@@ -34,11 +34,17 @@ import aiohttp
 # ====================================================================
 
 CHECK_INTERVAL: int = 5        # Seconds between each polling cycle
-MIN_PROFIT_MARGIN: float = 0.02  # Minimum gross spread (2%) to log
+MIN_PROFIT_MARGIN: float = 0.05  # Minimum gross spread to log
 DATA_DIR: str = "data"
 LEDGER_FILE: str = os.path.join(DATA_DIR, "trade_ledger.csv")
 PORTFOLIO_FILE: str = os.path.join(DATA_DIR, "portfolio.csv")
 REQUEST_TIMEOUT: int = 10        # HTTP timeout in seconds
+
+# How many consecutive cycles with no usable data before marking an
+# event as "stale" and removing it from the active list.  This catches
+# the common case where the game has ended but the APIs haven't
+# officially settled the market yet.
+STALE_CYCLE_THRESHOLD: int = 3
 
 # ---- Fee rates ----
 # Kalshi taker fee formula: round_up(rate × C × P × (1−P))
@@ -90,6 +96,33 @@ EVENTS: list[dict] = [
     #     "poly_condition_id": "...",
     # },
 ]
+
+
+# ====================================================================
+# HELPERS
+# ====================================================================
+
+def _parse_iso(s: str) -> Optional[datetime]:
+    """Parse an ISO-8601 timestamp string into an aware datetime (UTC).
+
+    Handles the common formats returned by Kalshi and Polymarket,
+    including the trailing ``Z`` that ``datetime.fromisoformat`` doesn't
+    support until Python 3.11.
+    """
+    if not s:
+        return None
+    try:
+        s = s.replace("Z", "+00:00")
+        dt = datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
+    except (ValueError, TypeError):
+        return None
+
+
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
 
 
 # ====================================================================
@@ -299,7 +332,13 @@ class MarketFetcher:
     # ----------------------------------------------------------------
 
     async def check_kalshi_active(self, ticker: str) -> bool:
-        """Return True if the Kalshi market is still open for trading."""
+        """Return True if the Kalshi market is still open for trading.
+
+        Checks three signals:
+        1. Market ``status`` in a set of terminal states.
+        2. ``result`` field is populated (outcome known).
+        3. ``close_time`` / ``expiration_time`` is in the past.
+        """
         await self._ensure_session()
         data = await _request_with_retry(
             self._session,
@@ -308,24 +347,49 @@ class MarketFetcher:
             label="Kalshi-status",
         )
         if data is None:
-            return True  # assume active on error
+            return True  # assume active on transient error
 
         market = data.get("market", data)
         status = str(market.get("status", "")).lower()
         result = market.get("result", "")
 
-        if status in ("settled", "closed", "finalized") or result:
+        logging.debug(
+            "[Kalshi] %s status=%r, result=%r, close_time=%r",
+            ticker, status, result,
+            market.get("close_time", market.get("expiration_time", "")),
+        )
+
+        # 1) Terminal status
+        if status in (
+            "settled", "closed", "finalized", "determined",
+            "ceased_trading", "complete",
+        ) or result:
             logging.info(
                 "[Kalshi] Market %s resolved (status=%s, result=%s)",
                 ticker, status, result,
             )
             return False
+
+        # 2) Past close / expiration time
+        for time_field in ("close_time", "expiration_time"):
+            raw = market.get(time_field, "")
+            close_dt = _parse_iso(str(raw)) if raw else None
+            if close_dt and close_dt <= _utc_now():
+                logging.info(
+                    "[Kalshi] Market %s past %s (%s). Treating as resolved.",
+                    ticker, time_field, raw,
+                )
+                return False
+
         return True
 
     async def check_poly_active(self, condition_id: str) -> bool:
-        """
-        Return True if the Polymarket market is still active.
-        Also opportunistically caches token IDs from the response.
+        """Return True if the Polymarket market is still active.
+
+        Checks three signals:
+        1. ``closed`` is True or ``active`` is False.
+        2. ``end_date_iso`` is in the past.
+        3. Opportunistically caches token IDs from the response.
         """
         await self._ensure_session()
         data = await _request_with_retry(
@@ -337,6 +401,14 @@ class MarketFetcher:
         if data is None:
             return True
 
+        logging.debug(
+            "[Polymarket] %s… closed=%r, active=%r, end_date_iso=%r",
+            condition_id[:16],
+            data.get("closed"), data.get("active"),
+            data.get("end_date_iso", ""),
+        )
+
+        # 1) Explicit closed / inactive flag
         if data.get("closed") is True or data.get("active") is False:
             logging.info(
                 "[Polymarket] Market %s… resolved (closed=%s, active=%s)",
@@ -344,6 +416,17 @@ class MarketFetcher:
             )
             return False
 
+        # 2) Past end date
+        end_raw = data.get("end_date_iso", "")
+        end_dt = _parse_iso(str(end_raw)) if end_raw else None
+        if end_dt and end_dt <= _utc_now():
+            logging.info(
+                "[Polymarket] Market %s… past end_date_iso (%s). Treating as resolved.",
+                condition_id[:16], end_raw,
+            )
+            return False
+
+        # 3) Cache token IDs
         tokens = data.get("tokens", [])
         if len(tokens) >= 2 and condition_id not in self._poly_token_cache:
             pair = (str(tokens[0]["token_id"]), str(tokens[1]["token_id"]))
@@ -983,6 +1066,10 @@ async def main() -> None:
 
     cycle = 0
     total_opps = 0
+    # Track consecutive cycles where we get no usable price data per event.
+    # Once we exceed STALE_CYCLE_THRESHOLD, treat as resolved (the game
+    # likely ended but the APIs haven't officially settled yet).
+    stale_counts: dict[str, int] = {ev["name"]: 0 for ev in active_events}
 
     try:
         while active_events:
@@ -1020,11 +1107,50 @@ async def main() -> None:
                 fetch_ms = int((loop.time() - t0) * 1000)
 
                 if kalshi_snap is None or poly_snap is None:
+                    stale_counts[name] = stale_counts.get(name, 0) + 1
                     logging.warning(
-                        "[%s] Skipped — could not fetch data from one or both platforms.",
-                        name,
+                        "[%s] Skipped — could not fetch data from one or both "
+                        "platforms. (stale %d/%d)",
+                        name, stale_counts[name], STALE_CYCLE_THRESHOLD,
                     )
+                    if stale_counts[name] >= STALE_CYCLE_THRESHOLD:
+                        logging.info(
+                            "[%s] No data for %d consecutive cycles — "
+                            "treating as resolved (game likely over).",
+                            name, stale_counts[name],
+                        )
+                        portfolio.close_positions_for_event(name)
+                        resolved_indices.append(idx)
                     continue
+
+                # ── Check for empty orderbooks (both sides have no ask) ──
+                kalshi_has_data = (
+                    kalshi_snap.yes.best_ask is not None
+                    or kalshi_snap.no.best_ask is not None
+                )
+                poly_has_data = (
+                    poly_snap.yes.best_ask is not None
+                    or poly_snap.no.best_ask is not None
+                )
+                if not kalshi_has_data and not poly_has_data:
+                    stale_counts[name] = stale_counts.get(name, 0) + 1
+                    logging.warning(
+                        "[%s] Both orderbooks empty — no prices available. "
+                        "(stale %d/%d)",
+                        name, stale_counts[name], STALE_CYCLE_THRESHOLD,
+                    )
+                    if stale_counts[name] >= STALE_CYCLE_THRESHOLD:
+                        logging.info(
+                            "[%s] Empty orderbooks for %d consecutive cycles — "
+                            "treating as resolved (game likely over).",
+                            name, stale_counts[name],
+                        )
+                        portfolio.close_positions_for_event(name)
+                        resolved_indices.append(idx)
+                    continue
+
+                # Got real data — reset the stale counter
+                stale_counts[name] = 0
 
                 # ── Log current top-of-book ──────────────────────
                 logging.info(
@@ -1070,6 +1196,7 @@ async def main() -> None:
             # ── Remove resolved events ───────────────────────────
             for idx in reversed(resolved_indices):
                 removed = active_events.pop(idx)
+                stale_counts.pop(removed["name"], None)
                 logging.info("Removed resolved event: %s", removed["name"])
 
             if not active_events:
