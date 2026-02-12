@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 ==========================================================================
-  Prediction Market Arbitrage — Paper-Trading Bot  (v2.0)
+  Prediction Market Arbitrage — Paper-Trading Bot  (v3.0)
   Monitors Kalshi and Polymarket for cross-platform arbitrage opportunities.
 
   PAPER TRADING ONLY — no real orders are ever placed.
@@ -14,11 +14,13 @@
       1. Edit the EVENTS list at the bottom of the config section.
       2. Run:  python arb_bot.py
       3. Check data/trade_ledger.csv for logged opportunities.
+      4. Check data/portfolio.csv for simulated positions and P&L.
 """
 
 import asyncio
 import csv
 import logging
+import math
 import os
 import sys
 from dataclasses import dataclass, field
@@ -31,16 +33,32 @@ import aiohttp
 # CONFIGURATION — edit these values to suit your needs
 # ====================================================================
 
-CHECK_INTERVAL: int = 60         # Seconds between each polling cycle
-MIN_PROFIT_MARGIN: float = 0.02  # Minimum spread (2%) to log a paper trade
+CHECK_INTERVAL: int = 5        # Seconds between each polling cycle
+MIN_PROFIT_MARGIN: float = 0.02  # Minimum gross spread (2%) to log
 DATA_DIR: str = "data"
 LEDGER_FILE: str = os.path.join(DATA_DIR, "trade_ledger.csv")
+PORTFOLIO_FILE: str = os.path.join(DATA_DIR, "portfolio.csv")
 REQUEST_TIMEOUT: int = 10        # HTTP timeout in seconds
 
+# ---- Fee rates ----
+# Kalshi taker fee formula: round_up(rate × C × P × (1−P))
+# Source: https://kalshi.com/docs/kalshi-fee-schedule.pdf
+KALSHI_FEE_RATE: float = 0.07
+
+# Polymarket taker fee — currently 0 for most markets.
+# NCAAB/Serie A markets created after Feb 18 2026 will have fees.
+# When active, the formula is the same shape: rate × C × P × (1−P)
+# Set to ~0.0624 when trading fee-enabled markets (1.56% max at P=0.5).
+POLY_FEE_RATE: float = 0.0
+
+# ---- Paper portfolio ----
+STARTING_CAPITAL: float = 1000.0  # Dollars to simulate with
+POSITION_SIZE: float = 50.0       # Max dollars per trade (both legs)
+
 # ---- Retry / backoff settings ----
-MAX_RETRIES: int = 3             # Number of retry attempts per request
-RETRY_BASE_DELAY: float = 1.0    # Initial backoff delay in seconds
-RETRY_BACKOFF_FACTOR: float = 2.0  # Multiply delay by this each retry
+MAX_RETRIES: int = 3
+RETRY_BASE_DELAY: float = 1.0
+RETRY_BACKOFF_FACTOR: float = 2.0
 
 # ---- Rate limits (conservative — well under documented limits) ----
 # Kalshi Basic tier: 20 reads/sec;  Polymarket /price: 150 reads/sec
@@ -60,16 +78,10 @@ CLOB_BASE = "https://clob.polymarket.com"
 #   poly_condition_id : the Polymarket condition_id (hex string)
 
 EVENTS: list[dict] = [
-    # ---- Fordham Rams vs Saint Louis Billikens (Women's CBB, Feb 11) ----
-    # Kalshi: https://kalshi.com/markets/kxncaawbgame/college-basketball-womens-game/kxncaawbgame-26feb11forslu
-    #   Kalshi splits this into two markets (one per team). We use the
-    #   Fordham ticker so that "Yes" = "Fordham wins", aligning with
-    #   Polymarket outcome[0] = "Fordham Rams".
-    # Polymarket: https://polymarket.com/sports/cwbb/cwbb-fordm-stlou-2026-02-11
     {
-        "name": "WCBB: Coastal Carolina vs Old Dominion",
-        "kalshi_ticker": "KXNCAAWBGAME-26FEB11CCARODU-CCAR",
-        "poly_condition_id": "0xf9db0e36f512695d5a5a49f35c4b8415bd9785318cec5b274e0ade4d12892ef0",
+        "name": "Bayern Munich vs Maccabi Tel-Aviv Winner?",
+        "kalshi_ticker": "KXEUROLEAGUEGAME-26FEB121405BAYMTA-MTA",
+        "poly_condition_id": "0x5fac1f28689e979b3be20c2d2a864d9e7b951833f35c28870a15a6b6f29bdfb5",
     },
     # Add more pairs here:
     # {
@@ -81,14 +93,46 @@ EVENTS: list[dict] = [
 
 
 # ====================================================================
+# FEE COMPUTATION
+# ====================================================================
+
+def kalshi_taker_fee(price: float, contracts: int = 1) -> float:
+    """
+    Kalshi taker fee per the published formula:
+        fee = round_up(RATE × C × P × (1 − P))
+    where round_up = ceiling to the next cent.
+
+    Returns the fee in dollars.
+    """
+    if KALSHI_FEE_RATE <= 0 or contracts <= 0:
+        return 0.0
+    raw = KALSHI_FEE_RATE * contracts * price * (1 - price)
+    return math.ceil(raw * 100) / 100
+
+
+def poly_taker_fee(price: float, contracts: int = 1) -> float:
+    """
+    Polymarket taker fee (same formula shape as Kalshi).
+    Currently 0 for most markets.  Set POLY_FEE_RATE when trading
+    fee-enabled markets.
+    """
+    if POLY_FEE_RATE <= 0 or contracts <= 0:
+        return 0.0
+    raw = POLY_FEE_RATE * contracts * price * (1 - price)
+    return math.ceil(raw * 100) / 100
+
+
+# ====================================================================
 # DATA CLASSES
 # ====================================================================
 
 @dataclass
 class TopOfBook:
     """Best bid and ask for one side (Yes or No) of a binary market."""
-    best_bid: Optional[float] = None  # highest resting buy price
-    best_ask: Optional[float] = None  # lowest resting sell price
+    best_bid: Optional[float] = None   # highest resting buy price
+    best_ask: Optional[float] = None   # lowest resting sell price
+    best_bid_size: Optional[float] = None  # depth at best bid
+    best_ask_size: Optional[float] = None  # depth at best ask
 
 
 @dataclass
@@ -96,19 +140,24 @@ class MarketSnapshot:
     """Top-of-book snapshot for both sides of a binary market."""
     yes: TopOfBook = field(default_factory=TopOfBook)
     no: TopOfBook = field(default_factory=TopOfBook)
-    source: str = ""
+    source: str = ""           # "kalshi" or "polymarket"
+    price_source: str = ""     # "book" (real orderbook) or "indicative" (/price)
 
 
 @dataclass
 class ArbOpportunity:
-    """A single detected arbitrage opportunity."""
+    """A single detected arbitrage opportunity (per-contract values)."""
     timestamp: str
     event_name: str
     direction: str
     kalshi_price: float
     poly_price: float
-    total_cost: float
-    profit: float          # absolute dollar profit per $1 contract
+    total_cost: float          # kalshi_price + poly_price (pre-fee)
+    kalshi_fee: float          # Kalshi taker fee for 1 contract
+    poly_fee: float            # Polymarket taker fee for 1 contract
+    gross_profit: float        # 1.0 − total_cost
+    net_profit: float          # 1.0 − total_cost − fees
+    fetch_latency_ms: int      # wall-clock ms to fetch both platforms
 
 
 # ====================================================================
@@ -159,7 +208,6 @@ async def _request_with_retry(
         await limiter.acquire()
         try:
             async with session.get(url, params=params, timeout=timeout) as resp:
-                # ── Rate-limited: honour Retry-After if present ──
                 if resp.status == 429:
                     retry_after = resp.headers.get("Retry-After")
                     delay = (
@@ -174,7 +222,6 @@ async def _request_with_retry(
                     await asyncio.sleep(delay)
                     continue
 
-                # ── Server error: retry with backoff ──
                 if resp.status >= 500:
                     delay = RETRY_BASE_DELAY * (RETRY_BACKOFF_FACTOR ** (attempt - 1))
                     logging.warning(
@@ -184,7 +231,6 @@ async def _request_with_retry(
                     await asyncio.sleep(delay)
                     continue
 
-                # ── Other 4xx: permanent client error, don't retry ──
                 if resp.status >= 400:
                     logging.error(
                         "[%s] Client error %d for %s — not retrying",
@@ -192,7 +238,6 @@ async def _request_with_retry(
                     )
                     return None
 
-                # ── Success: parse JSON ──
                 try:
                     return await resp.json(content_type=None)
                 except Exception as exc:
@@ -223,8 +268,8 @@ class MarketFetcher:
     rate limiters.
 
     - Kalshi:      REST orderbook endpoint (public, no auth required).
-    - Polymarket:  CLOB /markets to resolve condition_id → token IDs,
-                   then CLOB /price for each token+side.
+    - Polymarket:  CLOB /book for real orderbook with depth (preferred),
+                   falls back to CLOB /price if /book 404s.
     """
 
     def __init__(self) -> None:
@@ -232,13 +277,15 @@ class MarketFetcher:
         self._poly_token_cache: dict[str, tuple[str, str]] = {}
         self._kalshi_limiter = RateLimiter(KALSHI_MAX_RPS)
         self._poly_limiter = RateLimiter(POLY_MAX_RPS)
+        # Track whether /book works to avoid repeated 404 probes
+        self._poly_book_available: dict[str, bool] = {}
 
     async def _ensure_session(self) -> None:
         if self._session is None or self._session.closed:
             self._session = aiohttp.ClientSession(
                 headers={
                     "Accept": "application/json",
-                    "User-Agent": "PredictionArbBot/2.0 (paper-trading)",
+                    "User-Agent": "PredictionArbBot/3.0 (paper-trading)",
                 },
             )
 
@@ -261,8 +308,7 @@ class MarketFetcher:
             label="Kalshi-status",
         )
         if data is None:
-            # Network error — assume active to avoid premature removal.
-            return True
+            return True  # assume active on error
 
         market = data.get("market", data)
         status = str(market.get("status", "")).lower()
@@ -279,9 +325,7 @@ class MarketFetcher:
     async def check_poly_active(self, condition_id: str) -> bool:
         """
         Return True if the Polymarket market is still active.
-
-        Also opportunistically caches the token IDs from the same
-        response, so the later price-fetch step can skip a round-trip.
+        Also opportunistically caches token IDs from the response.
         """
         await self._ensure_session()
         data = await _request_with_retry(
@@ -291,7 +335,7 @@ class MarketFetcher:
             label="Poly-status",
         )
         if data is None:
-            return True  # assume active on error
+            return True
 
         if data.get("closed") is True or data.get("active") is False:
             logging.info(
@@ -300,7 +344,6 @@ class MarketFetcher:
             )
             return False
 
-        # Cache tokens from this response so _resolve_poly_tokens is free
         tokens = data.get("tokens", [])
         if len(tokens) >= 2 and condition_id not in self._poly_token_cache:
             pair = (str(tokens[0]["token_id"]), str(tokens[1]["token_id"]))
@@ -349,18 +392,20 @@ class MarketFetcher:
         no = TopOfBook()
 
         if yes_bids_raw:
-            highest_yes_bid_cents = max(lvl[0] for lvl in yes_bids_raw)
-            yes.best_bid = highest_yes_bid_cents / 100.0
-            # Yes bid @ X¢  ⟹  No ask @ (100−X)¢
-            no.best_ask = (100 - highest_yes_bid_cents) / 100.0
+            best_yes = max(yes_bids_raw, key=lambda lvl: lvl[0])
+            yes.best_bid = best_yes[0] / 100.0
+            yes.best_bid_size = best_yes[1]
+            no.best_ask = (100 - best_yes[0]) / 100.0
+            no.best_ask_size = best_yes[1]  # depth is the same (implied)
 
         if no_bids_raw:
-            highest_no_bid_cents = max(lvl[0] for lvl in no_bids_raw)
-            no.best_bid = highest_no_bid_cents / 100.0
-            # No bid @ X¢  ⟹  Yes ask @ (100−X)¢
-            yes.best_ask = (100 - highest_no_bid_cents) / 100.0
+            best_no = max(no_bids_raw, key=lambda lvl: lvl[0])
+            no.best_bid = best_no[0] / 100.0
+            no.best_bid_size = best_no[1]
+            yes.best_ask = (100 - best_no[0]) / 100.0
+            yes.best_ask_size = best_no[1]
 
-        return MarketSnapshot(yes=yes, no=no, source="kalshi")
+        return MarketSnapshot(yes=yes, no=no, source="kalshi", price_source="book")
 
     # ----------------------------------------------------------------
     #  Polymarket — token resolution (cached)
@@ -369,9 +414,7 @@ class MarketFetcher:
     async def _resolve_poly_tokens(self, condition_id: str) -> Optional[tuple[str, str]]:
         """
         Resolve a condition_id into (yes_token_id, no_token_id).
-
-        Returns cached tokens if available (typically populated by
-        check_poly_active); otherwise hits the CLOB /markets endpoint.
+        Returns cached tokens if available.
         """
         if condition_id in self._poly_token_cache:
             return self._poly_token_cache[condition_id]
@@ -405,7 +448,55 @@ class MarketFetcher:
         return pair
 
     # ----------------------------------------------------------------
-    #  Polymarket — single price fetch
+    #  Polymarket — /book endpoint (preferred, real orderbook)
+    # ----------------------------------------------------------------
+
+    async def _fetch_poly_book(self, token_id: str) -> Optional[dict]:
+        """
+        Try GET /book?token_id=… for real orderbook data with depth.
+        Returns the JSON response or None if 404 / error.
+        Does NOT log errors for 404 (expected for some markets).
+        """
+        await self._ensure_session()
+        await self._poly_limiter.acquire()
+        try:
+            timeout = aiohttp.ClientTimeout(total=REQUEST_TIMEOUT)
+            async with self._session.get(
+                f"{CLOB_BASE}/book",
+                params={"token_id": token_id},
+                timeout=timeout,
+            ) as resp:
+                if resp.status == 404:
+                    return None  # expected for some markets
+                if resp.status >= 400:
+                    return None
+                return await resp.json(content_type=None)
+        except (aiohttp.ClientError, asyncio.TimeoutError):
+            return None
+
+    @staticmethod
+    def _parse_book_tob(book: dict) -> TopOfBook:
+        """Parse a /book response into a TopOfBook."""
+        tob = TopOfBook()
+        bids = book.get("bids", [])
+        asks = book.get("asks", [])
+
+        if bids:
+            # Bids sorted desc by price — first is best
+            best = max(bids, key=lambda lvl: float(lvl.get("price", 0)))
+            tob.best_bid = float(best["price"])
+            tob.best_bid_size = float(best.get("size", 0))
+
+        if asks:
+            # Asks sorted asc by price — first is best (lowest)
+            best = min(asks, key=lambda lvl: float(lvl.get("price", 999)))
+            tob.best_ask = float(best["price"])
+            tob.best_ask_size = float(best.get("size", 0))
+
+        return tob
+
+    # ----------------------------------------------------------------
+    #  Polymarket — /price endpoint (fallback, indicative)
     # ----------------------------------------------------------------
 
     async def _fetch_poly_price(self, token_id: str, side: str) -> Optional[float]:
@@ -431,16 +522,16 @@ class MarketFetcher:
             return None
 
     # ----------------------------------------------------------------
-    #  Polymarket — full snapshot (4 prices concurrently)
+    #  Polymarket — full snapshot (tries /book, falls back to /price)
     # ----------------------------------------------------------------
 
     async def fetch_polymarket(self, condition_id: str) -> Optional[MarketSnapshot]:
         """
-        Fetch top-of-book from Polymarket for both the Yes and No tokens
-        associated with *condition_id*.
+        Fetch top-of-book from Polymarket for both tokens.
 
-        Fires all four /price requests concurrently to minimise latency
-        and reduce stale-price risk.
+        Tries /book first for real orderbook data with depth.
+        Falls back to /price (indicative, no depth) if /book 404s.
+        Remembers whether /book works to skip futile probes.
         """
         tokens = await self._resolve_poly_tokens(condition_id)
         if tokens is None:
@@ -448,7 +539,30 @@ class MarketFetcher:
 
         yes_token, no_token = tokens
 
-        # All four price calls in parallel
+        # ── Try /book if we haven't already determined it's unavailable ──
+        if self._poly_book_available.get(condition_id, True):
+            yes_book, no_book = await asyncio.gather(
+                self._fetch_poly_book(yes_token),
+                self._fetch_poly_book(no_token),
+            )
+
+            if yes_book is not None and no_book is not None:
+                self._poly_book_available[condition_id] = True
+                yes_tob = self._parse_book_tob(yes_book)
+                no_tob = self._parse_book_tob(no_book)
+                return MarketSnapshot(
+                    yes=yes_tob, no=no_tob,
+                    source="polymarket", price_source="book",
+                )
+
+            # /book not available for this market — remember for future cycles
+            self._poly_book_available[condition_id] = False
+            logging.info(
+                "[Polymarket] /book unavailable for %s…, using /price fallback",
+                condition_id[:16],
+            )
+
+        # ── Fall back to /price (4 concurrent calls) ──
         yes_buy, yes_sell, no_buy, no_sell = await asyncio.gather(
             self._fetch_poly_price(yes_token, "BUY"),
             self._fetch_poly_price(yes_token, "SELL"),
@@ -459,7 +573,10 @@ class MarketFetcher:
         yes_tob = TopOfBook(best_ask=yes_buy, best_bid=yes_sell)
         no_tob = TopOfBook(best_ask=no_buy, best_bid=no_sell)
 
-        return MarketSnapshot(yes=yes_tob, no=no_tob, source="polymarket")
+        return MarketSnapshot(
+            yes=yes_tob, no=no_tob,
+            source="polymarket", price_source="indicative",
+        )
 
     # ----------------------------------------------------------------
     #  Fetch both platforms concurrently for one event
@@ -482,13 +599,13 @@ class MarketFetcher:
 class ArbEngine:
     """
     Compares Kalshi and Polymarket snapshots and returns any arbitrage
-    opportunities whose spread exceeds the configured minimum margin.
+    opportunities whose gross spread exceeds the configured minimum.
 
     Strategy (guaranteed $1.00 payout regardless of outcome):
       Direction A:  Buy YES on Kalshi  +  Buy NO on Polymarket
       Direction B:  Buy NO on Kalshi   +  Buy YES on Polymarket
 
-    If total cost < $1.00, the difference is risk-free profit.
+    If total cost + fees < $1.00, the difference is risk-free profit.
     """
 
     def __init__(self, min_margin: float = MIN_PROFIT_MARGIN):
@@ -499,6 +616,7 @@ class ArbEngine:
         event_name: str,
         kalshi: MarketSnapshot,
         poly: MarketSnapshot,
+        fetch_latency_ms: int = 0,
     ) -> list[ArbOpportunity]:
         """Return a list of ArbOpportunity for every qualifying spread."""
         now = datetime.now(timezone.utc).isoformat(timespec="seconds")
@@ -506,41 +624,65 @@ class ArbEngine:
 
         # Direction A: Buy YES @ Kalshi  +  Buy NO @ Polymarket
         if kalshi.yes.best_ask is not None and poly.no.best_ask is not None:
-            cost = round(kalshi.yes.best_ask + poly.no.best_ask, 6)
-            if cost < 1.0:
-                profit = round(1.0 - cost, 6)
-                if profit >= self.min_margin:
-                    opportunities.append(ArbOpportunity(
-                        timestamp=now,
-                        event_name=event_name,
-                        direction="Buy YES@Kalshi + Buy NO@Polymarket",
-                        kalshi_price=kalshi.yes.best_ask,
-                        poly_price=poly.no.best_ask,
-                        total_cost=cost,
-                        profit=profit,
-                    ))
+            opp = self._evaluate(
+                now, event_name,
+                "Buy YES@Kalshi + Buy NO@Polymarket",
+                kalshi.yes.best_ask, poly.no.best_ask,
+                fetch_latency_ms,
+            )
+            if opp is not None:
+                opportunities.append(opp)
 
         # Direction B: Buy NO @ Kalshi  +  Buy YES @ Polymarket
         if kalshi.no.best_ask is not None and poly.yes.best_ask is not None:
-            cost = round(kalshi.no.best_ask + poly.yes.best_ask, 6)
-            if cost < 1.0:
-                profit = round(1.0 - cost, 6)
-                if profit >= self.min_margin:
-                    opportunities.append(ArbOpportunity(
-                        timestamp=now,
-                        event_name=event_name,
-                        direction="Buy NO@Kalshi + Buy YES@Polymarket",
-                        kalshi_price=kalshi.no.best_ask,
-                        poly_price=poly.yes.best_ask,
-                        total_cost=cost,
-                        profit=profit,
-                    ))
+            opp = self._evaluate(
+                now, event_name,
+                "Buy NO@Kalshi + Buy YES@Polymarket",
+                kalshi.no.best_ask, poly.yes.best_ask,
+                fetch_latency_ms,
+            )
+            if opp is not None:
+                opportunities.append(opp)
 
         return opportunities
 
+    def _evaluate(
+        self,
+        timestamp: str,
+        event_name: str,
+        direction: str,
+        k_price: float,
+        p_price: float,
+        fetch_ms: int,
+    ) -> Optional[ArbOpportunity]:
+        """Evaluate one direction, applying fees. Return opp or None."""
+        cost = round(k_price + p_price, 6)
+        gross_profit = round(1.0 - cost, 6)
+
+        if gross_profit < self.min_margin:
+            return None
+
+        k_fee = kalshi_taker_fee(k_price, 1)
+        p_fee = poly_taker_fee(p_price, 1)
+        net_profit = round(1.0 - cost - k_fee - p_fee, 6)
+
+        return ArbOpportunity(
+            timestamp=timestamp,
+            event_name=event_name,
+            direction=direction,
+            kalshi_price=k_price,
+            poly_price=p_price,
+            total_cost=cost,
+            kalshi_fee=k_fee,
+            poly_fee=p_fee,
+            gross_profit=gross_profit,
+            net_profit=net_profit,
+            fetch_latency_ms=fetch_ms,
+        )
+
 
 # ====================================================================
-# PaperTrader — CSV ledger for hypothetical trades
+# PaperTrader — CSV ledger for detected opportunities
 # ====================================================================
 
 class PaperTrader:
@@ -556,8 +698,12 @@ class PaperTrader:
         "kalshi_price",
         "poly_price",
         "total_cost",
-        "profit",
-        "profit_pct",
+        "kalshi_fee",
+        "poly_fee",
+        "gross_profit",
+        "net_profit",
+        "net_profit_pct",
+        "fetch_ms",
     ]
 
     def __init__(self, path: str = LEDGER_FILE):
@@ -574,7 +720,7 @@ class PaperTrader:
         if not os.path.exists(self.path):
             with open(self.path, mode="w", newline="") as fh:
                 csv.DictWriter(fh, fieldnames=self.COLUMNS).writeheader()
-            logging.info("Created new trade ledger → %s", self.path)
+            logging.info("Created trade ledger → %s", self.path)
 
     def log(self, opp: ArbOpportunity) -> None:
         """Append one row to the ledger CSV."""
@@ -585,11 +731,197 @@ class PaperTrader:
             "kalshi_price": f"{opp.kalshi_price:.4f}",
             "poly_price": f"{opp.poly_price:.4f}",
             "total_cost": f"{opp.total_cost:.4f}",
-            "profit": f"{opp.profit:.4f}",
-            "profit_pct": f"{opp.profit * 100:.2f}%",
+            "kalshi_fee": f"{opp.kalshi_fee:.4f}",
+            "poly_fee": f"{opp.poly_fee:.4f}",
+            "gross_profit": f"{opp.gross_profit:.4f}",
+            "net_profit": f"{opp.net_profit:.4f}",
+            "net_profit_pct": f"{opp.net_profit * 100:.2f}%",
+            "fetch_ms": opp.fetch_latency_ms,
         }
         with open(self.path, mode="a", newline="") as fh:
             csv.DictWriter(fh, fieldnames=self.COLUMNS).writerow(row)
+
+
+# ====================================================================
+# PaperPortfolio — simulated capital & position management
+# ====================================================================
+
+@dataclass
+class Position:
+    """An open simulated position (both arb legs combined)."""
+    event_name: str
+    direction: str
+    contracts: int
+    cost_per_contract: float   # total_cost (pre-fee) per contract
+    fees_per_contract: float   # kalshi_fee + poly_fee per contract
+    total_outlay: float        # contracts × (cost + fees)
+    opened_at: str
+
+
+class PaperPortfolio:
+    """
+    Simulates a paper portfolio that opens positions when arb
+    opportunities are detected and closes them when markets resolve.
+
+    Each arb trade guarantees a $1.00 payout per contract (one leg
+    always wins).  Profit = payout − cost − fees.
+    """
+
+    PORT_COLUMNS = [
+        "action", "timestamp", "event_name", "direction", "contracts",
+        "cost_per_contract", "fees_per_contract", "total_outlay",
+        "payout", "pnl", "capital_remaining",
+    ]
+
+    def __init__(
+        self,
+        starting_capital: float = STARTING_CAPITAL,
+        position_size: float = POSITION_SIZE,
+        path: str = PORTFOLIO_FILE,
+    ):
+        self.starting_capital = starting_capital
+        self.capital = starting_capital
+        self.position_size = position_size
+        self.path = path
+        self.open_positions: list[Position] = []
+        self.total_realized_pnl: float = 0.0
+        self.closed_count: int = 0
+        self._ensure_file()
+        # Track which event+direction combos we've already traded
+        self._traded: set[tuple[str, str]] = set()
+
+    def _ensure_file(self) -> None:
+        dir_path = os.path.dirname(self.path)
+        if dir_path:
+            os.makedirs(dir_path, exist_ok=True)
+        if not os.path.exists(self.path):
+            with open(self.path, mode="w", newline="") as fh:
+                csv.DictWriter(fh, fieldnames=self.PORT_COLUMNS).writeheader()
+            logging.info("Created portfolio ledger → %s", self.path)
+
+    def _write_row(self, row: dict) -> None:
+        with open(self.path, mode="a", newline="") as fh:
+            csv.DictWriter(fh, fieldnames=self.PORT_COLUMNS).writerow(row)
+
+    def try_open(self, opp: ArbOpportunity) -> Optional[Position]:
+        """
+        Attempt to open a position for the given opportunity.
+
+        Returns the Position if opened, None if skipped (already traded,
+        insufficient capital, or net-unprofitable after fees).
+        """
+        key = (opp.event_name, opp.direction)
+
+        # Don't double-trade the same event+direction
+        if key in self._traded:
+            return None
+
+        # Only paper-trade if profitable after fees
+        if opp.net_profit <= 0:
+            return None
+
+        cost_plus_fees = opp.total_cost + opp.kalshi_fee + opp.poly_fee
+        if cost_plus_fees <= 0:
+            return None
+
+        # Size the trade
+        max_contracts = int(min(self.position_size, self.capital) / cost_plus_fees)
+        if max_contracts < 1:
+            return None
+
+        total_outlay = round(max_contracts * cost_plus_fees, 4)
+        self.capital -= total_outlay
+        self._traded.add(key)
+
+        pos = Position(
+            event_name=opp.event_name,
+            direction=opp.direction,
+            contracts=max_contracts,
+            cost_per_contract=opp.total_cost,
+            fees_per_contract=opp.kalshi_fee + opp.poly_fee,
+            total_outlay=total_outlay,
+            opened_at=opp.timestamp,
+        )
+        self.open_positions.append(pos)
+
+        self._write_row({
+            "action": "OPEN",
+            "timestamp": opp.timestamp,
+            "event_name": pos.event_name,
+            "direction": pos.direction,
+            "contracts": pos.contracts,
+            "cost_per_contract": f"{pos.cost_per_contract:.4f}",
+            "fees_per_contract": f"{pos.fees_per_contract:.4f}",
+            "total_outlay": f"{pos.total_outlay:.4f}",
+            "payout": "",
+            "pnl": "",
+            "capital_remaining": f"{self.capital:.2f}",
+        })
+
+        logging.info(
+            "  PORTFOLIO: Opened %d contracts [%s] %s — outlay $%.2f, capital $%.2f",
+            pos.contracts, pos.event_name, pos.direction,
+            pos.total_outlay, self.capital,
+        )
+        return pos
+
+    def close_positions_for_event(self, event_name: str) -> None:
+        """
+        Close all open positions for a resolved event.
+        Arb guarantees $1.00 payout per contract.
+        """
+        now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        still_open: list[Position] = []
+
+        for pos in self.open_positions:
+            if pos.event_name == event_name:
+                payout = pos.contracts * 1.0
+                pnl = round(payout - pos.total_outlay, 4)
+                self.capital += payout
+                self.total_realized_pnl += pnl
+                self.closed_count += 1
+
+                self._write_row({
+                    "action": "CLOSE",
+                    "timestamp": now,
+                    "event_name": pos.event_name,
+                    "direction": pos.direction,
+                    "contracts": pos.contracts,
+                    "cost_per_contract": f"{pos.cost_per_contract:.4f}",
+                    "fees_per_contract": f"{pos.fees_per_contract:.4f}",
+                    "total_outlay": f"{pos.total_outlay:.4f}",
+                    "payout": f"{payout:.4f}",
+                    "pnl": f"{pnl:.4f}",
+                    "capital_remaining": f"{self.capital:.2f}",
+                })
+
+                logging.info(
+                    "  PORTFOLIO: Closed %d contracts [%s] %s — "
+                    "payout $%.2f, P&L $%.4f, capital $%.2f",
+                    pos.contracts, pos.event_name, pos.direction,
+                    payout, pnl, self.capital,
+                )
+            else:
+                still_open.append(pos)
+
+        self.open_positions = still_open
+
+    def summary(self) -> str:
+        """Return a multi-line summary string."""
+        open_outlay = sum(p.total_outlay for p in self.open_positions)
+        lines = [
+            "─── PORTFOLIO SUMMARY ───",
+            f"  Starting capital  : ${self.starting_capital:.2f}",
+            f"  Current capital   : ${self.capital:.2f}",
+            f"  Open positions    : {len(self.open_positions)} "
+            f"(${open_outlay:.2f} locked)",
+            f"  Closed trades     : {self.closed_count}",
+            f"  Realized P&L      : ${self.total_realized_pnl:.4f}",
+        ]
+        if self.closed_count > 0:
+            roi = (self.total_realized_pnl / self.starting_capital) * 100
+            lines.append(f"  ROI               : {roi:.2f}%")
+        return "\n".join(lines)
 
 
 # ====================================================================
@@ -604,13 +936,17 @@ def _fmt_price(price: Optional[float]) -> str:
 def _print_banner(active_events: list[dict]) -> None:
     """Print a startup banner with current configuration."""
     logging.info("=" * 62)
-    logging.info("  ARBITRAGE PAPER-TRADING BOT  v2.0")
+    logging.info("  ARBITRAGE PAPER-TRADING BOT  v3.0")
     logging.info("  NO REAL TRADES WILL BE EXECUTED")
     logging.info("=" * 62)
     logging.info("  Poll interval   : %ds", CHECK_INTERVAL)
-    logging.info("  Min margin      : %.2f%%", MIN_PROFIT_MARGIN * 100)
+    logging.info("  Min gross margin: %.2f%%", MIN_PROFIT_MARGIN * 100)
+    logging.info("  Kalshi fee rate : %.2f%%", KALSHI_FEE_RATE * 100)
+    logging.info("  Poly fee rate   : %.2f%%", POLY_FEE_RATE * 100)
+    logging.info("  Starting capital: $%.2f", STARTING_CAPITAL)
+    logging.info("  Position size   : $%.2f", POSITION_SIZE)
     logging.info("  Ledger file     : %s", LEDGER_FILE)
-    logging.info("  Max retries     : %d (backoff: %.0fx)", MAX_RETRIES, RETRY_BACKOFF_FACTOR)
+    logging.info("  Portfolio file  : %s", PORTFOLIO_FILE)
     logging.info("  Events tracked  : %d", len(active_events))
     for ev in active_events:
         logging.info("    • %s", ev["name"])
@@ -632,12 +968,16 @@ async def main() -> None:
         logging.error("No events configured. Add at least one entry to the EVENTS list.")
         sys.exit(1)
 
-    # Working copy so we can remove resolved events without touching the constant
     active_events: list[dict] = list(EVENTS)
 
     fetcher = MarketFetcher()
     engine = ArbEngine(min_margin=MIN_PROFIT_MARGIN)
     trader = PaperTrader(path=LEDGER_FILE)
+    portfolio = PaperPortfolio(
+        starting_capital=STARTING_CAPITAL,
+        position_size=POSITION_SIZE,
+        path=PORTFOLIO_FILE,
+    )
 
     _print_banner(active_events)
 
@@ -669,11 +1009,15 @@ async def main() -> None:
                         "[%s] Market resolved — will remove from active list.",
                         name,
                     )
+                    portfolio.close_positions_for_event(name)
                     resolved_indices.append(idx)
                     continue
 
-                # ── Fetch prices concurrently ────────────────────
+                # ── Fetch prices concurrently + measure latency ──
+                loop = asyncio.get_running_loop()
+                t0 = loop.time()
                 kalshi_snap, poly_snap = await fetcher.fetch_both(ticker, cond_id)
+                fetch_ms = int((loop.time() - t0) * 1000)
 
                 if kalshi_snap is None or poly_snap is None:
                     logging.warning(
@@ -689,33 +1033,41 @@ async def main() -> None:
                     _fmt_price(kalshi_snap.yes.best_ask),
                     _fmt_price(kalshi_snap.no.best_ask),
                 )
+                poly_src = f"({poly_snap.price_source})"
                 logging.info(
-                    "[%s] Poly     Yes Ask=%s  No Ask=%s",
-                    name,
+                    "[%s] Poly %s Yes Ask=%s  No Ask=%s  [%dms]",
+                    name, poly_src,
                     _fmt_price(poly_snap.yes.best_ask),
                     _fmt_price(poly_snap.no.best_ask),
+                    fetch_ms,
                 )
 
                 # ── Check for arbitrage ──────────────────────────
-                opps = engine.check(name, kalshi_snap, poly_snap)
+                opps = engine.check(name, kalshi_snap, poly_snap, fetch_ms)
 
                 if opps:
                     for opp in opps:
                         total_opps += 1
+                        net_label = (
+                            f"Net: ${opp.net_profit:.4f}"
+                            if opp.net_profit > 0
+                            else f"Net: -${abs(opp.net_profit):.4f} (fees eat profit)"
+                        )
                         logging.info(
-                            "*** OPPORTUNITY! [%s] %s │ "
-                            "Spread: %.2f%% │ Cost: $%.4f │ Profit: $%.4f ***",
+                            "*** OPP [%s] %s │ "
+                            "Gross: %.2f%% │ %s │ Fees: $%.4f ***",
                             opp.event_name,
                             opp.direction,
-                            opp.profit * 100,
-                            opp.total_cost,
-                            opp.profit,
+                            opp.gross_profit * 100,
+                            net_label,
+                            opp.kalshi_fee + opp.poly_fee,
                         )
                         trader.log(opp)
+                        portfolio.try_open(opp)
                 else:
                     logging.info("[%s] No arb this cycle.", name)
 
-            # ── Remove resolved events (reverse to keep indices valid) ──
+            # ── Remove resolved events ───────────────────────────
             for idx in reversed(resolved_indices):
                 removed = active_events.pop(idx)
                 logging.info("Removed resolved event: %s", removed["name"])
@@ -725,7 +1077,7 @@ async def main() -> None:
                 break
 
             logging.info(
-                "Cycle %d complete — %d total opportunities logged. Sleeping %ds…",
+                "Cycle %d complete — %d opps logged. Sleeping %ds…",
                 cycle, total_opps, CHECK_INTERVAL,
             )
             await asyncio.sleep(CHECK_INTERVAL)
@@ -733,10 +1085,14 @@ async def main() -> None:
     except KeyboardInterrupt:
         logging.info("")
         logging.info(
-            "Shutting down gracefully (Ctrl+C). %d opportunities logged.", total_opps
+            "Shutting down (Ctrl+C). %d opportunities logged.", total_opps
         )
     finally:
         await fetcher.close()
+        # Print portfolio summary
+        logging.info("")
+        for line in portfolio.summary().split("\n"):
+            logging.info(line)
 
     sys.exit(0)
 
