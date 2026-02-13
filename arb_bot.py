@@ -1,14 +1,21 @@
 #!/usr/bin/env python3
 """
 ==========================================================================
-  Prediction Market Arbitrage — Paper-Trading Bot  (v3.0)
+  Prediction Market Arbitrage — Paper-Trading Bot  (v4.0)
   Monitors Kalshi and Polymarket for cross-platform arbitrage opportunities.
 
   PAPER TRADING ONLY — no real orders are ever placed.
 ==========================================================================
 
   Dependencies (run once):
-      pip install aiohttp
+      pip install aiohttp cryptography
+
+  Environment variables (for Kalshi websocket — optional):
+      KALSHI_API_KEY          — your Kalshi API key ID
+      KALSHI_PRIVATE_KEY_PATH — path to your RSA private key PEM file
+
+  If Kalshi credentials are not set, falls back to REST polling.
+  Polymarket websocket requires no authentication.
 
   Usage:
       1. Edit the EVENTS list at the bottom of the config section.
@@ -19,15 +26,22 @@
 
 import asyncio
 import csv
+import json
 import logging
 import math
 import os
 import sys
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Optional
+from dotenv import load_dotenv
 
 import aiohttp
+
+# Load the .env file into the environment
+load_dotenv()
 
 # ====================================================================
 # CONFIGURATION — edit these values to suit your needs
@@ -73,7 +87,18 @@ POLY_MAX_RPS: float = 10.0
 
 # ---- API base URLs (no trailing slash) ----
 KALSHI_BASE = "https://api.elections.kalshi.com/trade-api/v2"
+KALSHI_WS_URL = "wss://api.elections.kalshi.com/trade-api/ws/v2"
 CLOB_BASE = "https://clob.polymarket.com"
+POLY_WS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
+
+# ---- Kalshi API credentials (env vars) ----
+KALSHI_API_KEY: str = os.environ.get("KALSHI_API_KEY", "")
+KALSHI_PRIVATE_KEY_PATH: str = os.environ.get("KALSHI_PRIVATE_KEY_PATH", "")
+
+# ---- Websocket settings ----
+WS_PING_INTERVAL: int = 10       # Seconds between heartbeat pings
+WS_RECONNECT_BASE: float = 1.0   # Base delay for reconnection backoff
+WS_RECONNECT_MAX: float = 30.0   # Max reconnection delay
 
 # ====================================================================
 # EVENTS TO MONITOR — add your own pairs here
@@ -85,16 +110,10 @@ CLOB_BASE = "https://clob.polymarket.com"
 
 EVENTS: list[dict] = [
     {
-        "name": "Bayern Munich vs Maccabi Tel-Aviv Winner?",
-        "kalshi_ticker": "KXEUROLEAGUEGAME-26FEB121405BAYMTA-MTA",
-        "poly_condition_id": "0x5fac1f28689e979b3be20c2d2a864d9e7b951833f35c28870a15a6b6f29bdfb5",
+        "name": "Middle Tennessee at Kennesaw St. Winner?",
+        "kalshi_ticker": "KXNCAAMBGAME-26FEB12MTUKENN-MTU",
+        "poly_condition_id": "0x752ed76a2e65bb6e30bc25d32a0d16a4d434474df22208098e8314c752ce5553",
     },
-    # Add more pairs here:
-    # {
-    #     "name": "...",
-    #     "kalshi_ticker": "...",
-    #     "poly_condition_id": "...",
-    # },
 ]
 
 
@@ -160,12 +179,22 @@ def poly_taker_fee(price: float, contracts: int = 1) -> float:
 # ====================================================================
 
 @dataclass
+class OrderbookLevel:
+    """A single price level in an orderbook."""
+    price: float   # 0.0–1.0
+    size: float    # number of contracts
+
+
+@dataclass
 class TopOfBook:
     """Best bid and ask for one side (Yes or No) of a binary market."""
     best_bid: Optional[float] = None   # highest resting buy price
     best_ask: Optional[float] = None   # lowest resting sell price
     best_bid_size: Optional[float] = None  # depth at best bid
     best_ask_size: Optional[float] = None  # depth at best ask
+    # Full depth: sorted lists (bids descending, asks ascending)
+    bid_levels: list[OrderbookLevel] = field(default_factory=list)
+    ask_levels: list[OrderbookLevel] = field(default_factory=list)
 
 
 @dataclass
@@ -191,6 +220,9 @@ class ArbOpportunity:
     gross_profit: float        # 1.0 − total_cost
     net_profit: float          # 1.0 − total_cost − fees
     fetch_latency_ms: int      # wall-clock ms to fetch both platforms
+    max_contracts: int = 0     # max fillable contracts at these prices
+    kalshi_depth: int = 0      # contracts available on Kalshi side
+    poly_depth: int = 0        # contracts available on Polymarket side
 
 
 # ====================================================================
@@ -416,15 +448,16 @@ class MarketFetcher:
             )
             return False
 
+        # TODO: Uncomment when I fix why its saying a game is finished when it isn't
         # 2) Past end date
-        end_raw = data.get("end_date_iso", "")
-        end_dt = _parse_iso(str(end_raw)) if end_raw else None
-        if end_dt and end_dt <= _utc_now():
-            logging.info(
-                "[Polymarket] Market %s… past end_date_iso (%s). Treating as resolved.",
-                condition_id[:16], end_raw,
-            )
-            return False
+        #end_raw = data.get("end_date_iso", "")
+        #end_dt = _parse_iso(str(end_raw)) if end_raw else None
+        #if end_dt and end_dt <= _utc_now():
+        #    logging.info(
+        #        "[Polymarket] Market %s… past end_date_iso (%s). Treating as resolved.",
+        #        condition_id[:16], end_raw,
+        #    )
+        #    return False
 
         # 3) Cache token IDs
         tokens = data.get("tokens", [])
@@ -475,18 +508,39 @@ class MarketFetcher:
         no = TopOfBook()
 
         if yes_bids_raw:
-            best_yes = max(yes_bids_raw, key=lambda lvl: lvl[0])
+            # Sort descending by price (best bid first)
+            sorted_yes = sorted(yes_bids_raw, key=lambda lvl: lvl[0], reverse=True)
+            best_yes = sorted_yes[0]
             yes.best_bid = best_yes[0] / 100.0
             yes.best_bid_size = best_yes[1]
+            yes.bid_levels = [
+                OrderbookLevel(price=lvl[0] / 100.0, size=lvl[1])
+                for lvl in sorted_yes
+            ]
+            # Implied No asks (ascending price = 1 - descending yes bid)
             no.best_ask = (100 - best_yes[0]) / 100.0
-            no.best_ask_size = best_yes[1]  # depth is the same (implied)
+            no.best_ask_size = best_yes[1]
+            no.ask_levels = [
+                OrderbookLevel(price=(100 - lvl[0]) / 100.0, size=lvl[1])
+                for lvl in sorted_yes  # ascending ask price
+            ]
 
         if no_bids_raw:
-            best_no = max(no_bids_raw, key=lambda lvl: lvl[0])
+            sorted_no = sorted(no_bids_raw, key=lambda lvl: lvl[0], reverse=True)
+            best_no = sorted_no[0]
             no.best_bid = best_no[0] / 100.0
             no.best_bid_size = best_no[1]
+            no.bid_levels = [
+                OrderbookLevel(price=lvl[0] / 100.0, size=lvl[1])
+                for lvl in sorted_no
+            ]
+            # Implied Yes asks
             yes.best_ask = (100 - best_no[0]) / 100.0
             yes.best_ask_size = best_no[1]
+            yes.ask_levels = [
+                OrderbookLevel(price=(100 - lvl[0]) / 100.0, size=lvl[1])
+                for lvl in sorted_no
+            ]
 
         return MarketSnapshot(yes=yes, no=no, source="kalshi", price_source="book")
 
@@ -559,22 +613,38 @@ class MarketFetcher:
 
     @staticmethod
     def _parse_book_tob(book: dict) -> TopOfBook:
-        """Parse a /book response into a TopOfBook."""
+        """Parse a /book response into a TopOfBook with full depth."""
         tob = TopOfBook()
-        bids = book.get("bids", [])
-        asks = book.get("asks", [])
+        bids = book.get("bids", []) or book.get("buys", [])
+        asks = book.get("asks", []) or book.get("sells", [])
 
         if bids:
-            # Bids sorted desc by price — first is best
-            best = max(bids, key=lambda lvl: float(lvl.get("price", 0)))
-            tob.best_bid = float(best["price"])
-            tob.best_bid_size = float(best.get("size", 0))
+            sorted_bids = sorted(
+                bids, key=lambda lvl: float(lvl.get("price", 0)), reverse=True,
+            )
+            tob.best_bid = float(sorted_bids[0]["price"])
+            tob.best_bid_size = float(sorted_bids[0].get("size", 0))
+            tob.bid_levels = [
+                OrderbookLevel(
+                    price=float(lvl["price"]),
+                    size=float(lvl.get("size", 0)),
+                )
+                for lvl in sorted_bids
+            ]
 
         if asks:
-            # Asks sorted asc by price — first is best (lowest)
-            best = min(asks, key=lambda lvl: float(lvl.get("price", 999)))
-            tob.best_ask = float(best["price"])
-            tob.best_ask_size = float(best.get("size", 0))
+            sorted_asks = sorted(
+                asks, key=lambda lvl: float(lvl.get("price", 999)),
+            )
+            tob.best_ask = float(sorted_asks[0]["price"])
+            tob.best_ask_size = float(sorted_asks[0].get("size", 0))
+            tob.ask_levels = [
+                OrderbookLevel(
+                    price=float(lvl["price"]),
+                    size=float(lvl.get("size", 0)),
+                )
+                for lvl in sorted_asks
+            ]
 
         return tob
 
@@ -676,6 +746,534 @@ class MarketFetcher:
 
 
 # ====================================================================
+# WebSocket Managers — real-time orderbook streaming
+# ====================================================================
+
+class _LocalOrderbook:
+    """Maintains a local orderbook from snapshots and deltas."""
+
+    def __init__(self) -> None:
+        # {price: size} for bids and asks
+        self.bids: dict[float, float] = {}
+        self.asks: dict[float, float] = {}
+
+    def apply_snapshot_poly(self, data: dict) -> None:
+        """Apply a Polymarket 'book' event (full snapshot)."""
+        self.bids.clear()
+        self.asks.clear()
+        for lvl in data.get("buys", []):
+            p, s = float(lvl["price"]), float(lvl["size"])
+            if s > 0:
+                self.bids[p] = s
+        for lvl in data.get("sells", []):
+            p, s = float(lvl["price"]), float(lvl["size"])
+            if s > 0:
+                self.asks[p] = s
+
+    def apply_price_change_poly(self, change: dict) -> None:
+        """Apply a Polymarket 'price_change' event (absolute size update)."""
+        price = float(change["price"])
+        size = float(change["size"])
+        side = change["side"]  # "BUY" or "SELL"
+        book = self.bids if side == "BUY" else self.asks
+        if size > 0:
+            book[price] = size
+        else:
+            book.pop(price, None)
+
+    def apply_snapshot_kalshi(self, bids_raw: list) -> None:
+        """Apply a Kalshi orderbook_snapshot (one side: 'yes' or 'no').
+        bids_raw = [[price_cents, qty], ...]
+        """
+        book = self.bids  # Kalshi only returns bids per side
+        book.clear()
+        for lvl in bids_raw:
+            p, s = lvl[0] / 100.0, float(lvl[1])
+            if s > 0:
+                book[p] = s
+
+    def apply_delta_kalshi(self, price_cents: int, delta: int) -> None:
+        """Apply a Kalshi orderbook_delta."""
+        price = price_cents / 100.0
+        current = self.bids.get(price, 0)
+        new_size = current + delta
+        if new_size > 0:
+            self.bids[price] = new_size
+        else:
+            self.bids.pop(price, None)
+
+    def to_tob(self) -> TopOfBook:
+        """Convert current state to a TopOfBook."""
+        tob = TopOfBook()
+        if self.bids:
+            sorted_bids = sorted(self.bids.items(), key=lambda x: x[0], reverse=True)
+            tob.best_bid = sorted_bids[0][0]
+            tob.best_bid_size = sorted_bids[0][1]
+            tob.bid_levels = [
+                OrderbookLevel(price=p, size=s) for p, s in sorted_bids
+            ]
+        if self.asks:
+            sorted_asks = sorted(self.asks.items(), key=lambda x: x[0])
+            tob.best_ask = sorted_asks[0][0]
+            tob.best_ask_size = sorted_asks[0][1]
+            tob.ask_levels = [
+                OrderbookLevel(price=p, size=s) for p, s in sorted_asks
+            ]
+        return tob
+
+
+class PolymarketWS:
+    """Manages a websocket connection to Polymarket's market channel.
+
+    Maintains local orderbooks for subscribed tokens and provides
+    snapshot access via get_snapshot().
+    No authentication required.
+    """
+
+    def __init__(self) -> None:
+        self._ws: Optional[aiohttp.ClientWebSocketResponse] = None
+        self._session: Optional[aiohttp.ClientSession] = None
+        # token_id -> _LocalOrderbook
+        self._books: dict[str, _LocalOrderbook] = {}
+        self._connected = False
+        self._subscribed_assets: list[str] = []
+        self._ping_task: Optional[asyncio.Task] = None
+        self._listen_task: Optional[asyncio.Task] = None
+        self._reconnect_attempts = 0
+        # condition_id -> (yes_token_id, no_token_id)
+        self._token_map: dict[str, tuple[str, str]] = {}
+        # Callback fired on every book update: (condition_id,) -> None
+        self.on_update: Optional[callable] = None
+
+    async def connect(self) -> None:
+        """Open the websocket connection."""
+        self._session = aiohttp.ClientSession()
+        await self._do_connect()
+
+    async def _do_connect(self) -> None:
+        try:
+            self._ws = await self._session.ws_connect(
+                POLY_WS_URL,
+                heartbeat=30,
+                timeout=aiohttp.ClientTimeout(total=15),
+            )
+            self._connected = True
+            self._reconnect_attempts = 0
+            logging.info("[Poly-WS] Connected to %s", POLY_WS_URL)
+
+            # Re-subscribe if reconnecting
+            if self._subscribed_assets:
+                msg = {
+                    "assets_ids": self._subscribed_assets,
+                    "type": "market",
+                }
+                await self._ws.send_json(msg)
+                logging.info(
+                    "[Poly-WS] Re-subscribed to %d assets", len(self._subscribed_assets),
+                )
+
+            # Start background tasks
+            self._ping_task = asyncio.create_task(self._ping_loop())
+            self._listen_task = asyncio.create_task(self._listen_loop())
+
+        except Exception as exc:
+            logging.error("[Poly-WS] Connection failed: %s", exc)
+            self._connected = False
+            await self._schedule_reconnect()
+
+    async def _ping_loop(self) -> None:
+        """Send PING every WS_PING_INTERVAL seconds."""
+        try:
+            while self._connected and self._ws and not self._ws.closed:
+                await self._ws.send_str("PING")
+                await asyncio.sleep(WS_PING_INTERVAL)
+        except Exception:
+            pass  # reconnect handled by listen loop
+
+    async def _listen_loop(self) -> None:
+        """Process incoming websocket messages."""
+        try:
+            async for msg in self._ws:
+                if msg.type == aiohttp.WSMsgType.TEXT:
+                    if msg.data == "PONG":
+                        continue
+                    try:
+                        data = json.loads(msg.data)
+                    except json.JSONDecodeError:
+                        continue
+                    # Poly WS can send a single object or an array of events
+                    if isinstance(data, list):
+                        for item in data:
+                            if isinstance(item, dict):
+                                self._handle_message(item)
+                    elif isinstance(data, dict):
+                        self._handle_message(data)
+                elif msg.type in (
+                    aiohttp.WSMsgType.CLOSED,
+                    aiohttp.WSMsgType.ERROR,
+                ):
+                    break
+        except Exception as exc:
+            logging.warning("[Poly-WS] Listen error: %s", exc)
+
+        self._connected = False
+        logging.warning("[Poly-WS] Disconnected, scheduling reconnect…")
+        await self._schedule_reconnect()
+
+    def _handle_message(self, data: dict) -> None:
+        event_type = data.get("event_type", "")
+
+        if event_type == "book":
+            asset_id = data.get("asset_id", "")
+            if asset_id not in self._books:
+                self._books[asset_id] = _LocalOrderbook()
+            self._books[asset_id].apply_snapshot_poly(data)
+            self._notify_update(asset_id)
+
+        elif event_type == "price_change":
+            for change in data.get("price_changes", []):
+                asset_id = change.get("asset_id", "")
+                if asset_id in self._books:
+                    self._books[asset_id].apply_price_change_poly(change)
+                    self._notify_update(asset_id)
+
+    def _notify_update(self, token_id: str) -> None:
+        if self.on_update is None:
+            return
+        for cid, (yes_tok, no_tok) in self._token_map.items():
+            if token_id in (yes_tok, no_tok):
+                self.on_update(cid)
+                break
+
+    async def _schedule_reconnect(self) -> None:
+        self._reconnect_attempts += 1
+        delay = min(
+            WS_RECONNECT_BASE * (2 ** (self._reconnect_attempts - 1)),
+            WS_RECONNECT_MAX,
+        )
+        logging.info("[Poly-WS] Reconnecting in %.1fs (attempt %d)…",
+                     delay, self._reconnect_attempts)
+        await asyncio.sleep(delay)
+        await self._do_connect()
+
+    async def subscribe(
+        self, condition_id: str, yes_token: str, no_token: str,
+    ) -> None:
+        """Subscribe to orderbook updates for a market's tokens."""
+        self._token_map[condition_id] = (yes_token, no_token)
+        new_assets = []
+        for tok in (yes_token, no_token):
+            if tok not in self._books:
+                self._books[tok] = _LocalOrderbook()
+                new_assets.append(tok)
+                self._subscribed_assets.append(tok)
+
+        if new_assets and self._connected and self._ws and not self._ws.closed:
+            msg = {"assets_ids": new_assets, "type": "market"}
+            await self._ws.send_json(msg)
+            logging.info(
+                "[Poly-WS] Subscribed to %d new assets for %s…",
+                len(new_assets), condition_id[:16],
+            )
+
+    def get_snapshot(self, condition_id: str) -> Optional[MarketSnapshot]:
+        """Build a MarketSnapshot from local orderbook state."""
+        tokens = self._token_map.get(condition_id)
+        if tokens is None:
+            return None
+        yes_tok, no_tok = tokens
+        yes_book = self._books.get(yes_tok)
+        no_book = self._books.get(no_tok)
+        if yes_book is None or no_book is None:
+            return None
+
+        yes_tob = yes_book.to_tob()
+        no_tob = no_book.to_tob()
+
+        # Only return if we have at least some data
+        if yes_tob.best_bid is None and yes_tob.best_ask is None:
+            if no_tob.best_bid is None and no_tob.best_ask is None:
+                return None
+
+        return MarketSnapshot(
+            yes=yes_tob, no=no_tob,
+            source="polymarket", price_source="book",
+        )
+
+    async def close(self) -> None:
+        self._connected = False
+        if self._ping_task:
+            self._ping_task.cancel()
+        if self._listen_task:
+            self._listen_task.cancel()
+        if self._ws and not self._ws.closed:
+            await self._ws.close()
+        if self._session and not self._session.closed:
+            await self._session.close()
+        logging.info("[Poly-WS] Closed.")
+
+
+class KalshiWS:
+    """Manages an authenticated websocket connection to Kalshi.
+
+    Requires KALSHI_API_KEY and KALSHI_PRIVATE_KEY_PATH env vars.
+    Maintains local orderbooks via orderbook_snapshot + orderbook_delta.
+    """
+
+    def __init__(self) -> None:
+        self._ws: Optional[aiohttp.ClientWebSocketResponse] = None
+        self._session: Optional[aiohttp.ClientSession] = None
+        # ticker -> {side: _LocalOrderbook} where side is "yes" or "no"
+        self._books: dict[str, dict[str, _LocalOrderbook]] = {}
+        self._connected = False
+        self._subscribed_tickers: list[str] = []
+        self._listen_task: Optional[asyncio.Task] = None
+        self._reconnect_attempts = 0
+        self._msg_id = 0
+        self.on_update: Optional[callable] = None
+        self._private_key = None
+
+    def _load_private_key(self):
+        """Load RSA private key for Kalshi auth."""
+        if self._private_key is not None:
+            return self._private_key
+
+        from cryptography.hazmat.primitives.serialization import load_pem_private_key
+
+        key_path = Path(KALSHI_PRIVATE_KEY_PATH).expanduser()
+        if not key_path.exists():
+            raise FileNotFoundError(
+                f"Kalshi private key not found at {key_path}. "
+                "Set KALSHI_PRIVATE_KEY_PATH env var."
+            )
+        self._private_key = load_pem_private_key(
+            key_path.read_bytes(), password=None,
+        )
+        return self._private_key
+
+    def _sign_ws_request(self) -> dict[str, str]:
+        """Generate auth headers for the Kalshi WS handshake."""
+        from cryptography.hazmat.primitives.asymmetric import padding
+        from cryptography.hazmat.primitives import hashes
+
+        if not KALSHI_API_KEY:
+            raise ValueError("KALSHI_API_KEY env var is required for websocket auth.")
+
+        key = self._load_private_key()
+        timestamp_ms = str(int(time.time() * 1000))
+        message = f"{timestamp_ms}GET/trade-api/ws/v2"
+        signature = key.sign(
+            message.encode(),
+            padding.PSS(
+                mgf=padding.MGF1(hashes.SHA256()),
+                salt_length=padding.PSS.MAX_LENGTH,
+            ),
+            hashes.SHA256(),
+        )
+        import base64
+        sig_b64 = base64.b64encode(signature).decode()
+
+        return {
+            "KALSHI-ACCESS-KEY": KALSHI_API_KEY,
+            "KALSHI-ACCESS-SIGNATURE": sig_b64,
+            "KALSHI-ACCESS-TIMESTAMP": timestamp_ms,
+        }
+
+    async def connect(self) -> None:
+        """Open the authenticated websocket connection."""
+        self._session = aiohttp.ClientSession()
+        await self._do_connect()
+
+    async def _do_connect(self) -> None:
+        try:
+            headers = self._sign_ws_request()
+            self._ws = await self._session.ws_connect(
+                KALSHI_WS_URL,
+                headers=headers,
+                heartbeat=30,
+                timeout=aiohttp.ClientTimeout(total=15),
+            )
+            self._connected = True
+            self._reconnect_attempts = 0
+            logging.info("[Kalshi-WS] Connected to %s", KALSHI_WS_URL)
+
+            # Re-subscribe if reconnecting
+            if self._subscribed_tickers:
+                self._msg_id += 1
+                msg = {
+                    "id": self._msg_id,
+                    "cmd": "subscribe",
+                    "params": {
+                        "channels": ["orderbook_delta"],
+                        "market_tickers": self._subscribed_tickers,
+                    },
+                }
+                await self._ws.send_json(msg)
+                logging.info(
+                    "[Kalshi-WS] Re-subscribed to %d tickers",
+                    len(self._subscribed_tickers),
+                )
+
+            self._listen_task = asyncio.create_task(self._listen_loop())
+
+        except Exception as exc:
+            logging.error("[Kalshi-WS] Connection failed: %s", exc)
+            self._connected = False
+            await self._schedule_reconnect()
+
+    async def _listen_loop(self) -> None:
+        try:
+            async for msg in self._ws:
+                if msg.type == aiohttp.WSMsgType.TEXT:
+                    try:
+                        data = json.loads(msg.data)
+                    except json.JSONDecodeError:
+                        continue
+                    self._handle_message(data)
+                elif msg.type in (
+                    aiohttp.WSMsgType.CLOSED,
+                    aiohttp.WSMsgType.ERROR,
+                ):
+                    break
+        except Exception as exc:
+            logging.warning("[Kalshi-WS] Listen error: %s", exc)
+
+        self._connected = False
+        logging.warning("[Kalshi-WS] Disconnected, scheduling reconnect…")
+        await self._schedule_reconnect()
+
+    def _handle_message(self, data: dict) -> None:
+        msg_type = data.get("type", "")
+
+        if msg_type == "orderbook_snapshot":
+            inner = data.get("msg", {})
+            ticker = inner.get("market_ticker", "")
+            if ticker not in self._books:
+                self._books[ticker] = {
+                    "yes": _LocalOrderbook(),
+                    "no": _LocalOrderbook(),
+                }
+            self._books[ticker]["yes"].apply_snapshot_kalshi(
+                inner.get("yes", []),
+            )
+            self._books[ticker]["no"].apply_snapshot_kalshi(
+                inner.get("no", []),
+            )
+            if self.on_update:
+                self.on_update(ticker)
+
+        elif msg_type == "orderbook_delta":
+            inner = data.get("msg", {})
+            ticker = inner.get("market_ticker", "")
+            side = inner.get("side", "")
+            if ticker in self._books and side in self._books[ticker]:
+                self._books[ticker][side].apply_delta_kalshi(
+                    inner.get("price", 0), inner.get("delta", 0),
+                )
+                if self.on_update:
+                    self.on_update(ticker)
+
+        elif msg_type == "error":
+            logging.error(
+                "[Kalshi-WS] Error code=%s: %s",
+                data.get("code"), data.get("msg"),
+            )
+
+    async def _schedule_reconnect(self) -> None:
+        self._reconnect_attempts += 1
+        delay = min(
+            WS_RECONNECT_BASE * (2 ** (self._reconnect_attempts - 1)),
+            WS_RECONNECT_MAX,
+        )
+        logging.info("[Kalshi-WS] Reconnecting in %.1fs (attempt %d)…",
+                     delay, self._reconnect_attempts)
+        await asyncio.sleep(delay)
+        await self._do_connect()
+
+    async def subscribe(self, ticker: str) -> None:
+        """Subscribe to orderbook updates for a ticker."""
+        if ticker not in self._books:
+            self._books[ticker] = {
+                "yes": _LocalOrderbook(),
+                "no": _LocalOrderbook(),
+            }
+        if ticker not in self._subscribed_tickers:
+            self._subscribed_tickers.append(ticker)
+
+        if self._connected and self._ws and not self._ws.closed:
+            self._msg_id += 1
+            msg = {
+                "id": self._msg_id,
+                "cmd": "subscribe",
+                "params": {
+                    "channels": ["orderbook_delta"],
+                    "market_tickers": [ticker],
+                },
+            }
+            await self._ws.send_json(msg)
+            logging.info("[Kalshi-WS] Subscribed to %s", ticker)
+
+    def get_snapshot(self, ticker: str) -> Optional[MarketSnapshot]:
+        """Build a MarketSnapshot from local orderbook state.
+
+        Kalshi books store bids per side. Asks are implied:
+            Ask(Yes) = 1.0 - Bid(No)
+            Ask(No)  = 1.0 - Bid(Yes)
+        """
+        sides = self._books.get(ticker)
+        if sides is None:
+            return None
+
+        yes_bids_tob = sides["yes"].to_tob()
+        no_bids_tob = sides["no"].to_tob()
+
+        yes = TopOfBook()
+        no = TopOfBook()
+
+        # Yes bids -> Yes bid, implied No ask
+        if yes_bids_tob.best_bid is not None:
+            yes.best_bid = yes_bids_tob.best_bid
+            yes.best_bid_size = yes_bids_tob.best_bid_size
+            yes.bid_levels = yes_bids_tob.bid_levels
+            no.best_ask = round(1.0 - yes_bids_tob.best_bid, 4)
+            no.best_ask_size = yes_bids_tob.best_bid_size
+            no.ask_levels = [
+                OrderbookLevel(price=round(1.0 - lvl.price, 4), size=lvl.size)
+                for lvl in yes_bids_tob.bid_levels
+            ]
+
+        # No bids -> No bid, implied Yes ask
+        if no_bids_tob.best_bid is not None:
+            no.best_bid = no_bids_tob.best_bid
+            no.best_bid_size = no_bids_tob.best_bid_size
+            no.bid_levels = no_bids_tob.bid_levels
+            yes.best_ask = round(1.0 - no_bids_tob.best_bid, 4)
+            yes.best_ask_size = no_bids_tob.best_bid_size
+            yes.ask_levels = [
+                OrderbookLevel(price=round(1.0 - lvl.price, 4), size=lvl.size)
+                for lvl in no_bids_tob.bid_levels
+            ]
+
+        if yes.best_bid is None and yes.best_ask is None:
+            if no.best_bid is None and no.best_ask is None:
+                return None
+
+        return MarketSnapshot(
+            yes=yes, no=no, source="kalshi", price_source="book",
+        )
+
+    async def close(self) -> None:
+        self._connected = False
+        if self._listen_task:
+            self._listen_task.cancel()
+        if self._ws and not self._ws.closed:
+            await self._ws.close()
+        if self._session and not self._session.closed:
+            await self._session.close()
+        logging.info("[Kalshi-WS] Closed.")
+
+
+# ====================================================================
 # ArbEngine — price comparison & opportunity detection
 # ====================================================================
 
@@ -689,10 +1287,30 @@ class ArbEngine:
       Direction B:  Buy NO on Kalshi   +  Buy YES on Polymarket
 
     If total cost + fees < $1.00, the difference is risk-free profit.
+
+    Position sizing is based on actual orderbook depth — the max
+    fillable contracts is the minimum of available depth on both legs.
     """
 
     def __init__(self, min_margin: float = MIN_PROFIT_MARGIN):
         self.min_margin = min_margin
+
+    @staticmethod
+    def _fillable_contracts(
+        k_ask_levels: list[OrderbookLevel],
+        p_ask_levels: list[OrderbookLevel],
+    ) -> tuple[int, int, int]:
+        """Walk both orderbooks to find how many contracts can be filled.
+
+        For the arb to work at the top-of-book price, we can only fill
+        as many contracts as are available at the best ask on BOTH sides.
+
+        Returns (max_contracts, kalshi_depth_at_best, poly_depth_at_best).
+        """
+        k_depth = int(k_ask_levels[0].size) if k_ask_levels else 0
+        p_depth = int(p_ask_levels[0].size) if p_ask_levels else 0
+        fillable = min(k_depth, p_depth)
+        return fillable, k_depth, p_depth
 
     def check(
         self,
@@ -711,6 +1329,7 @@ class ArbEngine:
                 now, event_name,
                 "Buy YES@Kalshi + Buy NO@Polymarket",
                 kalshi.yes.best_ask, poly.no.best_ask,
+                kalshi.yes.ask_levels, poly.no.ask_levels,
                 fetch_latency_ms,
             )
             if opp is not None:
@@ -722,6 +1341,7 @@ class ArbEngine:
                 now, event_name,
                 "Buy NO@Kalshi + Buy YES@Polymarket",
                 kalshi.no.best_ask, poly.yes.best_ask,
+                kalshi.no.ask_levels, poly.yes.ask_levels,
                 fetch_latency_ms,
             )
             if opp is not None:
@@ -736,9 +1356,11 @@ class ArbEngine:
         direction: str,
         k_price: float,
         p_price: float,
+        k_ask_levels: list[OrderbookLevel],
+        p_ask_levels: list[OrderbookLevel],
         fetch_ms: int,
     ) -> Optional[ArbOpportunity]:
-        """Evaluate one direction, applying fees. Return opp or None."""
+        """Evaluate one direction, applying fees and depth. Return opp or None."""
         cost = round(k_price + p_price, 6)
         gross_profit = round(1.0 - cost, 6)
 
@@ -748,6 +1370,10 @@ class ArbEngine:
         k_fee = kalshi_taker_fee(k_price, 1)
         p_fee = poly_taker_fee(p_price, 1)
         net_profit = round(1.0 - cost - k_fee - p_fee, 6)
+
+        max_contracts, k_depth, p_depth = self._fillable_contracts(
+            k_ask_levels, p_ask_levels,
+        )
 
         return ArbOpportunity(
             timestamp=timestamp,
@@ -761,6 +1387,9 @@ class ArbEngine:
             gross_profit=gross_profit,
             net_profit=net_profit,
             fetch_latency_ms=fetch_ms,
+            max_contracts=max_contracts,
+            kalshi_depth=k_depth,
+            poly_depth=p_depth,
         )
 
 
@@ -786,6 +1415,9 @@ class PaperTrader:
         "gross_profit",
         "net_profit",
         "net_profit_pct",
+        "max_contracts",
+        "kalshi_depth",
+        "poly_depth",
         "fetch_ms",
     ]
 
@@ -819,6 +1451,9 @@ class PaperTrader:
             "gross_profit": f"{opp.gross_profit:.4f}",
             "net_profit": f"{opp.net_profit:.4f}",
             "net_profit_pct": f"{opp.net_profit * 100:.2f}%",
+            "max_contracts": opp.max_contracts,
+            "kalshi_depth": opp.kalshi_depth,
+            "poly_depth": opp.poly_depth,
             "fetch_ms": opp.fetch_latency_ms,
         }
         with open(self.path, mode="a", newline="") as fh:
@@ -907,9 +1542,18 @@ class PaperPortfolio:
         if cost_plus_fees <= 0:
             return None
 
-        # Size the trade
-        max_contracts = int(min(self.position_size, self.capital) / cost_plus_fees)
+        # Size the trade — capped by capital AND orderbook depth
+        capital_max = int(min(self.position_size, self.capital) / cost_plus_fees)
+        depth_max = opp.max_contracts if opp.max_contracts > 0 else capital_max
+        max_contracts = min(capital_max, depth_max)
         if max_contracts < 1:
+            if depth_max < 1:
+                logging.info(
+                    "  PORTFOLIO: Skipped [%s] %s — insufficient depth "
+                    "(Kalshi: %d, Poly: %d)",
+                    opp.event_name, opp.direction,
+                    opp.kalshi_depth, opp.poly_depth,
+                )
             return None
 
         total_outlay = round(max_contracts * cost_plus_fees, 4)
@@ -1016,13 +1660,14 @@ def _fmt_price(price: Optional[float]) -> str:
     return f"${price:.4f}" if price is not None else "  n/a  "
 
 
-def _print_banner(active_events: list[dict]) -> None:
+def _print_banner(active_events: list[dict], mode: str = "websocket") -> None:
     """Print a startup banner with current configuration."""
     logging.info("=" * 62)
-    logging.info("  ARBITRAGE PAPER-TRADING BOT  v3.0")
+    logging.info("  ARBITRAGE PAPER-TRADING BOT  v4.0")
     logging.info("  NO REAL TRADES WILL BE EXECUTED")
     logging.info("=" * 62)
-    logging.info("  Poll interval   : %ds", CHECK_INTERVAL)
+    logging.info("  Data mode       : %s", mode)
+    logging.info("  Check interval  : %ds", CHECK_INTERVAL)
     logging.info("  Min gross margin: %.2f%%", MIN_PROFIT_MARGIN * 100)
     logging.info("  Kalshi fee rate : %.2f%%", KALSHI_FEE_RATE * 100)
     logging.info("  Poly fee rate   : %.2f%%", POLY_FEE_RATE * 100)
@@ -1032,18 +1677,95 @@ def _print_banner(active_events: list[dict]) -> None:
     logging.info("  Portfolio file  : %s", PORTFOLIO_FILE)
     logging.info("  Events tracked  : %d", len(active_events))
     for ev in active_events:
-        logging.info("    • %s", ev["name"])
+        logging.info("    - %s", ev["name"])
     logging.info("=" * 62)
+
+
+def _log_opportunity(opp: ArbOpportunity) -> None:
+    """Log a detected arb opportunity with depth info."""
+    net_label = (
+        f"Net: ${opp.net_profit:.4f}"
+        if opp.net_profit > 0
+        else f"Net: -${abs(opp.net_profit):.4f} (fees eat profit)"
+    )
+    logging.info(
+        "*** OPP [%s] %s | "
+        "Gross: %.2f%% | %s | Fees: $%.4f | "
+        "Depth: K=%d P=%d Fill=%d ***",
+        opp.event_name,
+        opp.direction,
+        opp.gross_profit * 100,
+        net_label,
+        opp.kalshi_fee + opp.poly_fee,
+        opp.kalshi_depth,
+        opp.poly_depth,
+        opp.max_contracts,
+    )
 
 
 # ====================================================================
 # Main loop
 # ====================================================================
 
+async def _setup_websockets(
+    active_events: list[dict],
+    fetcher: MarketFetcher,
+) -> tuple[Optional[KalshiWS], Optional[PolymarketWS]]:
+    """Connect websockets and subscribe to all active events.
+
+    Returns (kalshi_ws, poly_ws). Either may be None if connection fails,
+    in which case the main loop falls back to REST polling for that platform.
+    """
+    kalshi_ws: Optional[KalshiWS] = None
+    poly_ws: Optional[PolymarketWS] = None
+
+    # ── Kalshi websocket (requires auth) ──
+    if KALSHI_API_KEY and KALSHI_PRIVATE_KEY_PATH:
+        try:
+            kalshi_ws = KalshiWS()
+            await kalshi_ws.connect()
+            for ev in active_events:
+                await kalshi_ws.subscribe(ev["kalshi_ticker"])
+            logging.info("[Kalshi-WS] Subscribed to %d markets.", len(active_events))
+        except Exception as exc:
+            logging.warning(
+                "[Kalshi-WS] Failed to connect (%s). Falling back to REST polling.",
+                exc,
+            )
+            kalshi_ws = None
+    else:
+        logging.info(
+            "[Kalshi] No API credentials found (KALSHI_API_KEY / "
+            "KALSHI_PRIVATE_KEY_PATH). Using REST polling."
+        )
+
+    # ── Polymarket websocket (no auth) ──
+    try:
+        poly_ws = PolymarketWS()
+        await poly_ws.connect()
+
+        # Resolve token IDs for each event, then subscribe
+        for ev in active_events:
+            cond_id = ev["poly_condition_id"]
+            tokens = await fetcher._resolve_poly_tokens(cond_id)
+            if tokens:
+                await poly_ws.subscribe(cond_id, tokens[0], tokens[1])
+
+        logging.info("[Poly-WS] Subscribed to %d markets.", len(active_events))
+    except Exception as exc:
+        logging.warning(
+            "[Poly-WS] Failed to connect (%s). Falling back to REST polling.",
+            exc,
+        )
+        poly_ws = None
+
+    return kalshi_ws, poly_ws
+
+
 async def main() -> None:
     logging.basicConfig(
         level=logging.INFO,
-        format="%(asctime)s │ %(levelname)-7s │ %(message)s",
+        format="%(asctime)s | %(levelname)-7s | %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
 
@@ -1062,20 +1784,36 @@ async def main() -> None:
         path=PORTFOLIO_FILE,
     )
 
-    _print_banner(active_events)
+    # ── Connect websockets ──
+    kalshi_ws, poly_ws = await _setup_websockets(active_events, fetcher)
+
+    mode_parts = []
+    if kalshi_ws:
+        mode_parts.append("Kalshi=WS")
+    else:
+        mode_parts.append("Kalshi=REST")
+    if poly_ws:
+        mode_parts.append("Poly=WS")
+    else:
+        mode_parts.append("Poly=REST")
+    mode_str = ", ".join(mode_parts)
+
+    _print_banner(active_events, mode=mode_str)
+
+    # Give websockets a moment to receive initial snapshots
+    if kalshi_ws or poly_ws:
+        logging.info("Waiting %.0fs for initial WS snapshots…", CHECK_INTERVAL)
+        await asyncio.sleep(CHECK_INTERVAL)
 
     cycle = 0
     total_opps = 0
-    # Track consecutive cycles where we get no usable price data per event.
-    # Once we exceed STALE_CYCLE_THRESHOLD, treat as resolved (the game
-    # likely ended but the APIs haven't officially settled yet).
     stale_counts: dict[str, int] = {ev["name"]: 0 for ev in active_events}
 
     try:
         while active_events:
             cycle += 1
             logging.info(
-                "─── Cycle %d (%d active events) ───", cycle, len(active_events)
+                "--- Cycle %d (%d active events) ---", cycle, len(active_events)
             )
 
             resolved_indices: list[int] = []
@@ -1085,7 +1823,7 @@ async def main() -> None:
                 ticker = event_cfg["kalshi_ticker"]
                 cond_id = event_cfg["poly_condition_id"]
 
-                # ── Check if either market has resolved ──────────
+                # ── Check if either market has resolved ──
                 kalshi_live, poly_live = await asyncio.gather(
                     fetcher.check_kalshi_active(ticker),
                     fetcher.check_poly_active(cond_id),
@@ -1100,16 +1838,30 @@ async def main() -> None:
                     resolved_indices.append(idx)
                     continue
 
-                # ── Fetch prices concurrently + measure latency ──
+                # ── Get snapshots (WS local book or REST fallback) ──
                 loop = asyncio.get_running_loop()
                 t0 = loop.time()
-                kalshi_snap, poly_snap = await fetcher.fetch_both(ticker, cond_id)
+
+                # Kalshi snapshot
+                kalshi_snap: Optional[MarketSnapshot] = None
+                if kalshi_ws:
+                    kalshi_snap = kalshi_ws.get_snapshot(ticker)
+                if kalshi_snap is None:
+                    kalshi_snap = await fetcher.fetch_kalshi(ticker)
+
+                # Polymarket snapshot
+                poly_snap: Optional[MarketSnapshot] = None
+                if poly_ws:
+                    poly_snap = poly_ws.get_snapshot(cond_id)
+                if poly_snap is None:
+                    poly_snap = await fetcher.fetch_polymarket(cond_id)
+
                 fetch_ms = int((loop.time() - t0) * 1000)
 
                 if kalshi_snap is None or poly_snap is None:
                     stale_counts[name] = stale_counts.get(name, 0) + 1
                     logging.warning(
-                        "[%s] Skipped — could not fetch data from one or both "
+                        "[%s] Skipped — could not get data from one or both "
                         "platforms. (stale %d/%d)",
                         name, stale_counts[name], STALE_CYCLE_THRESHOLD,
                     )
@@ -1123,7 +1875,7 @@ async def main() -> None:
                         resolved_indices.append(idx)
                     continue
 
-                # ── Check for empty orderbooks (both sides have no ask) ──
+                # ── Check for empty orderbooks ──
                 kalshi_has_data = (
                     kalshi_snap.yes.best_ask is not None
                     or kalshi_snap.no.best_ask is not None
@@ -1149,51 +1901,46 @@ async def main() -> None:
                         resolved_indices.append(idx)
                     continue
 
-                # Got real data — reset the stale counter
                 stale_counts[name] = 0
 
-                # ── Log current top-of-book ──────────────────────
+                # ── Log current top-of-book with depth ──
+                k_src = "WS" if kalshi_ws and kalshi_ws.get_snapshot(ticker) else "REST"
+                p_src = "WS" if poly_ws and poly_ws.get_snapshot(cond_id) else "REST"
                 logging.info(
-                    "[%s] Kalshi   Yes Ask=%s  No Ask=%s",
-                    name,
+                    "[%s] Kalshi(%s)  Yes Ask=%s (%s)  No Ask=%s (%s)",
+                    name, k_src,
                     _fmt_price(kalshi_snap.yes.best_ask),
+                    f"d={int(kalshi_snap.yes.best_ask_size)}"
+                    if kalshi_snap.yes.best_ask_size else "d=?",
                     _fmt_price(kalshi_snap.no.best_ask),
+                    f"d={int(kalshi_snap.no.best_ask_size)}"
+                    if kalshi_snap.no.best_ask_size else "d=?",
                 )
-                poly_src = f"({poly_snap.price_source})"
                 logging.info(
-                    "[%s] Poly %s Yes Ask=%s  No Ask=%s  [%dms]",
-                    name, poly_src,
+                    "[%s] Poly(%s)    Yes Ask=%s (%s)  No Ask=%s (%s)  [%dms]",
+                    name, p_src,
                     _fmt_price(poly_snap.yes.best_ask),
+                    f"d={int(poly_snap.yes.best_ask_size)}"
+                    if poly_snap.yes.best_ask_size else "d=?",
                     _fmt_price(poly_snap.no.best_ask),
+                    f"d={int(poly_snap.no.best_ask_size)}"
+                    if poly_snap.no.best_ask_size else "d=?",
                     fetch_ms,
                 )
 
-                # ── Check for arbitrage ──────────────────────────
+                # ── Check for arbitrage ──
                 opps = engine.check(name, kalshi_snap, poly_snap, fetch_ms)
 
                 if opps:
                     for opp in opps:
                         total_opps += 1
-                        net_label = (
-                            f"Net: ${opp.net_profit:.4f}"
-                            if opp.net_profit > 0
-                            else f"Net: -${abs(opp.net_profit):.4f} (fees eat profit)"
-                        )
-                        logging.info(
-                            "*** OPP [%s] %s │ "
-                            "Gross: %.2f%% │ %s │ Fees: $%.4f ***",
-                            opp.event_name,
-                            opp.direction,
-                            opp.gross_profit * 100,
-                            net_label,
-                            opp.kalshi_fee + opp.poly_fee,
-                        )
+                        _log_opportunity(opp)
                         trader.log(opp)
                         portfolio.try_open(opp)
                 else:
                     logging.info("[%s] No arb this cycle.", name)
 
-            # ── Remove resolved events ───────────────────────────
+            # ── Remove resolved events ──
             for idx in reversed(resolved_indices):
                 removed = active_events.pop(idx)
                 stale_counts.pop(removed["name"], None)
@@ -1215,8 +1962,11 @@ async def main() -> None:
             "Shutting down (Ctrl+C). %d opportunities logged.", total_opps
         )
     finally:
+        if kalshi_ws:
+            await kalshi_ws.close()
+        if poly_ws:
+            await poly_ws.close()
         await fetcher.close()
-        # Print portfolio summary
         logging.info("")
         for line in portfolio.summary().split("\n"):
             logging.info(line)

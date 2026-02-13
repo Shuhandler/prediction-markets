@@ -208,3 +208,9 @@ __marimo__/
 
 # Project data output
 data/
+
+# Environment variables
+.env
+
+# Key files
+keys/
