@@ -37,14 +37,14 @@ _Do first — unblocks everything else._
 
 _Critical for live trading — builds on Phase 1 risk management._
 
-- [ ] New `UnwindManager` class with sequential execution + rollback:
+- [x] New `UnwindManager` class with sequential execution + rollback:
   - Submit Leg 1 → await fill confirmation → Submit Leg 2 → await fill confirmation
   - If Leg 2 fails/times out: immediately sell Leg 1 at market to unwind
   - If Leg 1 partially fills: adjust Leg 2 size to match, or unwind partial
-- [ ] Add `UNWIND_TIMEOUT_SECONDS` config (e.g. 5s) — if no fill confirmation within timeout, cancel + unwind
-- [ ] Add `StuckPositionMonitor`: background task that detects half-filled arbs older than N seconds and auto-unwinds
-- [ ] Integrate with Discord alerts (Phase 4) — every unwind triggers a notification
-- [ ] Add `UnwindOrder` type to OMS with its own lifecycle tracking
+- [x] Add `UNWIND_TIMEOUT_SECONDS` config (e.g. 5s) — if no fill confirmation within timeout, cancel + unwind
+- [x] Add `StuckPositionMonitor`: background task that detects half-filled arbs older than N seconds and auto-unwinds
+- [x] Integrate with Discord alerts (Phase 4) — every unwind triggers a notification
+- [x] Add `UnwindOrder` type to OMS with its own lifecycle tracking
 
 ---
 
