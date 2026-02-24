@@ -162,6 +162,12 @@ MAX_SPREAD_THRESHOLD: Decimal = D(os.environ.get("MAX_SPREAD_THRESHOLD", "0.20")
 MAX_ORDERS_PER_MINUTE: int = int(os.environ.get("MAX_ORDERS_PER_MINUTE", "10"))
 KILL_FILE: str = os.environ.get("KILL_FILE", "KILL")
 
+# ---- Unwind module (Phase 2) ----
+UNWIND_TIMEOUT_SECONDS: int = int(os.environ.get("UNWIND_TIMEOUT_SECONDS", "5"))
+STUCK_POSITION_MAX_AGE: int = int(os.environ.get("STUCK_POSITION_MAX_AGE", "30"))
+STUCK_POSITION_CHECK_INTERVAL: int = int(os.environ.get("STUCK_POSITION_CHECK_INTERVAL", "10"))
+UNWIND_LOG_FILE: str = os.path.join(DATA_DIR, "unwinds.csv")
+
 # ---- Events file ----
 DEFAULT_EVENTS_FILE: str = os.environ.get("EVENTS_FILE", "events.json")
 
@@ -381,6 +387,75 @@ class Order:
     reject_reason: RejectReason = RejectReason.NONE
     kalshi_depth: int = 0
     poly_depth: int = 0
+
+
+# ====================================================================
+# Unwind Module — OMS data types (Phase 2)
+# ====================================================================
+
+class LegStatus(enum.Enum):
+    """Lifecycle states for a single leg of a two-leg arb trade."""
+    PENDING = "PENDING"
+    SUBMITTED = "SUBMITTED"
+    FILLED = "FILLED"
+    PARTIAL = "PARTIAL"
+    FAILED = "FAILED"
+    CANCELLED = "CANCELLED"
+    UNWOUND = "UNWOUND"
+
+
+@dataclass
+class LegOrder:
+    """A single leg of a two-leg arb trade.
+
+    In paper mode, fills are instant.  In production (Phase 3), the
+    exchange_order_id will map to a real exchange order for tracking.
+    """
+    leg_id: str
+    platform: str              # "kalshi" or "polymarket"
+    side: str                  # "yes" or "no"
+    price: Decimal
+    contracts: int
+    status: LegStatus = LegStatus.PENDING
+    filled_contracts: int = 0
+    submitted_at: str = ""
+    filled_at: str = ""
+    exchange_order_id: str = ""  # real order ID from exchange (Phase 3)
+
+
+class UnwindStatus(enum.Enum):
+    """Lifecycle states for a two-leg arb execution with unwind."""
+    PENDING = "PENDING"
+    LEG1_SUBMITTED = "LEG1_SUBMITTED"
+    LEG1_FILLED = "LEG1_FILLED"
+    LEG2_SUBMITTED = "LEG2_SUBMITTED"
+    COMPLETE = "COMPLETE"          # Both legs filled successfully
+    UNWINDING = "UNWINDING"        # Leg 2 failed — selling Leg 1
+    UNWOUND = "UNWOUND"            # Leg 1 successfully unwound
+    FAILED = "FAILED"              # Unrecoverable failure
+
+
+@dataclass
+class UnwindOrder:
+    """Tracks a two-leg arb trade through sequential execution + unwind.
+
+    Lifecycle:
+      PENDING → LEG1_SUBMITTED → LEG1_FILLED → LEG2_SUBMITTED → COMPLETE
+                                                              → UNWINDING → UNWOUND
+                                                              → FAILED
+    """
+    unwind_id: str
+    event_name: str
+    direction: str
+    status: UnwindStatus = UnwindStatus.PENDING
+    leg1: Optional[LegOrder] = None
+    leg2: Optional[LegOrder] = None
+    unwind_leg: Optional[LegOrder] = None  # sell order if unwind needed
+    created_at: str = ""
+    completed_at: str = ""
+    error_message: str = ""
+    net_profit_per_contract: Decimal = ZERO
+    total_contracts: int = 0
 
 
 # ====================================================================
@@ -2246,18 +2321,572 @@ class RiskManager:
 
 
 # ====================================================================
+# UnwindLogger — CSV logger for unwind lifecycle
+# ====================================================================
+
+class UnwindLogger:
+    """Writes every UnwindOrder to a CSV file for post-session analysis."""
+
+    COLUMNS = [
+        "unwind_id", "timestamp", "event_name", "direction", "status",
+        "total_contracts", "net_profit_per_contract",
+        "leg1_platform", "leg1_side", "leg1_price", "leg1_status",
+        "leg1_filled",
+        "leg2_platform", "leg2_side", "leg2_price", "leg2_status",
+        "leg2_filled",
+        "unwind_platform", "unwind_side", "unwind_price", "unwind_status",
+        "unwind_filled",
+        "error_message",
+    ]
+
+    def __init__(self, path: str = UNWIND_LOG_FILE) -> None:
+        self.path = path
+        self._ensure()
+
+    def _ensure(self) -> None:
+        dir_path = os.path.dirname(self.path)
+        if dir_path:
+            os.makedirs(dir_path, exist_ok=True)
+        if not os.path.exists(self.path):
+            with open(self.path, mode="w", newline="") as fh:
+                csv.DictWriter(fh, fieldnames=self.COLUMNS).writeheader()
+            logging.info("Created unwind ledger → %s", self.path)
+
+    def log(self, uw: UnwindOrder) -> None:
+        """Append one row per unwind order lifecycle event."""
+        def _leg_fields(leg: Optional[LegOrder], prefix: str) -> dict:
+            if leg is None:
+                return {
+                    f"{prefix}_platform": "", f"{prefix}_side": "",
+                    f"{prefix}_price": "", f"{prefix}_status": "",
+                    f"{prefix}_filled": "",
+                }
+            return {
+                f"{prefix}_platform": leg.platform,
+                f"{prefix}_side": leg.side,
+                f"{prefix}_price": f"{leg.price.quantize(Q4)}",
+                f"{prefix}_status": leg.status.value,
+                f"{prefix}_filled": leg.filled_contracts,
+            }
+
+        row: dict = {
+            "unwind_id": uw.unwind_id,
+            "timestamp": uw.completed_at or uw.created_at,
+            "event_name": uw.event_name,
+            "direction": uw.direction,
+            "status": uw.status.value,
+            "total_contracts": uw.total_contracts,
+            "net_profit_per_contract": f"{uw.net_profit_per_contract.quantize(Q4)}",
+            "error_message": uw.error_message,
+        }
+        row.update(_leg_fields(uw.leg1, "leg1"))
+        row.update(_leg_fields(uw.leg2, "leg2"))
+        row.update(_leg_fields(uw.unwind_leg, "unwind"))
+        with open(self.path, mode="a", newline="") as fh:
+            csv.DictWriter(fh, fieldnames=self.COLUMNS).writerow(row)
+
+
+# ====================================================================
+# UnwindManager — sequential two-leg execution with rollback
+# ====================================================================
+
+class UnwindManager:
+    """Sequential two-leg execution with automatic rollback.
+
+    Execution flow:
+      1. Submit Leg 1 (Kalshi) → await fill confirmation (with timeout)
+      2. Submit Leg 2 (Polymarket) → await fill confirmation (with timeout)
+      3. If Leg 2 fails/times out: cancel + sell Leg 1 at market to unwind
+      4. If Leg 1 partially fills: adjust Leg 2 size to match, or unwind
+
+    PAPER MODE: Simulates immediate fills.  No real orders placed.
+    PRODUCTION (Phase 3): Replace _submit_leg() / _unwind_leg() with
+    real API calls to Kalshi and Polymarket.
+    """
+
+    def __init__(
+        self,
+        portfolio: "PaperPortfolio",
+        pnl_tracker: "DailyPnLTracker",
+        timeout: int = UNWIND_TIMEOUT_SECONDS,
+        logger: Optional[UnwindLogger] = None,
+    ) -> None:
+        self._portfolio = portfolio
+        self._pnl_tracker = pnl_tracker
+        self._timeout = timeout
+        self._logger = logger or UnwindLogger()
+        # Active unwind orders (in-flight — not yet COMPLETE/UNWOUND/FAILED)
+        self._active: dict[str, UnwindOrder] = {}
+        # Completed unwind orders (capped for memory)
+        self._completed: list[UnwindOrder] = []
+        # Notification callback for Discord (Phase 4 stub)
+        self._notify_callback: Optional[object] = None
+
+    def set_notify_callback(self, callback) -> None:
+        """Register a callback for Discord alerts (Phase 4).
+
+        Expected signature:  async def callback(message: str, level: str)
+        """
+        self._notify_callback = callback
+
+    # ── Leg construction ──────────────────────────────────────────
+
+    @staticmethod
+    def _build_legs(
+        opp: ArbOpportunity, contracts: int,
+    ) -> tuple[LegOrder, LegOrder]:
+        """Create Leg 1 (Kalshi) and Leg 2 (Polymarket) from an opp."""
+        if "YES@Kalshi" in opp.direction:
+            # Direction A: Buy YES @ Kalshi + Buy NO @ Polymarket
+            leg1 = LegOrder(
+                leg_id=str(uuid.uuid4())[:8],
+                platform="kalshi", side="yes",
+                price=opp.kalshi_price, contracts=contracts,
+            )
+            leg2 = LegOrder(
+                leg_id=str(uuid.uuid4())[:8],
+                platform="polymarket", side="no",
+                price=opp.poly_price, contracts=contracts,
+            )
+        else:
+            # Direction B: Buy NO @ Kalshi + Buy YES @ Polymarket
+            leg1 = LegOrder(
+                leg_id=str(uuid.uuid4())[:8],
+                platform="kalshi", side="no",
+                price=opp.kalshi_price, contracts=contracts,
+            )
+            leg2 = LegOrder(
+                leg_id=str(uuid.uuid4())[:8],
+                platform="polymarket", side="yes",
+                price=opp.poly_price, contracts=contracts,
+            )
+        return leg1, leg2
+
+    # ── Core execution ────────────────────────────────────────────
+
+    async def execute(
+        self, opp: ArbOpportunity, desired_contracts: int,
+    ) -> UnwindOrder:
+        """Execute a two-leg arb trade with unwind protection.
+
+        Returns the completed UnwindOrder (COMPLETE, UNWOUND, or FAILED).
+        """
+        now = _utc_iso()
+        leg1, leg2 = self._build_legs(opp, desired_contracts)
+
+        uw = UnwindOrder(
+            unwind_id=str(uuid.uuid4())[:8],
+            event_name=opp.event_name,
+            direction=opp.direction,
+            status=UnwindStatus.PENDING,
+            leg1=leg1,
+            leg2=leg2,
+            created_at=now,
+            net_profit_per_contract=opp.net_profit,
+            total_contracts=desired_contracts,
+        )
+        self._active[uw.unwind_id] = uw
+
+        try:
+            # ── Step 1: Submit Leg 1 (Kalshi) ──
+            uw.status = UnwindStatus.LEG1_SUBMITTED
+            logging.info(
+                "  [Unwind %s] Leg 1 SUBMITTED: %s %s @ $%s × %d on %s",
+                uw.unwind_id, "BUY", leg1.side.upper(),
+                leg1.price.quantize(Q4), leg1.contracts, leg1.platform,
+            )
+
+            leg1_ok = await self._submit_leg(leg1)
+
+            if not leg1_ok:
+                uw.status = UnwindStatus.FAILED
+                uw.error_message = "Leg 1 submission failed"
+                self._finish(uw)
+                return uw
+
+            if leg1.filled_contracts == 0:
+                uw.status = UnwindStatus.FAILED
+                uw.error_message = "Leg 1 fill returned 0 contracts"
+                self._finish(uw)
+                return uw
+
+            uw.status = UnwindStatus.LEG1_FILLED
+            actual_contracts = leg1.filled_contracts
+            logging.info(
+                "  [Unwind %s] Leg 1 FILLED: %d/%d contracts",
+                uw.unwind_id, actual_contracts, leg1.contracts,
+            )
+
+            # Handle partial fill on Leg 1: adjust Leg 2 size to match
+            if actual_contracts < desired_contracts:
+                logging.warning(
+                    "  [Unwind %s] Leg 1 partial fill (%d/%d). "
+                    "Adjusting Leg 2 to %d contracts.",
+                    uw.unwind_id, actual_contracts, desired_contracts,
+                    actual_contracts,
+                )
+                leg2.contracts = actual_contracts
+                uw.total_contracts = actual_contracts
+
+            # ── Step 2: Submit Leg 2 (Polymarket) ──
+            uw.status = UnwindStatus.LEG2_SUBMITTED
+            logging.info(
+                "  [Unwind %s] Leg 2 SUBMITTED: %s %s @ $%s × %d on %s",
+                uw.unwind_id, "BUY", leg2.side.upper(),
+                leg2.price.quantize(Q4), leg2.contracts, leg2.platform,
+            )
+
+            leg2_ok = await self._submit_leg(leg2)
+
+            if not leg2_ok or leg2.filled_contracts == 0:
+                # Leg 2 failed → unwind Leg 1
+                uw.error_message = (
+                    f"Leg 2 failed (filled {leg2.filled_contracts}/"
+                    f"{leg2.contracts}). Unwinding Leg 1."
+                )
+                logging.warning(
+                    "  [Unwind %s] %s", uw.unwind_id, uw.error_message,
+                )
+                await self._unwind(uw)
+                return uw
+
+            if leg2.filled_contracts < leg2.contracts:
+                # Leg 2 partial fill — unwind the excess from Leg 1
+                excess = actual_contracts - leg2.filled_contracts
+                logging.warning(
+                    "  [Unwind %s] Leg 2 partial fill (%d/%d). "
+                    "Unwinding %d excess contracts from Leg 1.",
+                    uw.unwind_id, leg2.filled_contracts, leg2.contracts,
+                    excess,
+                )
+                # Adjust total to what actually paired
+                uw.total_contracts = leg2.filled_contracts
+                # Unwind the unpaired Leg 1 contracts
+                await self._unwind_partial(uw, excess)
+
+            # ── Both legs filled ──
+            uw.status = UnwindStatus.COMPLETE
+            logging.info(
+                "  [Unwind %s] COMPLETE: %d contracts, "
+                "expected net $%s/contract",
+                uw.unwind_id, uw.total_contracts,
+                uw.net_profit_per_contract.quantize(Q4),
+            )
+            self._notify(
+                f"[Unwind {uw.unwind_id}] COMPLETE: {uw.total_contracts} "
+                f"contracts [{uw.event_name}] {uw.direction} — "
+                f"expected net ${uw.net_profit_per_contract.quantize(Q4)}/c",
+            )
+            self._finish(uw)
+            return uw
+
+        except asyncio.TimeoutError:
+            uw.error_message = (
+                f"Timeout ({self._timeout}s) during execution"
+            )
+            logging.error(
+                "  [Unwind %s] TIMEOUT: %s", uw.unwind_id, uw.error_message,
+            )
+            # If Leg 1 is filled but Leg 2 never completed, unwind
+            if leg1.status == LegStatus.FILLED and leg1.filled_contracts > 0:
+                await self._unwind(uw)
+            else:
+                uw.status = UnwindStatus.FAILED
+                self._finish(uw)
+            return uw
+
+        except Exception as exc:
+            uw.error_message = f"Unexpected error: {exc}"
+            uw.status = UnwindStatus.FAILED
+            logging.error(
+                "  [Unwind %s] ERROR: %s",
+                uw.unwind_id, uw.error_message, exc_info=True,
+            )
+            # Best-effort unwind if Leg 1 was filled
+            if (
+                leg1.status == LegStatus.FILLED
+                and leg1.filled_contracts > 0
+                and uw.status != UnwindStatus.UNWOUND
+            ):
+                try:
+                    await self._unwind(uw)
+                except Exception:
+                    logging.error(
+                        "  [Unwind %s] Unwind also failed!",
+                        uw.unwind_id, exc_info=True,
+                    )
+            self._finish(uw)
+            return uw
+
+    # ── Unwind helpers ────────────────────────────────────────────
+
+    async def _unwind(self, uw: UnwindOrder) -> None:
+        """Sell Leg 1 at market to fully unwind the position."""
+        uw.status = UnwindStatus.UNWINDING
+        leg1 = uw.leg1
+        assert leg1 is not None
+
+        contracts_to_unwind = leg1.filled_contracts
+        if uw.leg2 and uw.leg2.filled_contracts > 0:
+            # Some of Leg 2 filled — only unwind the unpaired excess
+            contracts_to_unwind = leg1.filled_contracts - uw.leg2.filled_contracts
+
+        if contracts_to_unwind <= 0:
+            uw.status = UnwindStatus.COMPLETE
+            self._finish(uw)
+            return
+
+        # Build unwind sell order (opposite of Leg 1 buy)
+        unwind_sell = LegOrder(
+            leg_id=str(uuid.uuid4())[:8],
+            platform=leg1.platform,
+            side=leg1.side,  # selling what we bought
+            price=leg1.price,  # idealized: sell at buy price (paper)
+            contracts=contracts_to_unwind,
+        )
+        uw.unwind_leg = unwind_sell
+
+        logging.warning(
+            "  [Unwind %s] UNWINDING: SELL %s %s @ $%s × %d on %s",
+            uw.unwind_id, unwind_sell.side.upper(),
+            unwind_sell.platform, unwind_sell.price.quantize(Q4),
+            unwind_sell.contracts, unwind_sell.platform,
+        )
+
+        ok = await self._submit_unwind(unwind_sell)
+        if ok:
+            uw.status = UnwindStatus.UNWOUND
+            logging.info(
+                "  [Unwind %s] UNWOUND: sold %d contracts",
+                uw.unwind_id, unwind_sell.filled_contracts,
+            )
+        else:
+            uw.status = UnwindStatus.FAILED
+            uw.error_message += " | Unwind sell also failed!"
+            logging.error(
+                "  [Unwind %s] UNWIND FAILED — MANUAL INTERVENTION NEEDED",
+                uw.unwind_id,
+            )
+
+        self._notify(
+            f"[Unwind {uw.unwind_id}] {uw.status.value}: "
+            f"{uw.event_name} — {uw.error_message}",
+            level="warning",
+        )
+        self._finish(uw)
+
+    async def _unwind_partial(self, uw: UnwindOrder, excess: int) -> None:
+        """Unwind excess contracts when Leg 2 partially fills."""
+        leg1 = uw.leg1
+        assert leg1 is not None
+
+        unwind_sell = LegOrder(
+            leg_id=str(uuid.uuid4())[:8],
+            platform=leg1.platform,
+            side=leg1.side,
+            price=leg1.price,
+            contracts=excess,
+        )
+        uw.unwind_leg = unwind_sell
+
+        logging.warning(
+            "  [Unwind %s] Partial unwind: SELL %d excess contracts on %s",
+            uw.unwind_id, excess, leg1.platform,
+        )
+
+        ok = await self._submit_unwind(unwind_sell)
+        if not ok:
+            uw.error_message += f" | Partial unwind of {excess} contracts failed!"
+            logging.error(
+                "  [Unwind %s] Partial unwind FAILED", uw.unwind_id,
+            )
+
+    # ── Paper-mode leg submission (Phase 3 replaces with real API) ──
+
+    async def _submit_leg(self, leg: LegOrder) -> bool:
+        """Submit a leg order.  Paper mode: simulate immediate full fill.
+
+        PRODUCTION (Phase 3): Replace with real API calls:
+          Kalshi:      POST /trade-api/v2/portfolio/orders
+          Polymarket:  POST signed CLOB order via py_clob_client
+        Then await fill confirmation with self._timeout.
+        """
+        leg.submitted_at = _utc_iso()
+        leg.status = LegStatus.SUBMITTED
+
+        # Paper mode: instant full fill
+        await asyncio.sleep(0)  # yield to event loop
+        leg.status = LegStatus.FILLED
+        leg.filled_contracts = leg.contracts
+        leg.filled_at = _utc_iso()
+        return True
+
+    async def _submit_unwind(self, leg: LegOrder) -> bool:
+        """Submit an unwind (sell) order.  Paper mode: instant fill.
+
+        PRODUCTION (Phase 3): Sell at market on the appropriate exchange.
+        """
+        leg.submitted_at = _utc_iso()
+        leg.status = LegStatus.SUBMITTED
+
+        # Paper mode: instant sell
+        await asyncio.sleep(0)
+        leg.status = LegStatus.UNWOUND
+        leg.filled_contracts = leg.contracts
+        leg.filled_at = _utc_iso()
+        return True
+
+    # ── Stuck position detection ──────────────────────────────────
+
+    def get_stuck_positions(self, max_age_seconds: int) -> list[UnwindOrder]:
+        """Return active unwinds that have been stuck for > max_age_seconds.
+
+        An unwind is 'stuck' if it's in LEG1_FILLED or LEG2_SUBMITTED
+        state for too long (Leg 2 hasn't completed).
+        """
+        stuck: list[UnwindOrder] = []
+        now = _utc_now()
+        stuck_states = {
+            UnwindStatus.LEG1_FILLED,
+            UnwindStatus.LEG2_SUBMITTED,
+            UnwindStatus.LEG1_SUBMITTED,
+        }
+        for uw in self._active.values():
+            if uw.status not in stuck_states:
+                continue
+            created = _parse_iso(uw.created_at)
+            if created and (now - created).total_seconds() > max_age_seconds:
+                stuck.append(uw)
+        return stuck
+
+    async def force_unwind(self, uw: UnwindOrder) -> None:
+        """Force-unwind a stuck position.  Called by StuckPositionMonitor."""
+        logging.warning(
+            "  [Unwind %s] FORCE UNWIND triggered by StuckPositionMonitor",
+            uw.unwind_id,
+        )
+        self._notify(
+            f"[StuckMonitor] Force-unwinding {uw.unwind_id} "
+            f"[{uw.event_name}] — stuck in {uw.status.value}",
+            level="warning",
+        )
+        await self._unwind(uw)
+
+    # ── Lifecycle management ──────────────────────────────────────
+
+    def _finish(self, uw: UnwindOrder) -> None:
+        """Move an unwind order from active to completed."""
+        uw.completed_at = _utc_iso()
+        self._active.pop(uw.unwind_id, None)
+        self._completed.append(uw)
+        # Cap completed list
+        if len(self._completed) > MAX_ORDERS_IN_MEMORY:
+            self._completed = self._completed[-MAX_ORDERS_IN_MEMORY:]
+        self._logger.log(uw)
+
+    def _notify(self, message: str, level: str = "info") -> None:
+        """Notification stub for Discord alerts (Phase 4).
+
+        When Phase 4 is implemented, set_notify_callback() will register
+        the DiscordNotifier.  Until then, this just logs the message.
+        """
+        log_level = getattr(logging, level.upper(), logging.INFO)
+        logging.log(log_level, message)
+        # Phase 4: if self._notify_callback: await self._notify_callback(message, level)
+
+    # ── Accessors ──────────────────────────────────────────────────
+
+    @property
+    def active_count(self) -> int:
+        return len(self._active)
+
+    @property
+    def completed_count(self) -> int:
+        return len(self._completed)
+
+    @property
+    def complete_count(self) -> int:
+        return sum(
+            1 for uw in self._completed
+            if uw.status == UnwindStatus.COMPLETE
+        )
+
+    @property
+    def unwound_count(self) -> int:
+        return sum(
+            1 for uw in self._completed
+            if uw.status in (UnwindStatus.UNWOUND, UnwindStatus.FAILED)
+        )
+
+
+# ====================================================================
+# StuckPositionMonitor — detects half-filled arbs & auto-unwinds
+# ====================================================================
+
+class StuckPositionMonitor:
+    """Background task that detects half-filled arbs and auto-unwinds.
+
+    Runs every STUCK_POSITION_CHECK_INTERVAL seconds.  When an
+    UnwindOrder has been in an intermediate state (LEG1_FILLED,
+    LEG2_SUBMITTED) for longer than STUCK_POSITION_MAX_AGE seconds,
+    triggers an automatic unwind via UnwindManager.force_unwind().
+
+    Integrates with Discord alerts (Phase 4) — every unwind triggers
+    a notification.
+    """
+
+    def __init__(
+        self,
+        unwind_manager: UnwindManager,
+        max_age: int = STUCK_POSITION_MAX_AGE,
+        check_interval: int = STUCK_POSITION_CHECK_INTERVAL,
+    ) -> None:
+        self._manager = unwind_manager
+        self._max_age = max_age
+        self._check_interval = check_interval
+
+    async def run(self, stop_event: asyncio.Event) -> None:
+        """Main loop — runs until stop_event is set."""
+        logging.info(
+            "[StuckMonitor] Started (check every %ds, max age %ds)",
+            self._check_interval, self._max_age,
+        )
+        while not stop_event.is_set():
+            try:
+                await asyncio.wait_for(
+                    stop_event.wait(), timeout=self._check_interval,
+                )
+                return  # stop_event was set
+            except asyncio.TimeoutError:
+                pass  # time to check
+
+            stuck = self._manager.get_stuck_positions(self._max_age)
+            if stuck:
+                logging.warning(
+                    "[StuckMonitor] Found %d stuck position(s)", len(stuck),
+                )
+            for uw in stuck:
+                try:
+                    await self._manager.force_unwind(uw)
+                except Exception as exc:
+                    logging.error(
+                        "[StuckMonitor] Failed to unwind %s: %s",
+                        uw.unwind_id, exc, exc_info=True,
+                    )
+
+
+# ====================================================================
 # ExecutionEngine — EXECUTION: OMS + Fill-or-Kill validation
 # ====================================================================
 # Separates the "should we trade?" question (ArbEngine, the Strategy)
 # from the "can we trade?" and "execute the trade" steps (this class).
 #
-# PRODUCTION TODO: Replace the paper-trading fills below with real
-# API calls:
-#   Kalshi:      POST /trade-api/v2/portfolio/orders
-#   Polymarket:  POST signed CLOB order via py_clob_client
-#
 # The validation pipeline (duplicate, profitability, capital, FOK)
-# stays the same; only step 5 (fill) changes for live trading.
+# stays the same.  The fill step routes through UnwindManager for
+# sequential two-leg execution with automatic rollback.
+#
+# PRODUCTION (Phase 3): Replace UnwindManager's paper-mode fills
+# with real API calls to Kalshi and Polymarket.
 
 class ExecutionEngine:
     """
@@ -2281,21 +2910,25 @@ class ExecutionEngine:
         trader: PaperTrader,
         order_logger: Optional[OrderLogger] = None,
         risk_manager: Optional[RiskManager] = None,
+        unwind_manager: Optional[UnwindManager] = None,
     ):
         self._portfolio = portfolio
         self._trader = trader
         self._order_logger = order_logger or OrderLogger()
         self._risk_manager = risk_manager
+        self._unwind_manager = unwind_manager
         self._orders: list[Order] = []
         # Track which event+direction combos we've already traded
         self._traded: set[tuple[str, str]] = set()
 
-    def submit(self, opp: ArbOpportunity) -> Order:
+    async def submit(self, opp: ArbOpportunity) -> Order:
         """
         Submit a candidate arb trade for execution.
 
         Creates an Order in PENDING state, runs the validation pipeline,
-        and transitions to FILLED or REJECTED.  Returns the finalized Order.
+        and transitions to FILLED or REJECTED.  If all validations pass,
+        the fill is routed through UnwindManager for sequential two-leg
+        execution with automatic rollback protection.
 
         The opportunity is always logged to the trade_ledger CSV regardless
         of whether the order fills.
@@ -2388,45 +3021,66 @@ class ExecutionEngine:
             self._finalize(order)
             return order
 
-        # ── 5. All validations passed — FILL the order ──
+        # ── 5. All validations passed — route through UnwindManager ──
         #
-        # PRODUCTION TODO: Replace this block with real API calls:
-        #
-        #   # Kalshi leg
-        #   kalshi_order = await kalshi_client.create_order(
-        #       ticker=..., action="buy", side="yes"|"no",
-        #       count=desired, type="limit", yes_price=...,
-        #   )
-        #
-        #   # Polymarket leg
-        #   poly_order = await poly_clob_client.create_and_post_order(
-        #       OrderArgs(token_id=..., price=..., size=desired, side=BUY),
-        #   )
-        #
-        #   # Wait for fill confirmations from both platforms.
-        #   # Handle partial fills / rejections and unwind the other leg.
+        # The UnwindManager handles sequential two-leg execution:
+        #   Leg 1 (Kalshi) → await fill → Leg 2 (Poly) → await fill
+        # with automatic rollback if Leg 2 fails or times out.
 
-        total_outlay = (D(desired) * cost_plus_fees).quantize(Q4)
-        order.filled_contracts = desired
-        order.total_outlay = total_outlay
-        order.status = OrderStatus.FILLED
+        if self._unwind_manager is not None:
+            uw_order = await self._unwind_manager.execute(opp, desired)
 
-        # Record in portfolio
-        self._traded.add(key)
-        pos = Position(
-            event_name=opp.event_name,
-            direction=opp.direction,
-            contracts=desired,
-            cost_per_contract=opp.total_cost,
-            fees_per_contract=opp.kalshi_fee + opp.poly_fee,
-            total_outlay=total_outlay,
-            opened_at=opp.timestamp,
-        )
-        self._portfolio.open_position(pos)
+            if uw_order.status != UnwindStatus.COMPLETE:
+                # Unwind occurred or execution failed
+                order.status = OrderStatus.CANCELLED
+                order.reject_reason = RejectReason.NONE
+                order.filled_contracts = 0
+                order.total_outlay = ZERO
+                self._finalize(order)
+                return order
 
-        # Record this fill in the daily P&L tracker
-        if self._risk_manager is not None:
-            self._risk_manager.pnl_tracker.record(opp.net_profit, desired)
+            # Both legs filled — use actual filled quantity
+            actual = uw_order.total_contracts
+            total_outlay = (D(actual) * cost_plus_fees).quantize(Q4)
+            order.filled_contracts = actual
+            order.total_outlay = total_outlay
+            order.status = OrderStatus.FILLED
+
+            self._traded.add(key)
+            pos = Position(
+                event_name=opp.event_name,
+                direction=opp.direction,
+                contracts=actual,
+                cost_per_contract=opp.total_cost,
+                fees_per_contract=opp.kalshi_fee + opp.poly_fee,
+                total_outlay=total_outlay,
+                opened_at=opp.timestamp,
+            )
+            self._portfolio.open_position(pos)
+
+            if self._risk_manager is not None:
+                self._risk_manager.pnl_tracker.record(opp.net_profit, actual)
+        else:
+            # Legacy path (no unwind manager) — instant paper fill
+            total_outlay = (D(desired) * cost_plus_fees).quantize(Q4)
+            order.filled_contracts = desired
+            order.total_outlay = total_outlay
+            order.status = OrderStatus.FILLED
+
+            self._traded.add(key)
+            pos = Position(
+                event_name=opp.event_name,
+                direction=opp.direction,
+                contracts=desired,
+                cost_per_contract=opp.total_cost,
+                fees_per_contract=opp.kalshi_fee + opp.poly_fee,
+                total_outlay=total_outlay,
+                opened_at=opp.timestamp,
+            )
+            self._portfolio.open_position(pos)
+
+            if self._risk_manager is not None:
+                self._risk_manager.pnl_tracker.record(opp.net_profit, desired)
 
         self._finalize(order)
         return order
@@ -2520,6 +3174,9 @@ def _print_banner(active_events: list[dict], mode: str = "event-driven") -> None
     logging.info("  Max spread      : %s%%", (MAX_SPREAD_THRESHOLD * HUNDRED).quantize(Q2))
     logging.info("  Order rate limit: %d/min", MAX_ORDERS_PER_MINUTE)
     logging.info("  Kill file       : %s", KILL_FILE)
+    logging.info("  Unwind timeout  : %ds", UNWIND_TIMEOUT_SECONDS)
+    logging.info("  Stuck pos age   : %ds", STUCK_POSITION_MAX_AGE)
+    logging.info("  Stuck check int : %ds", STUCK_POSITION_CHECK_INTERVAL)
     logging.info("  Ledger file     : %s", LEDGER_FILE)
     logging.info("  Order file      : %s", ORDER_FILE)
     logging.info("  Portfolio file  : %s", PORTFOLIO_FILE)
@@ -2738,7 +3395,7 @@ async def _process_updates(
                 for opp in opps:
                     total_opps += 1
                     _log_opportunity(opp)
-                    execution.submit(opp)
+                    await execution.submit(opp)
 
         except Exception as exc:
             logging.error(
@@ -2829,10 +3486,20 @@ async def main() -> None:
         kill_file=KILL_FILE,
     )
 
+    # ── Unwind module (Phase 2) ──
+    unwind_logger = UnwindLogger(path=UNWIND_LOG_FILE)
+    unwind_manager = UnwindManager(
+        portfolio=portfolio,
+        pnl_tracker=pnl_tracker,
+        timeout=UNWIND_TIMEOUT_SECONDS,
+        logger=unwind_logger,
+    )
+
     execution = ExecutionEngine(
         portfolio=portfolio,
         trader=trader,
         risk_manager=risk_manager,
+        unwind_manager=unwind_manager,
     )
 
     # ── Connect WebSockets ──
@@ -2877,6 +3544,17 @@ async def main() -> None:
             active_events, name_to_event, fetcher, portfolio, stop_event,
         ),
         name="resolution-check",
+    ))
+
+    # Stuck position monitor (Phase 2): auto-unwinds half-filled arbs
+    stuck_monitor = StuckPositionMonitor(
+        unwind_manager=unwind_manager,
+        max_age=STUCK_POSITION_MAX_AGE,
+        check_interval=STUCK_POSITION_CHECK_INTERVAL,
+    )
+    bg_tasks.append(asyncio.create_task(
+        stuck_monitor.run(stop_event),
+        name="stuck-monitor",
     ))
 
     # Give websockets a moment to receive initial snapshots
@@ -2925,6 +3603,12 @@ async def main() -> None:
             "  Daily P&L        : $%s (limit: -$%s)",
             pnl_tracker.daily_pnl.quantize(Q4),
             pnl_tracker.daily_limit.quantize(Q2),
+        )
+        logging.info(
+            "  Unwind orders    : %d complete, %d unwound, %d active",
+            unwind_manager.complete_count,
+            unwind_manager.unwound_count,
+            unwind_manager.active_count,
         )
 
     sys.exit(0)
