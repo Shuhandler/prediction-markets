@@ -38,13 +38,14 @@
   Polymarket websocket requires no authentication.
 
   Usage:
-      1. Edit the EVENTS list in the config section.
-      2. Run:  python arb_bot.py
+      1. Edit events.json (or specify --events-file path).
+      2. Run:  python arb_bot.py [--log-level DEBUG] [--dry-run]
       3. Check data/trade_ledger.csv for logged opportunities.
       4. Check data/orders.csv for full order lifecycle.
       5. Check data/portfolio.csv for simulated positions and P&L.
 """
 
+import argparse
 import asyncio
 import base64
 import csv
@@ -53,11 +54,12 @@ import enum
 import json
 import logging
 import os
+import signal
 import sys
 import time
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal, ROUND_CEILING, ROUND_HALF_UP
 from pathlib import Path
 from typing import Optional
@@ -88,31 +90,33 @@ Q2 = D("0.01")     # quantize to 2 decimal places (dollar amounts)
 # CONFIGURATION — edit these values to suit your needs
 # ====================================================================
 
-MIN_PROFIT_MARGIN: Decimal = D("0.05")  # Minimum gross spread to log
+# All tunable params read from environment (set via .env file) with
+# sensible defaults.  CLI flags can override at runtime — see _parse_args().
+
+MIN_PROFIT_MARGIN: Decimal = D(os.environ.get("MIN_PROFIT_MARGIN", "0.05"))
 DATA_DIR: str = "data"
 LEDGER_FILE: str = os.path.join(DATA_DIR, "trade_ledger.csv")
 PORTFOLIO_FILE: str = os.path.join(DATA_DIR, "portfolio.csv")
 ORDER_FILE: str = os.path.join(DATA_DIR, "orders.csv")
 REQUEST_TIMEOUT: int = 10        # HTTP timeout in seconds
 
-# How many seconds without any WS update before we fall back to REST
-# for an event.  Catches silent WS disconnects.
-STALE_TIMEOUT_SECONDS: int = 30
+# How many seconds without any WS update before we force-reconnect.
+STALE_TIMEOUT_SECONDS: int = int(os.environ.get("STALE_TIMEOUT_SECONDS", "30"))
 
 # ---- Fee rates (Decimal) ----
 # Kalshi taker fee formula: round_up(rate × C × P × (1−P))
 # Source: https://kalshi.com/docs/kalshi-fee-schedule.pdf
-KALSHI_FEE_RATE: Decimal = D("0.07")
+KALSHI_FEE_RATE: Decimal = D(os.environ.get("KALSHI_FEE_RATE", "0.07"))
 
 # Polymarket taker fee — currently 0 for most markets.
 # NCAAB/Serie A markets created after Feb 18 2026 will have fees.
 # When active, the formula is the same shape: rate × C × P × (1−P)
 # Set to ~0.0624 when trading fee-enabled markets (1.56% max at P=0.5).
-POLY_FEE_RATE: Decimal = D("0")
+POLY_FEE_RATE: Decimal = D(os.environ.get("POLY_FEE_RATE", "0"))
 
 # ---- Paper portfolio ----
-STARTING_CAPITAL: Decimal = D("1000.00")  # Dollars to simulate with
-POSITION_SIZE: Decimal = D("50.00")       # Max dollars per trade (both legs)
+STARTING_CAPITAL: Decimal = D(os.environ.get("STARTING_CAPITAL", "1000.00"))
+POSITION_SIZE: Decimal = D(os.environ.get("POSITION_SIZE", "50.00"))
 
 # ---- Retry / backoff settings ----
 MAX_RETRIES: int = 3
@@ -125,10 +129,10 @@ KALSHI_MAX_RPS: float = 5.0
 POLY_MAX_RPS: float = 10.0
 
 # ---- API base URLs (no trailing slash) ----
-KALSHI_BASE = "https://api.elections.kalshi.com/trade-api/v2"
-KALSHI_WS_URL = "wss://api.elections.kalshi.com/trade-api/ws/v2"
-CLOB_BASE = "https://clob.polymarket.com"
-POLY_WS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
+KALSHI_BASE = os.environ.get("KALSHI_BASE", "https://api.elections.kalshi.com/trade-api/v2")
+KALSHI_WS_URL = os.environ.get("KALSHI_WS_URL", "wss://api.elections.kalshi.com/trade-api/ws/v2")
+CLOB_BASE = os.environ.get("CLOB_BASE", "https://clob.polymarket.com")
+POLY_WS_URL = os.environ.get("POLY_WS_URL", "wss://ws-subscriptions-clob.polymarket.com/ws/market")
 
 # ---- Kalshi API credentials (env vars) ----
 KALSHI_API_KEY: str = os.environ.get("KALSHI_API_KEY", "")
@@ -141,32 +145,58 @@ WS_RECONNECT_MAX: float = 30.0   # Max reconnection delay
 
 # ---- Resolution check ----
 RESOLUTION_CHECK_INTERVAL: int = 60  # Seconds between market-alive checks
+# Hours after end_date_iso before treating a Polymarket market as resolved.
+# Accounts for overtime, delayed settlement, and clock skew.
+RESOLUTION_GRACE_HOURS: int = int(os.environ.get("RESOLUTION_GRACE_HOURS", "4"))
+
+# ---- In-memory order cap ----
+# Orders are always persisted to CSV immediately.  This cap limits the
+# in-memory list to avoid unbounded growth during long-running sessions.
+MAX_ORDERS_IN_MEMORY: int = int(os.environ.get("MAX_ORDERS_IN_MEMORY", "1000"))
+
+# ---- Events file ----
+DEFAULT_EVENTS_FILE: str = os.environ.get("EVENTS_FILE", "events.json")
 
 # ====================================================================
-# EVENTS TO MONITOR — add your own pairs here
+# EVENT LOADING — reads from events.json (or --events-file path)
 # ====================================================================
-# Each entry maps the same real-world event across both platforms.
-#   name              : a human-readable label (for logs / CSV)
-#   kalshi_ticker     : the Kalshi market ticker string
-#   poly_condition_id : the Polymarket condition_id (hex string)
 
-EVENTS: list[dict] = [
-    {
-        "name": "Nebraska at Iowa Winner?",
-        "kalshi_ticker": "KXNCAAMBGAME-26FEB17NEBIOWA-NEB",
-        "poly_condition_id": "0xdf643f54ef0037a80aa7daffe1066497be68fc14511d8a1bedaed691bd98a105",
-    },
-    {
-        "name": "Virginia Tech at Miami (FL) Winner?",
-        "kalshi_ticker": "KXNCAAMBGAME-26FEB17VTMIA-VT",
-        "poly_condition_id": "0x534f933826463ea9eed59c0052eaed8caf6cf600c074b9988a276964a493605b",
-    },
-    {
-        "name": "Baylor at Kansas St. Winner?",
-        "kalshi_ticker": "KXNCAAMBGAME-26FEB17BAYKSU-BAY",
-        "poly_condition_id": "0xc877e1c8223cc3a68fe9dcd47b896db8270e0c56c8b42ef6a073f78aaa4e10bb",
-    },
-]
+def _load_events(path: str) -> list[dict]:
+    """Load events from a JSON file.
+
+    The JSON must be a list of objects, each with:
+      - name              : human-readable label
+      - kalshi_ticker     : Kalshi market ticker
+      - poly_condition_id : Polymarket condition_id (hex)
+    """
+    p = Path(path)
+    if not p.exists():
+        logging.error(
+            "Events file '%s' not found. Create it or use --events-file.",
+            path,
+        )
+        sys.exit(1)
+
+    with open(p) as f:
+        events = json.load(f)
+
+    if not isinstance(events, list) or not events:
+        logging.error(
+            "Events file '%s' must contain a non-empty JSON array.", path,
+        )
+        sys.exit(1)
+
+    required = {"name", "kalshi_ticker", "poly_condition_id"}
+    for i, ev in enumerate(events):
+        missing = required - set(ev.keys())
+        if missing:
+            logging.error(
+                "Event #%d in '%s' missing keys: %s", i, path, missing,
+            )
+            sys.exit(1)
+
+    logging.info("Loaded %d events from %s", len(events), path)
+    return events
 
 
 # ====================================================================
@@ -560,16 +590,17 @@ class MarketFetcher:
             )
             return False
 
-        # TODO: Uncomment when I fix why its saying a game is finished when it isn't
-        # 2) Past end date
-        # end_raw = data.get("end_date_iso", "")
-        # end_dt = _parse_iso(str(end_raw)) if end_raw else None
-        # if end_dt and end_dt <= _utc_now():
-        #     logging.info(
-        #         "[Polymarket] Market %s… past end_date_iso (%s). Treating as resolved.",
-        #         condition_id[:16], end_raw,
-        #     )
-        #     return False
+        # 2) Past end date — with grace period to account for overtime,
+        #    delayed settlement, or clock skew.
+        end_raw = data.get("end_date_iso", "")
+        end_dt = _parse_iso(str(end_raw)) if end_raw else None
+        if end_dt and (end_dt + timedelta(hours=RESOLUTION_GRACE_HOURS)) <= _utc_now():
+            logging.info(
+                "[Polymarket] Market %s… past end_date_iso (%s) + %dh grace. "
+                "Treating as resolved.",
+                condition_id[:16], end_raw, RESOLUTION_GRACE_HOURS,
+            )
+            return False
 
         # 3) Cache token IDs
         tokens = data.get("tokens", [])
@@ -2185,9 +2216,17 @@ class ExecutionEngine:
         return order
 
     def _finalize(self, order: Order) -> None:
-        """Log the order to CSV and store in memory for inspection."""
+        """Log the order to CSV and store in memory for inspection.
+
+        Orders are always persisted to CSV immediately.  The in-memory
+        list is capped at MAX_ORDERS_IN_MEMORY to prevent unbounded
+        growth during long-running sessions.
+        """
         self._orders.append(order)
         self._order_logger.log(order)
+
+        if len(self._orders) > MAX_ORDERS_IN_MEMORY:
+            self._orders = self._orders[-MAX_ORDERS_IN_MEMORY:]
 
         if order.status == OrderStatus.FILLED:
             logging.info(
@@ -2230,6 +2269,10 @@ def _fmt_price(price: Optional[Decimal]) -> str:
     return f"${price.quantize(Q4)}" if price is not None else "  n/a  "
 
 
+# Module-level variable set by main() so _print_banner can display it.
+_events_file_path: str = DEFAULT_EVENTS_FILE
+
+
 def _print_banner(active_events: list[dict], mode: str = "event-driven") -> None:
     """Print a startup banner with current configuration."""
     logging.info("=" * 62)
@@ -2258,6 +2301,7 @@ def _print_banner(active_events: list[dict], mode: str = "event-driven") -> None
     logging.info("  Ledger file     : %s", LEDGER_FILE)
     logging.info("  Order file      : %s", ORDER_FILE)
     logging.info("  Portfolio file  : %s", PORTFOLIO_FILE)
+    logging.info("  Events file     : %s", _events_file_path)
     logging.info("  Events tracked  : %d", len(active_events))
     for ev in active_events:
         logging.info("    - %s", ev["name"])
@@ -2483,19 +2527,58 @@ async def _process_updates(
     return total_opps
 
 
+def _parse_args() -> argparse.Namespace:
+    """Parse command-line arguments (Phase 0 — config overrides)."""
+    parser = argparse.ArgumentParser(
+        description="Prediction Market Arbitrage Bot",
+    )
+    parser.add_argument(
+        "--events-file",
+        default=DEFAULT_EVENTS_FILE,
+        help="Path to events JSON file (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--log-level",
+        default=os.environ.get("LOG_LEVEL", "INFO"),
+        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
+        help="Logging level (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Print configuration and exit without trading",
+    )
+    parser.add_argument(
+        "--mode",
+        choices=["paper", "live"],
+        default="paper",
+        help="Trading mode (default: %(default)s). "
+             "'live' is not yet implemented — reserved for Phase 3.",
+    )
+    return parser.parse_args()
+
+
 async def main() -> None:
+    # ── Parse CLI args first (before configuring logging) ──
+    args = _parse_args()
+
     logging.basicConfig(
-        level=logging.INFO,
+        level=getattr(logging, args.log_level),
         format="%(asctime)s | %(levelname)-7s | %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
 
-    if not EVENTS:
-        logging.error("No events configured. Add at least one entry to the EVENTS list.")
+    if args.mode == "live":
+        logging.error("Live trading is not yet implemented (see scope.md Phase 3).")
         sys.exit(1)
 
+    # ── Load events from JSON ──
+    global _events_file_path
+    _events_file_path = args.events_file
+    events = _load_events(args.events_file)
+
     # ── Build event lookup structures ──
-    active_events: list[dict] = list(EVENTS)
+    active_events: list[dict] = list(events)
     name_to_event: dict[str, dict] = {ev["name"]: ev for ev in active_events}
 
     # ── Shared components ──
@@ -2533,6 +2616,21 @@ async def main() -> None:
 
     _print_banner(active_events, mode=mode_str)
 
+    # ── Dry-run: print config and exit ──
+    if args.dry_run:
+        logging.info("--dry-run flag set. Exiting without trading.")
+        if kalshi_ws:
+            await kalshi_ws.close()
+        if poly_ws:
+            await poly_ws.close()
+        await fetcher.close()
+        sys.exit(0)
+
+    # ── SIGTERM / SIGINT signal handlers for graceful shutdown ──
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        loop.add_signal_handler(sig, stop_event.set)
+
     # ── Start background tasks ──
     bg_tasks: list[asyncio.Task] = []
 
@@ -2557,12 +2655,11 @@ async def main() -> None:
             kalshi_ws, poly_ws,
             engine, execution, stop_event,
         )
-    except KeyboardInterrupt:
+    finally:
         logging.info("")
         logging.info(
-            "Shutting down (Ctrl+C). %d opportunities detected.", total_opps,
+            "Shutting down. %d opportunities detected.", total_opps,
         )
-    finally:
         stop_event.set()
 
         # Cancel background tasks
