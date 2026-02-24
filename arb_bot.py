@@ -154,6 +154,14 @@ RESOLUTION_GRACE_HOURS: int = int(os.environ.get("RESOLUTION_GRACE_HOURS", "4"))
 # in-memory list to avoid unbounded growth during long-running sessions.
 MAX_ORDERS_IN_MEMORY: int = int(os.environ.get("MAX_ORDERS_IN_MEMORY", "1000"))
 
+# ---- Risk management ----
+DAILY_LOSS_LIMIT: Decimal = D(os.environ.get("DAILY_LOSS_LIMIT", "100.00"))
+MAX_TOTAL_EXPOSURE: Decimal = D(os.environ.get("MAX_TOTAL_EXPOSURE", "500.00"))
+MAX_CONCURRENT_POSITIONS: int = int(os.environ.get("MAX_CONCURRENT_POSITIONS", "10"))
+MAX_SPREAD_THRESHOLD: Decimal = D(os.environ.get("MAX_SPREAD_THRESHOLD", "0.20"))
+MAX_ORDERS_PER_MINUTE: int = int(os.environ.get("MAX_ORDERS_PER_MINUTE", "10"))
+KILL_FILE: str = os.environ.get("KILL_FILE", "KILL")
+
 # ---- Events file ----
 DEFAULT_EVENTS_FILE: str = os.environ.get("EVENTS_FILE", "events.json")
 
@@ -338,6 +346,13 @@ class RejectReason(enum.Enum):
     DUPLICATE_TRADE = "DUPLICATE_TRADE"
     NET_UNPROFITABLE = "NET_UNPROFITABLE"
     ZERO_CONTRACTS = "ZERO_CONTRACTS"
+    # Phase 1 — risk management reject reasons
+    DAILY_LOSS_LIMIT = "DAILY_LOSS_LIMIT"        # Daily loss limit breached
+    MAX_EXPOSURE = "MAX_EXPOSURE"                # Total exposure cap reached
+    MAX_POSITIONS = "MAX_POSITIONS"              # Too many concurrent positions
+    SPREAD_TOO_WIDE = "SPREAD_TOO_WIDE"          # Spread exceeds sanity threshold
+    ORDER_RATE_LIMIT = "ORDER_RATE_LIMIT"         # Too many orders per minute
+    KILL_SWITCH = "KILL_SWITCH"                   # Kill file detected
 
 
 @dataclass
@@ -2045,6 +2060,192 @@ class OrderLogger:
 
 
 # ====================================================================
+# DailyPnLTracker — tracks realized P&L per calendar day
+# ====================================================================
+
+class DailyPnLTracker:
+    """Tracks realized P&L per calendar day for circuit-breaker logic.
+
+    Every fill's expected P&L is recorded.  When the cumulative daily
+    loss exceeds DAILY_LOSS_LIMIT, the tracker trips the circuit
+    breaker, blocking all new orders for the rest of the day.
+
+    The tracker resets automatically at midnight UTC.
+    """
+
+    def __init__(self, daily_limit: Decimal = DAILY_LOSS_LIMIT) -> None:
+        self._daily_limit = daily_limit
+        self._today: str = self._current_day()
+        self._daily_pnl: Decimal = ZERO
+        self._tripped = False
+
+    @staticmethod
+    def _current_day() -> str:
+        return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+    def _maybe_reset(self) -> None:
+        """Reset if the calendar day has changed."""
+        today = self._current_day()
+        if today != self._today:
+            logging.info(
+                "[DailyPnL] New day %s — resetting. Previous day P&L: $%s",
+                today, self._daily_pnl.quantize(Q4),
+            )
+            self._today = today
+            self._daily_pnl = ZERO
+            self._tripped = False
+
+    def record(self, net_pnl: Decimal, contracts: int) -> None:
+        """Record a fill's expected P&L (net_profit × contracts)."""
+        self._maybe_reset()
+        realized = (net_pnl * D(contracts)).quantize(Q4)
+        self._daily_pnl += realized
+        logging.debug(
+            "[DailyPnL] Recorded $%s — daily total: $%s / -$%s limit",
+            realized.quantize(Q4), self._daily_pnl.quantize(Q4),
+            self._daily_limit.quantize(Q2),
+        )
+        if self._daily_pnl < -self._daily_limit and not self._tripped:
+            self._tripped = True
+            logging.warning(
+                "[DailyPnL] *** CIRCUIT BREAKER TRIPPED *** "
+                "Daily P&L $%s exceeds -$%s limit. Halting new orders.",
+                self._daily_pnl.quantize(Q4), self._daily_limit.quantize(Q2),
+            )
+
+    @property
+    def is_breached(self) -> bool:
+        """True if the daily loss limit has been exceeded."""
+        self._maybe_reset()
+        return self._tripped
+
+    @property
+    def daily_pnl(self) -> Decimal:
+        self._maybe_reset()
+        return self._daily_pnl
+
+    @property
+    def daily_limit(self) -> Decimal:
+        return self._daily_limit
+
+
+# ====================================================================
+# OrderRateLimiter — caps order submissions per minute
+# ====================================================================
+
+class OrderRateLimiter:
+    """Sliding-window rate limiter for order submissions.
+
+    Tracks timestamps of recent submissions and rejects new ones when
+    the count in the last 60 seconds exceeds MAX_ORDERS_PER_MINUTE.
+    """
+
+    def __init__(self, max_per_minute: int = MAX_ORDERS_PER_MINUTE) -> None:
+        self._max = max_per_minute
+        self._timestamps: list[float] = []
+
+    def _prune(self) -> None:
+        """Remove timestamps older than 60 seconds."""
+        cutoff = time.time() - 60.0
+        self._timestamps = [t for t in self._timestamps if t > cutoff]
+
+    def try_acquire(self) -> bool:
+        """Return True if the order is allowed, False if rate-limited."""
+        self._prune()
+        if len(self._timestamps) >= self._max:
+            return False
+        self._timestamps.append(time.time())
+        return True
+
+    @property
+    def recent_count(self) -> int:
+        self._prune()
+        return len(self._timestamps)
+
+
+# ====================================================================
+# RiskManager — aggregates all risk checks into a single gate
+# ====================================================================
+
+class RiskManager:
+    """Central risk management gate checked before every order.
+
+    Consolidates:
+      - Daily loss limit (circuit breaker)
+      - Max total exposure across open positions
+      - Max concurrent positions
+      - Spread sanity check
+      - Order submission rate limit
+      - File-based kill switch
+    """
+
+    def __init__(
+        self,
+        pnl_tracker: DailyPnLTracker,
+        rate_limiter: OrderRateLimiter,
+        portfolio: "PaperPortfolio",
+        *,
+        max_exposure: Decimal = MAX_TOTAL_EXPOSURE,
+        max_positions: int = MAX_CONCURRENT_POSITIONS,
+        max_spread: Decimal = MAX_SPREAD_THRESHOLD,
+        kill_file: str = KILL_FILE,
+    ) -> None:
+        self.pnl_tracker = pnl_tracker
+        self.rate_limiter = rate_limiter
+        self._portfolio = portfolio
+        self._max_exposure = max_exposure
+        self._max_positions = max_positions
+        self._max_spread = max_spread
+        self._kill_file = kill_file
+
+    def check(self, opp: "ArbOpportunity") -> Optional[RejectReason]:
+        """Run all risk checks.  Returns None if OK, or a RejectReason."""
+        # 1. Kill switch
+        if Path(self._kill_file).exists():
+            logging.warning(
+                "[Risk] Kill file '%s' detected — rejecting order.",
+                self._kill_file,
+            )
+            return RejectReason.KILL_SWITCH
+
+        # 2. Daily loss limit
+        if self.pnl_tracker.is_breached:
+            return RejectReason.DAILY_LOSS_LIMIT
+
+        # 3. Spread sanity — reject unreasonably large spreads (likely stale data)
+        if opp.gross_profit > self._max_spread:
+            logging.warning(
+                "[Risk] Spread %.2f%% exceeds %.2f%% sanity threshold for [%s]. "
+                "Likely stale data — rejecting.",
+                float(opp.gross_profit * HUNDRED),
+                float(self._max_spread * HUNDRED),
+                opp.event_name,
+            )
+            return RejectReason.SPREAD_TOO_WIDE
+
+        # 4. Max concurrent positions
+        if len(self._portfolio.open_positions) >= self._max_positions:
+            return RejectReason.MAX_POSITIONS
+
+        # 5. Max total exposure
+        current_exposure = sum(
+            (p.total_outlay for p in self._portfolio.open_positions), ZERO,
+        )
+        if current_exposure >= self._max_exposure:
+            return RejectReason.MAX_EXPOSURE
+
+        # 6. Order rate limit
+        if not self.rate_limiter.try_acquire():
+            logging.warning(
+                "[Risk] Order rate limit (%d/min) hit — rejecting.",
+                self.rate_limiter._max,
+            )
+            return RejectReason.ORDER_RATE_LIMIT
+
+        return None
+
+
+# ====================================================================
 # ExecutionEngine — EXECUTION: OMS + Fill-or-Kill validation
 # ====================================================================
 # Separates the "should we trade?" question (ArbEngine, the Strategy)
@@ -2079,10 +2280,12 @@ class ExecutionEngine:
         portfolio: PaperPortfolio,
         trader: PaperTrader,
         order_logger: Optional[OrderLogger] = None,
+        risk_manager: Optional[RiskManager] = None,
     ):
         self._portfolio = portfolio
         self._trader = trader
         self._order_logger = order_logger or OrderLogger()
+        self._risk_manager = risk_manager
         self._orders: list[Order] = []
         # Track which event+direction combos we've already traded
         self._traded: set[tuple[str, str]] = set()
@@ -2121,6 +2324,15 @@ class ExecutionEngine:
         )
 
         # ── Validation pipeline ──
+
+        # 0. Risk management gate (Phase 1)
+        if self._risk_manager is not None:
+            risk_reject = self._risk_manager.check(opp)
+            if risk_reject is not None:
+                order.status = OrderStatus.REJECTED
+                order.reject_reason = risk_reject
+                self._finalize(order)
+                return order
 
         # 1. Duplicate check
         key = (opp.event_name, opp.direction)
@@ -2212,6 +2424,10 @@ class ExecutionEngine:
         )
         self._portfolio.open_position(pos)
 
+        # Record this fill in the daily P&L tracker
+        if self._risk_manager is not None:
+            self._risk_manager.pnl_tracker.record(opp.net_profit, desired)
+
         self._finalize(order)
         return order
 
@@ -2298,6 +2514,12 @@ def _print_banner(active_events: list[dict], mode: str = "event-driven") -> None
     logging.info("  Starting capital: $%s", STARTING_CAPITAL.quantize(Q2))
     logging.info("  Position size   : $%s", POSITION_SIZE.quantize(Q2))
     logging.info("  Stale timeout   : %ds", STALE_TIMEOUT_SECONDS)
+    logging.info("  Daily loss limit: $%s", DAILY_LOSS_LIMIT.quantize(Q2))
+    logging.info("  Max exposure    : $%s", MAX_TOTAL_EXPOSURE.quantize(Q2))
+    logging.info("  Max positions   : %d", MAX_CONCURRENT_POSITIONS)
+    logging.info("  Max spread      : %s%%", (MAX_SPREAD_THRESHOLD * HUNDRED).quantize(Q2))
+    logging.info("  Order rate limit: %d/min", MAX_ORDERS_PER_MINUTE)
+    logging.info("  Kill file       : %s", KILL_FILE)
     logging.info("  Ledger file     : %s", LEDGER_FILE)
     logging.info("  Order file      : %s", ORDER_FILE)
     logging.info("  Portfolio file  : %s", PORTFOLIO_FILE)
@@ -2593,9 +2815,24 @@ async def main() -> None:
         position_size=POSITION_SIZE,
         path=PORTFOLIO_FILE,
     )
+
+    # ── Risk management (Phase 1) ──
+    pnl_tracker = DailyPnLTracker(daily_limit=DAILY_LOSS_LIMIT)
+    order_rate_limiter = OrderRateLimiter(max_per_minute=MAX_ORDERS_PER_MINUTE)
+    risk_manager = RiskManager(
+        pnl_tracker=pnl_tracker,
+        rate_limiter=order_rate_limiter,
+        portfolio=portfolio,
+        max_exposure=MAX_TOTAL_EXPOSURE,
+        max_positions=MAX_CONCURRENT_POSITIONS,
+        max_spread=MAX_SPREAD_THRESHOLD,
+        kill_file=KILL_FILE,
+    )
+
     execution = ExecutionEngine(
         portfolio=portfolio,
         trader=trader,
+        risk_manager=risk_manager,
     )
 
     # ── Connect WebSockets ──
@@ -2683,6 +2920,11 @@ async def main() -> None:
             len(execution.orders),
             execution.filled_count,
             execution.rejected_count,
+        )
+        logging.info(
+            "  Daily P&L        : $%s (limit: -$%s)",
+            pnl_tracker.daily_pnl.quantize(Q4),
+            pnl_tracker.daily_limit.quantize(Q2),
         )
 
     sys.exit(0)
