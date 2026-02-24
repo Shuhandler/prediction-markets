@@ -23,13 +23,13 @@ _Do first — unblocks everything else._
 
 ## Phase 1 — Risk Management & Daily Loss Limits
 
-- [ ] Add `DailyPnLTracker` class: tracks realized + unrealized P&L per calendar day, persists to CSV/SQLite
-- [ ] Add `DAILY_LOSS_LIMIT` config param (e.g. `$100`); circuit-breaker halts all new orders when breached
-- [ ] Add `MAX_TOTAL_EXPOSURE` cap across all open positions
-- [ ] Add `MAX_CONCURRENT_POSITIONS` limit
-- [ ] Add spread sanity check in `ArbEngine.check()`: reject spreads > 20% as likely stale/bad data
-- [ ] Add order submission rate limiter (max N orders/minute) to prevent runaway execution
-- [ ] Add file-based kill switch (`touch KILL` to halt) for emergency remote stop
+- [x] Add `DailyPnLTracker` class: tracks realized + unrealized P&L per calendar day, persists to CSV/SQLite
+- [x] Add `DAILY_LOSS_LIMIT` config param (e.g. `$100`); circuit-breaker halts all new orders when breached
+- [x] Add `MAX_TOTAL_EXPOSURE` cap across all open positions
+- [x] Add `MAX_CONCURRENT_POSITIONS` limit
+- [x] Add spread sanity check in `ArbEngine.check()`: reject spreads > 20% as likely stale/bad data
+- [x] Add order submission rate limiter (max N orders/minute) to prevent runaway execution
+- [x] Add file-based kill switch (`touch KILL` to halt) for emergency remote stop
 
 ---
 
