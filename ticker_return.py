@@ -301,8 +301,8 @@ def main():
     print("    {")
     print(f'        "name": "{name}",')
     print(f'        "kalshi_ticker": "{selected_ticker}",')
-    print(f'        "poly_condition_id": "{condition_id}",')
-    print("    },")
+    print(f'        "poly_condition_id": "{condition_id}"')
+    print("    }")
     print()
 
 
