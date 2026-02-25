@@ -1,17 +1,12 @@
 [
     {
-        "name": "Nebraska at Iowa Winner?",
-        "kalshi_ticker": "KXNCAAMBGAME-26FEB17NEBIOWA-NEB",
-        "poly_condition_id": "0xdf643f54ef0037a80aa7daffe1066497be68fc14511d8a1bedaed691bd98a105"
+        "name": "Golden State at New Orleans Winner?",
+        "kalshi_ticker": "KXNBAGAME-26FEB24GSWNOP-GSW",
+        "poly_condition_id": "0x7cdb2504f2b5c28598efa93e349169c122c51289ed64fcec816ebed49377076c"
     },
     {
-        "name": "Virginia Tech at Miami (FL) Winner?",
-        "kalshi_ticker": "KXNCAAMBGAME-26FEB17VTMIA-VT",
-        "poly_condition_id": "0x534f933826463ea9eed59c0052eaed8caf6cf600c074b9988a276964a493605b"
-    },
-    {
-        "name": "Baylor at Kansas St. Winner?",
-        "kalshi_ticker": "KXNCAAMBGAME-26FEB17BAYKSU-BAY",
-        "poly_condition_id": "0xc877e1c8223cc3a68fe9dcd47b896db8270e0c56c8b42ef6a073f78aaa4e10bb"
+        "name": "Tennessee at Missouri Winner?",
+        "kalshi_ticker": "KXNCAAMBGAME-26FEB24TENNMIZZ-TENN",
+        "poly_condition_id": "0xba7bd969e491109cd0d813dde352dec5abfe8fe05b1fedbafcfab432b6f28577"
     }
 ]

@@ -50,7 +50,7 @@ _Critical for live trading — builds on Phase 1 risk management._
 
 ## Phase 3 — Live Order Execution
 
-- [ ] **Kalshi**: Build authenticated REST order client using existing RSA signing (lines 1307–1329). Endpoint: `POST /trade-api/v2/portfolio/orders`
+- [ ] **Kalshi**: Build authenticated REST order client using existing RSA signing. Endpoint: `POST /trade-api/v2/portfolio/orders`
 - [ ] **Polymarket**: Add `py_clob_client` dependency. Initialize `ClobClient` with Ethereum private key + API credentials. Handle EIP-712 order signing on Polygon
 - [ ] Make `ExecutionEngine.submit()` async — replace paper fill block (lines 2150–2180) with real API calls routed through `UnwindManager`
 - [ ] Update `_process_updates()` call site (line 2480) to `await` execution

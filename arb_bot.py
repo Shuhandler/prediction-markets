@@ -145,9 +145,6 @@ WS_RECONNECT_MAX: float = 30.0   # Max reconnection delay
 
 # ---- Resolution check ----
 RESOLUTION_CHECK_INTERVAL: int = 60  # Seconds between market-alive checks
-# Hours after end_date_iso before treating a Polymarket market as resolved.
-# Accounts for overtime, delayed settlement, and clock skew.
-RESOLUTION_GRACE_HOURS: int = int(os.environ.get("RESOLUTION_GRACE_HOURS", "4"))
 
 # ---- In-memory order cap ----
 # Orders are always persisted to CSV immediately.  This cap limits the
@@ -340,6 +337,7 @@ class OrderStatus(enum.Enum):
     FILLED = "FILLED"
     REJECTED = "REJECTED"
     CANCELLED = "CANCELLED"
+    UNWOUND = "UNWOUND"           # Leg 1 filled then sold back (legging risk realized)
 
 
 class RejectReason(enum.Enum):
@@ -598,10 +596,12 @@ class MarketFetcher:
     async def check_kalshi_active(self, ticker: str) -> bool:
         """Return True if the Kalshi market is still open for trading.
 
-        Checks three signals:
+        Relies strictly on explicit exchange status flags:
         1. Market ``status`` in a set of terminal states.
         2. ``result`` field is populated (outcome known).
-        3. ``close_time`` / ``expiration_time`` is in the past.
+
+        Does NOT use close_time / expiration_time — these are often
+        inaccurate placeholders for live sports markets.
         """
         await self._ensure_session()
         data = await _request_with_retry(
@@ -618,12 +618,10 @@ class MarketFetcher:
         result = market.get("result", "")
 
         logging.debug(
-            "[Kalshi] %s status=%r, result=%r, close_time=%r",
+            "[Kalshi] %s status=%r, result=%r",
             ticker, status, result,
-            market.get("close_time", market.get("expiration_time", "")),
         )
 
-        # 1) Terminal status
         if status in (
             "settled", "closed", "finalized", "determined",
             "ceased_trading", "complete",
@@ -634,26 +632,18 @@ class MarketFetcher:
             )
             return False
 
-        # 2) Past close / expiration time
-        for time_field in ("close_time", "expiration_time"):
-            raw = market.get(time_field, "")
-            close_dt = _parse_iso(str(raw)) if raw else None
-            if close_dt and close_dt <= _utc_now():
-                logging.info(
-                    "[Kalshi] Market %s past %s (%s). Treating as resolved.",
-                    ticker, time_field, raw,
-                )
-                return False
-
         return True
 
     async def check_poly_active(self, condition_id: str) -> bool:
         """Return True if the Polymarket market is still active.
 
-        Checks three signals:
+        Relies strictly on explicit exchange status flags:
         1. ``closed`` is True or ``active`` is False.
-        2. ``end_date_iso`` is in the past.
-        3. Opportunistically caches token IDs from the response.
+
+        Does NOT use end_date_iso — these timestamps are often
+        inaccurate placeholders for live sports markets.
+
+        Opportunistically caches token IDs from the response.
         """
         await self._ensure_session()
         data = await _request_with_retry(
@@ -666,13 +656,11 @@ class MarketFetcher:
             return True
 
         logging.debug(
-            "[Polymarket] %s… closed=%r, active=%r, end_date_iso=%r",
+            "[Polymarket] %s… closed=%r, active=%r",
             condition_id[:16],
             data.get("closed"), data.get("active"),
-            data.get("end_date_iso", ""),
         )
 
-        # 1) Explicit closed / inactive flag
         if data.get("closed") is True or data.get("active") is False:
             logging.info(
                 "[Polymarket] Market %s… resolved (closed=%s, active=%s)",
@@ -680,19 +668,7 @@ class MarketFetcher:
             )
             return False
 
-        # 2) Past end date — with grace period to account for overtime,
-        #    delayed settlement, or clock skew.
-        end_raw = data.get("end_date_iso", "")
-        end_dt = _parse_iso(str(end_raw)) if end_raw else None
-        if end_dt and (end_dt + timedelta(hours=RESOLUTION_GRACE_HOURS)) <= _utc_now():
-            logging.info(
-                "[Polymarket] Market %s… past end_date_iso (%s) + %dh grace. "
-                "Treating as resolved.",
-                condition_id[:16], end_raw, RESOLUTION_GRACE_HOURS,
-            )
-            return False
-
-        # 3) Cache token IDs
+        # Cache token IDs
         tokens = data.get("tokens", [])
         if len(tokens) >= 2 and condition_id not in self._poly_token_cache:
             pair = (str(tokens[0]["token_id"]), str(tokens[1]["token_id"]))
@@ -1143,6 +1119,10 @@ class PolymarketWS:
             # relying solely on deltas that may have arrived out of order.
             await self._fetch_initial_snapshots()
 
+            # Seed the watchdog timer so it doesn't spin if the WS
+            # connects successfully but the first real message is delayed.
+            self.last_update_time = time.time()
+
         except Exception as exc:
             logging.error("[Poly-WS] Connection failed: %s", exc)
             self._connected = False
@@ -1494,6 +1474,10 @@ class KalshiWS:
 
             # After (re)connect, pull a fresh REST snapshot
             await self._fetch_initial_snapshots()
+
+            # Seed the watchdog timer so it doesn't spin if the WS
+            # connects successfully but the first real message is delayed.
+            self.last_update_time = time.time()
 
         except Exception as exc:
             logging.error("[Kalshi-WS] Connection failed: %s", exc)
@@ -1878,7 +1862,6 @@ class PaperTrader:
         "poly_fee",
         "gross_profit",
         "net_profit",
-        "net_profit_pct",
         "max_contracts",
         "kalshi_depth",
         "poly_depth",
@@ -1914,7 +1897,6 @@ class PaperTrader:
             "poly_fee": f"{opp.poly_fee.quantize(Q4)}",
             "gross_profit": f"{opp.gross_profit.quantize(Q4)}",
             "net_profit": f"{opp.net_profit.quantize(Q4)}",
-            "net_profit_pct": f"{(opp.net_profit * HUNDRED).quantize(Q2)}%",
             "max_contracts": opp.max_contracts,
             "kalshi_depth": opp.kalshi_depth,
             "poly_depth": opp.poly_depth,
@@ -1976,6 +1958,7 @@ class PaperPortfolio:
         self.path = path
         self.open_positions: list[Position] = []
         self.total_realized_pnl: Decimal = ZERO
+        self.total_unwind_losses: Decimal = ZERO
         self.closed_count: int = 0
         self._ensure_file()
 
@@ -2058,6 +2041,49 @@ class PaperPortfolio:
                 still_open.append(pos)
 
         self.open_positions = still_open
+
+    def record_unwind_loss(
+        self,
+        event_name: str,
+        direction: str,
+        contracts: int,
+        loss_amount: Decimal,
+    ) -> None:
+        """Debit the portfolio for a realized unwind loss.
+
+        Called when an arb trade is unwound (Leg 1 bought then sold back).
+        The loss includes:
+          - Leg 1 taker fees (paid on the original buy)
+          - Unwind taker fees (paid on the sell-back)
+          - Slippage: (buy_price - sell_price) * contracts
+            (zero in paper mode, non-zero in production)
+
+        The loss is deducted from capital and tracked cumulatively in
+        self.total_unwind_losses for reporting.
+        """
+        self.capital -= loss_amount
+        self.total_unwind_losses += loss_amount
+
+        self._write_row({
+            "action": "UNWIND",
+            "timestamp": _utc_iso(),
+            "event_name": event_name,
+            "direction": direction,
+            "contracts": contracts,
+            "cost_per_contract": "",
+            "fees_per_contract": "",
+            "total_outlay": f"{loss_amount.quantize(Q4)}",
+            "payout": "",
+            "pnl": f"-{loss_amount.quantize(Q4)}",
+            "capital_remaining": f"{self.capital.quantize(Q2)}",
+        })
+
+        logging.warning(
+            "  PORTFOLIO: UNWIND [%s] %s — %d contracts, "
+            "loss $%s, capital $%s",
+            event_name, direction, contracts,
+            loss_amount.quantize(Q4), self.capital.quantize(Q2),
+        )
 
     def summary(self) -> str:
         """Return a multi-line summary string."""
@@ -2309,13 +2335,9 @@ class RiskManager:
         if current_exposure >= self._max_exposure:
             return RejectReason.MAX_EXPOSURE
 
-        # 6. Order rate limit
-        if not self.rate_limiter.try_acquire():
-            logging.warning(
-                "[Risk] Order rate limit (%d/min) hit — rejecting.",
-                self.rate_limiter._max,
-            )
-            return RejectReason.ORDER_RATE_LIMIT
+        # NOTE: Order rate limit moved to ExecutionEngine.submit() as a
+        # post-filter gate (Phase 2 refactor).  It should only be consumed
+        # when a trade actually passes all pre-trade checks.
 
         return None
 
@@ -2637,11 +2659,18 @@ class UnwindManager:
             return
 
         # Build unwind sell order (opposite of Leg 1 buy)
+        # TODO (Phase 3): In live trading, we cannot submit a limit sell
+        # at our buy price.  We must fetch the real-time best bid from
+        # the exchange orderbook here and execute a market-taking order
+        # to guarantee the unwind fills.  The difference between our
+        # buy price and the actual sell price is slippage, which must
+        # be captured in the loss calculation below.  For paper mode,
+        # sell_price == buy_price (zero slippage).
         unwind_sell = LegOrder(
             leg_id=str(uuid.uuid4())[:8],
             platform=leg1.platform,
             side=leg1.side,  # selling what we bought
-            price=leg1.price,  # idealized: sell at buy price (paper)
+            price=leg1.price,  # paper: sell at buy price (zero slippage)
             contracts=contracts_to_unwind,
         )
         uw.unwind_leg = unwind_sell
@@ -2656,10 +2685,42 @@ class UnwindManager:
         ok = await self._submit_unwind(unwind_sell)
         if ok:
             uw.status = UnwindStatus.UNWOUND
+
+            # ── Calculate realized unwind loss ──
+            # Loss = Leg1 fees + Unwind fees + Slippage
+            #   Leg 1 fee: Kalshi taker fee on the original buy
+            #   Unwind fee: Kalshi taker fee on the sell-back
+            #   Slippage: (buy_price - sell_price) * contracts
+            #     (zero in paper mode; non-zero in production)
+            leg1_fee = kalshi_taker_fee(leg1.price, contracts_to_unwind)
+            unwind_fee = kalshi_taker_fee(unwind_sell.price, contracts_to_unwind)
+            slippage = (
+                (leg1.price - unwind_sell.price)
+                * D(contracts_to_unwind)
+            ).quantize(Q4)
+            unwind_loss = (leg1_fee + unwind_fee + slippage).quantize(Q4)
+
             logging.info(
-                "  [Unwind %s] UNWOUND: sold %d contracts",
+                "  [Unwind %s] UNWOUND: sold %d contracts — "
+                "loss $%s (fees $%s + $%s, slippage $%s)",
                 uw.unwind_id, unwind_sell.filled_contracts,
+                unwind_loss.quantize(Q4),
+                leg1_fee.quantize(Q4), unwind_fee.quantize(Q4),
+                slippage.quantize(Q4),
             )
+
+            # Record loss in portfolio and circuit breaker
+            self._portfolio.record_unwind_loss(
+                event_name=uw.event_name,
+                direction=uw.direction,
+                contracts=contracts_to_unwind,
+                loss_amount=unwind_loss,
+            )
+            # Feed negative P&L to circuit breaker (loss is negative)
+            self._pnl_tracker.record(-unwind_loss, 1)
+
+            # Stash loss on the UnwindOrder for ExecutionEngine to read
+            uw._unwind_loss = unwind_loss
         else:
             uw.status = UnwindStatus.FAILED
             uw.error_message += " | Unwind sell also failed!"
@@ -2680,11 +2741,12 @@ class UnwindManager:
         leg1 = uw.leg1
         assert leg1 is not None
 
+        # TODO (Phase 3): Same as _unwind — fetch real-time best bid.
         unwind_sell = LegOrder(
             leg_id=str(uuid.uuid4())[:8],
             platform=leg1.platform,
             side=leg1.side,
-            price=leg1.price,
+            price=leg1.price,  # paper: zero slippage
             contracts=excess,
         )
         uw.unwind_leg = unwind_sell
@@ -2695,7 +2757,36 @@ class UnwindManager:
         )
 
         ok = await self._submit_unwind(unwind_sell)
-        if not ok:
+        if ok:
+            # Calculate realized loss on the partial unwind
+            leg1_fee = kalshi_taker_fee(leg1.price, excess)
+            unwind_fee = kalshi_taker_fee(unwind_sell.price, excess)
+            slippage = (
+                (leg1.price - unwind_sell.price) * D(excess)
+            ).quantize(Q4)
+            partial_loss = (leg1_fee + unwind_fee + slippage).quantize(Q4)
+
+            logging.info(
+                "  [Unwind %s] Partial unwind OK: sold %d — "
+                "loss $%s (fees $%s + $%s, slippage $%s)",
+                uw.unwind_id, excess,
+                partial_loss.quantize(Q4),
+                leg1_fee.quantize(Q4), unwind_fee.quantize(Q4),
+                slippage.quantize(Q4),
+            )
+
+            self._portfolio.record_unwind_loss(
+                event_name=uw.event_name,
+                direction=uw.direction,
+                contracts=excess,
+                loss_amount=partial_loss,
+            )
+            self._pnl_tracker.record(-partial_loss, 1)
+
+            # Accumulate on the UnwindOrder for ExecutionEngine
+            existing = getattr(uw, '_unwind_loss', ZERO)
+            uw._unwind_loss = existing + partial_loss
+        else:
             uw.error_message += f" | Partial unwind of {excess} contracts failed!"
             logging.error(
                 "  [Unwind %s] Partial unwind FAILED", uw.unwind_id,
@@ -2892,16 +2983,22 @@ class ExecutionEngine:
     """
     Validates and executes (simulated) trades.
 
-    Responsibilities:
-      1. Duplicate check — don't re-trade the same event+direction.
-      2. Net-profitability gate — skip if fees eat the spread.
-      3. Capital check — ensure we have enough to cover the outlay.
-      4. FOK depth check — BOTH legs must have depth >= desired qty.
-         If not, the entire order is Killed (rejected). No partial fills.
-      5. Fill — deduct capital, create Position, log Order.
+    Architecture (Phase 2 refactor — pre-trade vs. post-trade filter):
 
-    Every order (filled or rejected) is logged to data/orders.csv for
-    post-session analysis.
+      SILENT PRE-TRADE FILTERS (no Order created, no CSV, no rate-limit):
+        1. Duplicate check — event+direction already in self._traded
+        2. Risk management — kill switch, daily loss, exposure, positions,
+           spread sanity (but NOT rate limit — that's post-filter)
+        3. Net-profitability — fees eat the spread
+        4. Capital + sizing — can't afford even 1 contract
+        5. FOK depth — orderbook too thin on either/both legs
+
+      POST-TRADE GATE (Order created, CSV logged):
+        6. Rate limiter — only consumed when all silent checks pass
+        7. Fill — routed through UnwindManager (sequential two-leg)
+
+    This eliminates CSV/log spam from repeated rejections on every
+    WS tick while preserving instant retry when liquidity refills.
     """
 
     def __init__(
@@ -2918,32 +3015,203 @@ class ExecutionEngine:
         self._risk_manager = risk_manager
         self._unwind_manager = unwind_manager
         self._orders: list[Order] = []
-        # Track which event+direction combos we've already traded
+        # Track which event+direction combos we've already traded or
+        # are currently in-flight (prevents concurrency races).
         self._traded: set[tuple[str, str]] = set()
 
-    async def submit(self, opp: ArbOpportunity) -> Order:
+    async def submit(self, opp: ArbOpportunity) -> Optional[Order]:
         """
         Submit a candidate arb trade for execution.
 
-        Creates an Order in PENDING state, runs the validation pipeline,
-        and transitions to FILLED or REJECTED.  If all validations pass,
-        the fill is routed through UnwindManager for sequential two-leg
-        execution with automatic rollback protection.
+        Pre-trade filters silently return None (no Order, no CSV, no
+        rate-limit consumed).  Only trades that pass all silent checks
+        hit the rate limiter, create an Order, and write to CSV.
 
-        The opportunity is always logged to the trade_ledger CSV regardless
-        of whether the order fills.
+        If UnwindManager fails/unwinds, the (event, direction) key is
+        removed from self._traded so the bot can retry on the next tick.
         """
-        # Log all detected opportunities regardless of fill outcome
+        key = (opp.event_name, opp.direction)
+
+        # ── SILENT PRE-TRADE FILTERS ──
+        # These return None without creating an Order, writing CSV,
+        # or consuming a rate-limit slot.
+
+        # 1. Duplicate / in-flight check
+        if key in self._traded:
+            logging.debug(
+                "[Exec] Skipped [%s] %s — already traded or in-flight",
+                opp.event_name, opp.direction,
+            )
+            return None
+
+        # 2. Risk management gate (excluding rate limit)
+        if self._risk_manager is not None:
+            risk_reject = self._risk_manager.check(opp)
+            if risk_reject is not None:
+                logging.debug(
+                    "[Exec] Skipped [%s] %s — %s",
+                    opp.event_name, opp.direction, risk_reject.value,
+                )
+                return None
+
+        # 3. Net profitability after fees
+        if opp.net_profit <= ZERO:
+            logging.debug(
+                "[Exec] Skipped [%s] %s — net unprofitable",
+                opp.event_name, opp.direction,
+            )
+            return None
+
+        # 4. Compute desired contracts from capital and position size
+        cost_plus_fees = opp.total_cost + opp.kalshi_fee + opp.poly_fee
+        if cost_plus_fees <= ZERO:
+            return None
+
+        available = min(self._portfolio.position_size, self._portfolio.capital)
+        desired = int(available / cost_plus_fees)
+        if desired < 1:
+            logging.debug(
+                "[Exec] Skipped [%s] %s — insufficient capital for 1 contract",
+                opp.event_name, opp.direction,
+            )
+            return None
+
+        # 5. Fill or Kill depth check
+        k_short = opp.kalshi_depth < desired
+        p_short = opp.poly_depth < desired
+        if k_short or p_short:
+            reason = (
+                "both" if (k_short and p_short)
+                else ("kalshi" if k_short else "poly")
+            )
+            logging.debug(
+                "[Exec] Skipped [%s] %s — FOK depth %s "
+                "(wanted %d, K=%d P=%d)",
+                opp.event_name, opp.direction, reason,
+                desired, opp.kalshi_depth, opp.poly_depth,
+            )
+            return None
+
+        # ── POST-TRADE GATE ──
+        # All silent checks passed.  Now consume a rate-limit slot.
+
+        if self._risk_manager is not None:
+            if not self._risk_manager.rate_limiter.try_acquire():
+                # Rate limit hit — log this one to CSV as a real rejection
+                # so we have an audit trail, but only 1 row per event.
+                order = self._make_order(opp, desired)
+                order.status = OrderStatus.REJECTED
+                order.reject_reason = RejectReason.ORDER_RATE_LIMIT
+                self._finalize(order)
+                return order
+
+        # ── Log the opportunity (console + CSV) ──
+        _log_opportunity(opp)
         self._trader.log(opp)
 
-        # Create pending order
-        order = Order(
+        # ── CREATE ORDER + EXECUTE ──
+        order = self._make_order(opp, desired)
+
+        # Mark in-flight BEFORE awaiting to prevent duplicate submissions
+        # from concurrent WS ticks hitting submit() while we're awaiting.
+        self._traded.add(key)
+
+        try:
+            if self._unwind_manager is not None:
+                uw_order = await self._unwind_manager.execute(opp, desired)
+
+                if uw_order.status != UnwindStatus.COMPLETE:
+                    # Unwind occurred or execution failed — unlock the key
+                    # so the bot can retry on the next tick.
+                    self._traded.discard(key)
+
+                    if uw_order.status == UnwindStatus.UNWOUND:
+                        # Trade was unwound — record the real cost
+                        unwind_loss = getattr(uw_order, '_unwind_loss', ZERO)
+                        order.status = OrderStatus.UNWOUND
+                        order.reject_reason = RejectReason.NONE
+                        order.filled_contracts = 0
+                        order.total_outlay = unwind_loss
+                    else:
+                        # Pure failure (Leg 1 never filled, etc.)
+                        order.status = OrderStatus.CANCELLED
+                        order.reject_reason = RejectReason.NONE
+                        order.filled_contracts = 0
+                        order.total_outlay = ZERO
+
+                    self._finalize(order)
+                    return order
+
+                # Both legs filled — use actual filled quantity
+                actual = uw_order.total_contracts
+                total_outlay = (D(actual) * cost_plus_fees).quantize(Q4)
+                order.filled_contracts = actual
+                order.total_outlay = total_outlay
+                order.status = OrderStatus.FILLED
+
+                pos = Position(
+                    event_name=opp.event_name,
+                    direction=opp.direction,
+                    contracts=actual,
+                    cost_per_contract=opp.total_cost,
+                    fees_per_contract=opp.kalshi_fee + opp.poly_fee,
+                    total_outlay=total_outlay,
+                    opened_at=opp.timestamp,
+                )
+                self._portfolio.open_position(pos)
+
+                if self._risk_manager is not None:
+                    self._risk_manager.pnl_tracker.record(opp.net_profit, actual)
+            else:
+                # Legacy path (no unwind manager) — instant paper fill
+                total_outlay = (D(desired) * cost_plus_fees).quantize(Q4)
+                order.filled_contracts = desired
+                order.total_outlay = total_outlay
+                order.status = OrderStatus.FILLED
+
+                pos = Position(
+                    event_name=opp.event_name,
+                    direction=opp.direction,
+                    contracts=desired,
+                    cost_per_contract=opp.total_cost,
+                    fees_per_contract=opp.kalshi_fee + opp.poly_fee,
+                    total_outlay=total_outlay,
+                    opened_at=opp.timestamp,
+                )
+                self._portfolio.open_position(pos)
+
+                if self._risk_manager is not None:
+                    self._risk_manager.pnl_tracker.record(opp.net_profit, desired)
+
+        except Exception as exc:
+            # On any unexpected error during execution, unlock the key
+            # so the bot can retry.  Do NOT re-raise — this method runs
+            # via asyncio.create_task, so an unhandled exception would
+            # be silently swallowed (or produce noisy GC warnings).
+            self._traded.discard(key)
+            logging.error(
+                "[Exec] Execution failed for [%s] %s: %s",
+                opp.event_name, opp.direction, exc, exc_info=True,
+            )
+            order.status = OrderStatus.CANCELLED
+            order.reject_reason = RejectReason.NONE
+            order.filled_contracts = 0
+            order.total_outlay = ZERO
+            self._finalize(order)
+            return order
+
+        self._finalize(order)
+        return order
+
+    def _make_order(self, opp: ArbOpportunity, desired: int) -> Order:
+        """Instantiate an Order dataclass from an opp."""
+        return Order(
             order_id=str(uuid.uuid4())[:8],
             timestamp=opp.timestamp,
             event_name=opp.event_name,
             direction=opp.direction,
             status=OrderStatus.PENDING,
-            desired_contracts=0,
+            desired_contracts=desired,
             filled_contracts=0,
             kalshi_price=opp.kalshi_price,
             poly_price=opp.poly_price,
@@ -2955,135 +3223,6 @@ class ExecutionEngine:
             kalshi_depth=opp.kalshi_depth,
             poly_depth=opp.poly_depth,
         )
-
-        # ── Validation pipeline ──
-
-        # 0. Risk management gate (Phase 1)
-        if self._risk_manager is not None:
-            risk_reject = self._risk_manager.check(opp)
-            if risk_reject is not None:
-                order.status = OrderStatus.REJECTED
-                order.reject_reason = risk_reject
-                self._finalize(order)
-                return order
-
-        # 1. Duplicate check
-        key = (opp.event_name, opp.direction)
-        if key in self._traded:
-            order.status = OrderStatus.REJECTED
-            order.reject_reason = RejectReason.DUPLICATE_TRADE
-            self._finalize(order)
-            return order
-
-        # 2. Net profitability after fees
-        if opp.net_profit <= ZERO:
-            order.status = OrderStatus.REJECTED
-            order.reject_reason = RejectReason.NET_UNPROFITABLE
-            self._finalize(order)
-            return order
-
-        # 3. Compute desired contracts from capital and position size
-        cost_plus_fees = opp.total_cost + opp.kalshi_fee + opp.poly_fee
-        if cost_plus_fees <= ZERO:
-            order.status = OrderStatus.REJECTED
-            order.reject_reason = RejectReason.ZERO_CONTRACTS
-            self._finalize(order)
-            return order
-
-        available = min(self._portfolio.position_size, self._portfolio.capital)
-        desired = int(available / cost_plus_fees)
-        order.desired_contracts = desired
-
-        if desired < 1:
-            order.status = OrderStatus.REJECTED
-            order.reject_reason = RejectReason.INSUFFICIENT_CAPITAL
-            self._finalize(order)
-            return order
-
-        # 4. Fill or Kill — BOTH legs must have depth >= desired qty
-        #    If either side can't fill the full desired quantity at the
-        #    stated price, reject the entire order.
-        k_short = opp.kalshi_depth < desired
-        p_short = opp.poly_depth < desired
-        if k_short and p_short:
-            order.status = OrderStatus.REJECTED
-            order.reject_reason = RejectReason.FOK_DEPTH_BOTH
-            self._finalize(order)
-            return order
-        if k_short:
-            order.status = OrderStatus.REJECTED
-            order.reject_reason = RejectReason.FOK_DEPTH_KALSHI
-            self._finalize(order)
-            return order
-        if p_short:
-            order.status = OrderStatus.REJECTED
-            order.reject_reason = RejectReason.FOK_DEPTH_POLY
-            self._finalize(order)
-            return order
-
-        # ── 5. All validations passed — route through UnwindManager ──
-        #
-        # The UnwindManager handles sequential two-leg execution:
-        #   Leg 1 (Kalshi) → await fill → Leg 2 (Poly) → await fill
-        # with automatic rollback if Leg 2 fails or times out.
-
-        if self._unwind_manager is not None:
-            uw_order = await self._unwind_manager.execute(opp, desired)
-
-            if uw_order.status != UnwindStatus.COMPLETE:
-                # Unwind occurred or execution failed
-                order.status = OrderStatus.CANCELLED
-                order.reject_reason = RejectReason.NONE
-                order.filled_contracts = 0
-                order.total_outlay = ZERO
-                self._finalize(order)
-                return order
-
-            # Both legs filled — use actual filled quantity
-            actual = uw_order.total_contracts
-            total_outlay = (D(actual) * cost_plus_fees).quantize(Q4)
-            order.filled_contracts = actual
-            order.total_outlay = total_outlay
-            order.status = OrderStatus.FILLED
-
-            self._traded.add(key)
-            pos = Position(
-                event_name=opp.event_name,
-                direction=opp.direction,
-                contracts=actual,
-                cost_per_contract=opp.total_cost,
-                fees_per_contract=opp.kalshi_fee + opp.poly_fee,
-                total_outlay=total_outlay,
-                opened_at=opp.timestamp,
-            )
-            self._portfolio.open_position(pos)
-
-            if self._risk_manager is not None:
-                self._risk_manager.pnl_tracker.record(opp.net_profit, actual)
-        else:
-            # Legacy path (no unwind manager) — instant paper fill
-            total_outlay = (D(desired) * cost_plus_fees).quantize(Q4)
-            order.filled_contracts = desired
-            order.total_outlay = total_outlay
-            order.status = OrderStatus.FILLED
-
-            self._traded.add(key)
-            pos = Position(
-                event_name=opp.event_name,
-                direction=opp.direction,
-                contracts=desired,
-                cost_per_contract=opp.total_cost,
-                fees_per_contract=opp.kalshi_fee + opp.poly_fee,
-                total_outlay=total_outlay,
-                opened_at=opp.timestamp,
-            )
-            self._portfolio.open_position(pos)
-
-            if self._risk_manager is not None:
-                self._risk_manager.pnl_tracker.record(opp.net_profit, desired)
-
-        self._finalize(order)
-        return order
 
     def _finalize(self, order: Order) -> None:
         """Log the order to CSV and store in memory for inspection.
@@ -3104,6 +3243,15 @@ class ExecutionEngine:
                 order.order_id, order.filled_contracts,
                 order.event_name, order.direction,
                 order.total_outlay.quantize(Q2),
+            )
+        elif order.status == OrderStatus.UNWOUND:
+            logging.warning(
+                "  ORDER %s UNWOUND: [%s] %s — "
+                "loss $%s (wanted %d contracts)",
+                order.order_id,
+                order.event_name, order.direction,
+                order.total_outlay.quantize(Q4),
+                order.desired_contracts,
             )
         elif order.status == OrderStatus.REJECTED:
             logging.info(
@@ -3394,8 +3542,7 @@ async def _process_updates(
             if opps:
                 for opp in opps:
                     total_opps += 1
-                    _log_opportunity(opp)
-                    await execution.submit(opp)
+                    asyncio.create_task(execution.submit(opp))
 
         except Exception as exc:
             logging.error(
