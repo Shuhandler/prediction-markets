@@ -50,21 +50,21 @@ _Critical for live trading — builds on Phase 1 risk management._
 
 ## Phase 3 — Live Order Execution
 
-- [ ] **Kalshi**: Build authenticated REST order client using existing RSA signing. Endpoint: `POST /trade-api/v2/portfolio/orders`
-- [ ] **Polymarket**: Add `py_clob_client` dependency. Initialize `ClobClient` with Ethereum private key + API credentials. Handle EIP-712 order signing on Polygon
-- [ ] Make `ExecutionEngine.submit()` async — replace paper fill block (lines 2150–2180) with real API calls routed through `UnwindManager`
-- [ ] Update `_process_updates()` call site (line 2480) to `await` execution
-- [ ] Add `--dry-run` flag that preserves current paper-trading behavior as safety net
-- [ ] Track real order IDs from both platforms; poll/WS-subscribe for fill status updates
-- [ ] Add `--paper` / `--live` mode flag with confirmation prompt for live mode
+- [x] **Kalshi**: Build authenticated REST order client using existing RSA signing. Endpoint: `POST /trade-api/v2/portfolio/orders`
+- [x] **Polymarket**: Add `py_clob_client` dependency. Initialize `ClobClient` with Ethereum private key + API credentials. Handle EIP-712 order signing on Polygon
+- [x] Make `ExecutionEngine.submit()` async — replace paper fill block with real API calls routed through `UnwindManager` (live mode branches in `_submit_leg()` and `_submit_unwind()`)
+- [x] Update `_process_updates()` call site to pass `kalshi_ticker` and `poly_condition_id` on each `ArbOpportunity`
+- [x] Add `--dry-run` flag that preserves current paper-trading behavior as safety net (paper mode is default; `--mode live` opts in)
+- [x] Track real order IDs from both platforms; WS-subscribe for Kalshi fill status, synchronous FOK confirmation for Polymarket
+- [x] Add `--paper` / `--live` mode flag (`--mode paper|live`); live mode validates all credentials at startup
 
 ---
 
 ## Phase 4 — Discord Notifications
 
-- [ ] Add `DiscordNotifier` class: async webhook POST via `aiohttp`
-- [ ] Config: `DISCORD_WEBHOOK_URL` in `.env`
-- [ ] Notification triggers:
+- [x] Add `DiscordNotifier` class: async webhook POST via `aiohttp`
+- [x] Config: `DISCORD_WEBHOOK_URL` in `.env`
+- [x] Notification triggers:
   - Order filled (direction, contracts, prices, expected profit)
   - Order rejected (reject reason)
   - Unwind triggered (details)
@@ -72,8 +72,8 @@ _Critical for live trading — builds on Phase 1 risk management._
   - WS reconnection events
   - Error-level log messages
   - Daily summary (total P&L, positions, fills, rejects)
-- [ ] Rate-limit Discord POSTs (max 5/sec per Discord API limits)
-- [ ] Embed formatting with color coding: green = fill, red = error, yellow = warning
+- [x] Rate-limit Discord POSTs (max 5/sec per Discord API limits)
+- [x] Embed formatting with color coding: green = fill, red = error, yellow = warning
 
 ---
 

@@ -2,11 +2,15 @@
     {
         "name": "Golden State at New Orleans Winner?",
         "kalshi_ticker": "KXNBAGAME-26FEB24GSWNOP-GSW",
-        "poly_condition_id": "0x7cdb2504f2b5c28598efa93e349169c122c51289ed64fcec816ebed49377076c"
+        "poly_condition_id": "0x7cdb2504f2b5c28598efa93e349169c122c51289ed64fcec816ebed49377076c",
+        "poly_yes_token": "FILL_ME",
+        "poly_no_token": "FILL_ME"
     },
     {
         "name": "Tennessee at Missouri Winner?",
         "kalshi_ticker": "KXNCAAMBGAME-26FEB24TENNMIZZ-TENN",
-        "poly_condition_id": "0xba7bd969e491109cd0d813dde352dec5abfe8fe05b1fedbafcfab432b6f28577"
+        "poly_condition_id": "0xba7bd969e491109cd0d813dde352dec5abfe8fe05b1fedbafcfab432b6f28577",
+        "poly_yes_token": "FILL_ME",
+        "poly_no_token": "FILL_ME"
     }
 ]
