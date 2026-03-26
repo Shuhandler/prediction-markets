@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
 ==========================================================================
-  Prediction Market Arbitrage — Paper-Trading Bot  (v5.0)
+  Prediction Market Arbitrage Bot  (v6.0)
   Monitors Kalshi and Polymarket for cross-platform arbitrage opportunities.
 
-  PAPER TRADING ONLY — no real orders are ever placed.
+  Supports both paper trading (simulated) and live trading (real orders).
 ==========================================================================
 
-  Architecture (v5.0 — four major improvements over v4.0):
+  Architecture (v6.0 — live execution on top of v5.0):
 
     1. EVENT-DRIVEN: WebSocket updates trigger immediate arb checks via
        an asyncio.Queue. No more sleep-based polling loop. The bot reacts
@@ -18,8 +18,8 @@
        use decimal.Decimal to avoid float rounding errors like
        0.1 + 0.2 != 0.3. Eliminates false-positive arb detections.
 
-    3. FILL OR KILL (FOK): Before executing a paper trade, the bot
-       verifies that BOTH legs have orderbook depth >= desired trade size.
+    3. FILL OR KILL (FOK): Before executing a trade, the bot verifies
+       that BOTH legs have orderbook depth >= desired trade size.
        If not, the entire order is Killed (rejected). No partial fills.
 
     4. ORDER MANAGEMENT SYSTEM (OMS): Full order lifecycle tracking
@@ -27,19 +27,38 @@
        from Execution (ExecutionEngine). Each order records its state,
        reject reason, and sizing details.
 
-  Dependencies (run once):
-      pip install aiohttp cryptography python-dotenv
+    5. LIVE EXECUTION (Phase 3): Real order placement on both platforms.
+       - Kalshi: IOC (Immediate-or-Cancel) limit orders via authenticated
+         REST API, with WS fill tracking for confirmation.
+       - Polymarket: FOK (Fill-or-Kill) orders via py_clob_client with
+         EIP-712 signed orders on Polygon.
+       - Sequential two-leg execution: Kalshi IOC partial fills
+         dynamically resize the subsequent Polymarket FOK order.
+       - Automatic unwind: if Leg 2 fails, Leg 1 is sold back at market.
 
-  Environment variables (for Kalshi websocket — optional):
+  Dependencies (run once):
+      pip install aiohttp cryptography python-dotenv py-clob-client
+
+  Environment variables (paper mode — Kalshi websocket):
       KALSHI_API_KEY          — your Kalshi API key ID
       KALSHI_PRIVATE_KEY_PATH — path to your RSA private key PEM file
 
+  Additional env vars (live mode — required for real order placement):
+      POLY_API_KEY            — Polymarket CLOB API key
+      POLY_API_SECRET         — Polymarket CLOB API secret
+      POLY_PASSPHRASE         — Polymarket CLOB passphrase
+      POLY_PRIVATE_KEY_PATH   — path to Ethereum private key file (hex)
+
   If Kalshi credentials are not set, the Kalshi WS will be unavailable.
-  Polymarket websocket requires no authentication.
+  Polymarket websocket requires no authentication (read-only).
 
   Usage:
-      1. Edit events.json (or specify --events-file path).
-      2. Run:  python arb_bot.py [--log-level DEBUG] [--dry-run]
+      Paper mode (default — no real orders):
+        python arb_bot.py [--log-level DEBUG] [--dry-run]
+
+      Live mode (real orders on both platforms):
+        python arb_bot.py --mode live [--log-level DEBUG]
+
       3. Check data/trade_ledger.csv for logged opportunities.
       4. Check data/orders.csv for full order lifecycle.
       5. Check data/portfolio.csv for simulated positions and P&L.
@@ -108,11 +127,15 @@ STALE_TIMEOUT_SECONDS: int = int(os.environ.get("STALE_TIMEOUT_SECONDS", "30"))
 # Source: https://kalshi.com/docs/kalshi-fee-schedule.pdf
 KALSHI_FEE_RATE: Decimal = D(os.environ.get("KALSHI_FEE_RATE", "0.07"))
 
-# Polymarket taker fee — currently 0 for most markets.
-# NCAAB/Serie A markets created after Feb 18 2026 will have fees.
-# When active, the formula is the same shape: rate × C × P × (1−P)
-# Set to ~0.0624 when trading fee-enabled markets (1.56% max at P=0.5).
-POLY_FEE_RATE: Decimal = D(os.environ.get("POLY_FEE_RATE", "0"))
+# Polymarket taker fee.
+# Sports markets (NCAAB, Serie A, etc.) use a QUADRATIC formula:
+#   fee = C × feeRate × (P × (1 − P))^exponent
+# Per https://docs.polymarket.com/trading/fees:
+#   Sports:        feeRate = 0.25,  exponent = 2
+#   5/15-min Crypto: feeRate = 0.0175, exponent = 1
+# Set POLY_FEE_EXPONENT=1 for crypto markets.
+POLY_FEE_RATE: Decimal = D(os.environ.get("POLY_FEE_RATE", "0.25"))
+POLY_FEE_EXPONENT: int = int(os.environ.get("POLY_FEE_EXPONENT", "2"))
 
 # ---- Paper portfolio ----
 STARTING_CAPITAL: Decimal = D(os.environ.get("STARTING_CAPITAL", "1000.00"))
@@ -137,6 +160,18 @@ POLY_WS_URL = os.environ.get("POLY_WS_URL", "wss://ws-subscriptions-clob.polymar
 # ---- Kalshi API credentials (env vars) ----
 KALSHI_API_KEY: str = os.environ.get("KALSHI_API_KEY", "")
 KALSHI_PRIVATE_KEY_PATH: str = os.environ.get("KALSHI_PRIVATE_KEY_PATH", "")
+
+# ---- Polymarket API credentials (env vars — Phase 3) ----
+# The ETH private key is read from a file (like Kalshi) for security.
+# CLOB API key/secret/passphrase are obtained from Polymarket's onboarding.
+POLY_API_KEY: str = os.environ.get("POLY_API_KEY", "")
+POLY_API_SECRET: str = os.environ.get("POLY_API_SECRET", "")
+POLY_PASSPHRASE: str = os.environ.get("POLY_PASSPHRASE", "")
+POLY_PRIVATE_KEY_PATH: str = os.environ.get("POLY_PRIVATE_KEY_PATH", "")
+POLY_CHAIN_ID: int = int(os.environ.get("POLY_CHAIN_ID", "137"))  # Polygon mainnet
+
+# ---- Kalshi fill poll interval (live mode) ----
+KALSHI_FILL_POLL_MS: int = int(os.environ.get("KALSHI_FILL_POLL_MS", "250"))
 
 # ---- Websocket settings ----
 WS_PING_INTERVAL: int = 10       # Seconds between heartbeat pings
@@ -165,8 +200,20 @@ STUCK_POSITION_MAX_AGE: int = int(os.environ.get("STUCK_POSITION_MAX_AGE", "30")
 STUCK_POSITION_CHECK_INTERVAL: int = int(os.environ.get("STUCK_POSITION_CHECK_INTERVAL", "10"))
 UNWIND_LOG_FILE: str = os.path.join(DATA_DIR, "unwinds.csv")
 
+# ---- Unwind sell price floor (Phase 3 safety) ----
+# During an emergency unwind, the sell limit price is set to
+#   max(buy_price * RATIO, ABSOLUTE_MIN)
+# This prevents catastrophic slippage (selling at $0.01 what was
+# bought at $0.55). Set RATIO to 0 to revert to aggressive $0.01 floor.
+UNWIND_MIN_PRICE_RATIO: Decimal = D(os.environ.get("UNWIND_MIN_PRICE_RATIO", "0.50"))
+UNWIND_ABSOLUTE_MIN_PRICE: Decimal = D(os.environ.get("UNWIND_ABSOLUTE_MIN_PRICE", "0.05"))
+
 # ---- Events file ----
 DEFAULT_EVENTS_FILE: str = os.environ.get("EVENTS_FILE", "events.json")
+
+# ---- Discord notifications (Phase 4) ----
+DISCORD_WEBHOOK_URL: str = os.environ.get("DISCORD_WEBHOOK_URL", "")
+DISCORD_MAX_POSTS_PER_SEC: float = float(os.environ.get("DISCORD_MAX_POSTS_PER_SEC", "5"))
 
 # ====================================================================
 # EVENT LOADING — reads from events.json (or --events-file path)
@@ -179,6 +226,12 @@ def _load_events(path: str) -> list[dict]:
       - name              : human-readable label
       - kalshi_ticker     : Kalshi market ticker
       - poly_condition_id : Polymarket condition_id (hex)
+      - poly_yes_token    : Polymarket YES token_id (hex)
+      - poly_no_token     : Polymarket NO token_id (hex)
+
+    Token IDs are explicit to avoid the catastrophic bug of blindly
+    mapping tokens[0] as YES — the API can return them in any order.
+    Use ticker_return.py to generate entries with correct token IDs.
     """
     p = Path(path)
     if not p.exists():
@@ -197,7 +250,8 @@ def _load_events(path: str) -> list[dict]:
         )
         sys.exit(1)
 
-    required = {"name", "kalshi_ticker", "poly_condition_id"}
+    required = {"name", "kalshi_ticker", "poly_condition_id",
+                "poly_yes_token", "poly_no_token"}
     for i, ev in enumerate(events):
         missing = required - set(ev.keys())
         if missing:
@@ -205,6 +259,15 @@ def _load_events(path: str) -> list[dict]:
                 "Event #%d in '%s' missing keys: %s", i, path, missing,
             )
             sys.exit(1)
+        # Sanity: reject placeholder values
+        for key in ("poly_yes_token", "poly_no_token"):
+            if ev[key] in ("", "FILL_ME"):
+                logging.error(
+                    "Event #%d in '%s': %s is a placeholder — run "
+                    "ticker_return.py to populate real token IDs.",
+                    i, path, key,
+                )
+                sys.exit(1)
 
     logging.info("Loaded %d events from %s", len(events), path)
     return events
@@ -266,14 +329,19 @@ def kalshi_taker_fee(price: Decimal, contracts: int = 1) -> Decimal:
 
 def poly_taker_fee(price: Decimal, contracts: int = 1) -> Decimal:
     """
-    Polymarket taker fee (same formula shape as Kalshi).
-    Currently 0 for most markets.  Set POLY_FEE_RATE when trading
-    fee-enabled markets.
+    Polymarket taker fee per the official formula:
+        fee = C × feeRate × (P × (1 − P))^exponent
+
+    Sports markets (NCAAB, Serie A): rate=0.25, exponent=2
+    5/15-min Crypto markets:         rate=0.0175, exponent=1
+
+    Rounded to 4 decimal places (smallest fee = 0.0001 USDC).
     """
     if POLY_FEE_RATE <= ZERO or contracts <= 0:
         return ZERO
-    raw = POLY_FEE_RATE * D(contracts) * price * (ONE - price)
-    return _ceil_penny(raw)
+    p_factor = price * (ONE - price)
+    raw = POLY_FEE_RATE * D(contracts) * (p_factor ** POLY_FEE_EXPONENT)
+    return raw.quantize(Q4, rounding=ROUND_CEILING)
 
 
 # ====================================================================
@@ -325,6 +393,9 @@ class ArbOpportunity:
     max_contracts: int = 0     # max fillable contracts at these prices
     kalshi_depth: int = 0      # contracts available on Kalshi side
     poly_depth: int = 0        # contracts available on Polymarket side
+    # Phase 3: market identifiers for live execution
+    kalshi_ticker: str = ""    # Kalshi market ticker (e.g. KXNBAGAME-26FEB24GSWNOP-GSW)
+    poly_condition_id: str = "" # Polymarket condition_id (hex)
 
 
 # ====================================================================
@@ -419,6 +490,7 @@ class LegOrder:
     submitted_at: str = ""
     filled_at: str = ""
     exchange_order_id: str = ""  # real order ID from exchange (Phase 3)
+    market_id: str = ""          # Kalshi ticker or Polymarket token_id
 
 
 class UnwindStatus(enum.Enum):
@@ -668,17 +740,9 @@ class MarketFetcher:
             )
             return False
 
-        # Cache token IDs
-        tokens = data.get("tokens", [])
-        if len(tokens) >= 2 and condition_id not in self._poly_token_cache:
-            pair = (str(tokens[0]["token_id"]), str(tokens[1]["token_id"]))
-            self._poly_token_cache[condition_id] = pair
-            logging.info(
-                "[Polymarket] Resolved %s… → %s (%s…)  %s (%s…)",
-                condition_id[:16],
-                tokens[0].get("outcome", "?"), pair[0][:16],
-                tokens[1].get("outcome", "?"), pair[1][:16],
-            )
+        # Note: do NOT cache token IDs from API response here.
+        # Token mapping comes exclusively from events.json to avoid
+        # the blind tokens[0]=YES assumption bug.
 
         return True
 
@@ -765,38 +829,21 @@ class MarketFetcher:
     async def _resolve_poly_tokens(self, condition_id: str) -> Optional[tuple[str, str]]:
         """
         Resolve a condition_id into (yes_token_id, no_token_id).
-        Returns cached tokens if available.
+
+        Returns cached tokens ONLY. Token IDs must be pre-populated in
+        the cache from events.json at startup — no runtime API resolution.
+        This eliminates the catastrophic bug of blindly assuming
+        tokens[0] == YES based on arbitrary API ordering.
         """
         if condition_id in self._poly_token_cache:
             return self._poly_token_cache[condition_id]
 
-        await self._ensure_session()
-        data = await _request_with_retry(
-            self._session,
-            f"{CLOB_BASE}/markets/{condition_id}",
-            self._poly_limiter,
-            label="Poly-resolve",
-        )
-        if data is None:
-            return None
-
-        tokens = data.get("tokens", [])
-        if len(tokens) < 2:
-            logging.error(
-                "[Polymarket] Expected 2 tokens, got %d for %s…",
-                len(tokens), condition_id[:16],
-            )
-            return None
-
-        pair = (str(tokens[0]["token_id"]), str(tokens[1]["token_id"]))
-        self._poly_token_cache[condition_id] = pair
-        logging.info(
-            "[Polymarket] Resolved %s… → %s (%s…)  %s (%s…)",
+        logging.error(
+            "[Polymarket] No cached tokens for %s… — "
+            "events.json must include poly_yes_token / poly_no_token.",
             condition_id[:16],
-            tokens[0].get("outcome", "?"), pair[0][:16],
-            tokens[1].get("outcome", "?"), pair[1][:16],
         )
-        return pair
+        return None
 
     # ----------------------------------------------------------------
     #  Polymarket — /book endpoint (preferred, real orderbook)
@@ -834,7 +881,7 @@ class MarketFetcher:
 
         if bids:
             sorted_bids = sorted(
-                bids, key=lambda lvl: float(lvl.get("price", 0)), reverse=True,
+                bids, key=lambda lvl: D(str(lvl.get("price", 0))), reverse=True,
             )
             tob.best_bid = D(str(sorted_bids[0]["price"]))
             tob.best_bid_size = D(str(sorted_bids[0].get("size", 0)))
@@ -848,7 +895,7 @@ class MarketFetcher:
 
         if asks:
             sorted_asks = sorted(
-                asks, key=lambda lvl: float(lvl.get("price", 999)),
+                asks, key=lambda lvl: D(str(lvl.get("price", 999))),
             )
             tob.best_ask = D(str(sorted_asks[0]["price"]))
             tob.best_ask_size = D(str(sorted_asks[0].get("size", 0)))
@@ -960,6 +1007,427 @@ class MarketFetcher:
 
 
 # ====================================================================
+# KalshiOrderClient — authenticated REST order submission (Phase 3)
+# ====================================================================
+
+class KalshiOrderClient:
+    """Authenticated REST client for Kalshi order placement.
+
+    Uses the same RSA-PSS signing scheme as KalshiWS but for REST endpoints.
+
+    Signing payload:  {timestamp_ms}{METHOD}{path}
+    Headers:
+      - KALSHI-ACCESS-KEY:       API key ID
+      - KALSHI-ACCESS-SIGNATURE: base64(RSA-PSS-sign(payload))
+      - KALSHI-ACCESS-TIMESTAMP: timestamp in milliseconds
+
+    Endpoints:
+      - POST   /trade-api/v2/portfolio/orders           — place order
+      - GET    /trade-api/v2/portfolio/orders/{order_id} — check status
+      - DELETE /trade-api/v2/portfolio/orders/{order_id} — cancel order
+    """
+
+    ORDER_PATH = "/trade-api/v2/portfolio/orders"
+
+    def __init__(self) -> None:
+        self._session: Optional[aiohttp.ClientSession] = None
+        self._private_key = None
+        self._limiter = RateLimiter(KALSHI_MAX_RPS)
+
+    def _load_private_key(self):
+        """Load RSA private key for Kalshi auth (same key as WS)."""
+        if self._private_key is not None:
+            return self._private_key
+        from cryptography.hazmat.primitives.serialization import load_pem_private_key
+        key_path = Path(KALSHI_PRIVATE_KEY_PATH).expanduser()
+        if not key_path.exists():
+            raise FileNotFoundError(
+                f"Kalshi private key not found at {key_path}. "
+                "Set KALSHI_PRIVATE_KEY_PATH env var."
+            )
+        self._private_key = load_pem_private_key(
+            key_path.read_bytes(), password=None,
+        )
+        return self._private_key
+
+    def _sign_request(self, method: str, path: str) -> dict[str, str]:
+        """Generate auth headers for a REST API call."""
+        from cryptography.hazmat.primitives.asymmetric import padding
+        from cryptography.hazmat.primitives import hashes
+
+        if not KALSHI_API_KEY:
+            raise ValueError("KALSHI_API_KEY env var is required.")
+
+        key = self._load_private_key()
+        timestamp_ms = str(int(time.time() * 1000))
+        message = f"{timestamp_ms}{method}{path}"
+        signature = key.sign(
+            message.encode(),
+            padding.PSS(
+                mgf=padding.MGF1(hashes.SHA256()),
+                salt_length=padding.PSS.MAX_LENGTH,
+            ),
+            hashes.SHA256(),
+        )
+        sig_b64 = base64.b64encode(signature).decode()
+
+        return {
+            "KALSHI-ACCESS-KEY": KALSHI_API_KEY,
+            "KALSHI-ACCESS-SIGNATURE": sig_b64,
+            "KALSHI-ACCESS-TIMESTAMP": timestamp_ms,
+            "Content-Type": "application/json",
+        }
+
+    async def _ensure_session(self) -> None:
+        if self._session is None or self._session.closed:
+            self._session = aiohttp.ClientSession()
+
+    async def place_order(
+        self,
+        ticker: str,
+        action: str,
+        side: str,
+        count: int,
+        price_cents: int,
+        time_in_force: str = "ioc",
+        client_order_id: str = "",
+    ) -> dict:
+        """Place an order on Kalshi.
+
+        Args:
+            ticker: Market ticker (e.g. KXNBAGAME-26FEB24GSWNOP-GSW)
+            action: "buy" or "sell"
+            side: "yes" or "no"
+            count: Number of contracts
+            price_cents: Limit price in cents (1-99)
+            time_in_force: "ioc" (default) or "gtc"
+            client_order_id: Optional idempotency / reconciliation key (UUID)
+
+        Returns:
+            The order dict from the API response, including:
+              order_id, status, remaining_count, etc.
+        """
+        await self._ensure_session()
+        await self._limiter.acquire()
+
+        path = self.ORDER_PATH
+        headers = self._sign_request("POST", path)
+
+        body = {
+            "ticker": ticker,
+            "action": action,
+            "side": side,
+            "type": "limit",
+            "count": count,
+            "time_in_force": time_in_force,
+        }
+        if client_order_id:
+            body["client_order_id"] = client_order_id
+        # Kalshi expects yes_price or no_price depending on side
+        if side == "yes":
+            body["yes_price"] = price_cents
+        else:
+            body["no_price"] = price_cents
+
+        url = f"{KALSHI_BASE.rstrip('/trade-api/v2')}{path}"
+        # Handle the case where KALSHI_BASE already has the right prefix
+        if "/trade-api/v2" in KALSHI_BASE:
+            base = KALSHI_BASE.split("/trade-api/v2")[0]
+            url = f"{base}{path}"
+
+        timeout = aiohttp.ClientTimeout(total=REQUEST_TIMEOUT)
+        try:
+            async with self._session.post(
+                url, headers=headers, json=body, timeout=timeout,
+            ) as resp:
+                data = await resp.json(content_type=None)
+                if resp.status >= 400:
+                    logging.error(
+                        "[Kalshi-Order] %s %s %s x%d @ %dc → HTTP %d: %s",
+                        action.upper(), side.upper(), ticker,
+                        count, price_cents, resp.status, data,
+                    )
+                    return {"error": True, "status_code": resp.status, "detail": data}
+                order = data.get("order", data)
+                logging.info(
+                    "[Kalshi-Order] %s %s %s x%d @ %dc → "
+                    "order_id=%s status=%s remaining=%s",
+                    action.upper(), side.upper(), ticker,
+                    count, price_cents,
+                    order.get("order_id", "?"),
+                    order.get("status", "?"),
+                    order.get("remaining_count", "?"),
+                )
+                return order
+        except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+            logging.error("[Kalshi-Order] Request failed: %s", exc)
+            return {"error": True, "detail": str(exc)}
+
+    async def get_order(self, order_id: str) -> dict:
+        """Check the status of an existing order."""
+        await self._ensure_session()
+        await self._limiter.acquire()
+
+        path = f"{self.ORDER_PATH}/{order_id}"
+        headers = self._sign_request("GET", path)
+
+        base = KALSHI_BASE.split("/trade-api/v2")[0] if "/trade-api/v2" in KALSHI_BASE else KALSHI_BASE
+        url = f"{base}{path}"
+
+        timeout = aiohttp.ClientTimeout(total=REQUEST_TIMEOUT)
+        try:
+            async with self._session.get(
+                url, headers=headers, timeout=timeout,
+            ) as resp:
+                data = await resp.json(content_type=None)
+                return data.get("order", data) if resp.status < 400 else data
+        except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+            logging.error("[Kalshi-Order] get_order failed: %s", exc)
+            return {"error": True, "detail": str(exc)}
+
+    async def get_orders(self, **params) -> list[dict]:
+        """List orders with query parameters (e.g. ticker, status).
+
+        Useful for reconciliation: pass ticker=... to find orders
+        placed during a timeout when we don't have the order_id.
+        """
+        await self._ensure_session()
+        await self._limiter.acquire()
+
+        path = self.ORDER_PATH
+        headers = self._sign_request("GET", path)
+
+        base = KALSHI_BASE.split("/trade-api/v2")[0] if "/trade-api/v2" in KALSHI_BASE else KALSHI_BASE
+        url = f"{base}{path}"
+
+        timeout = aiohttp.ClientTimeout(total=REQUEST_TIMEOUT)
+        try:
+            async with self._session.get(
+                url, headers=headers, params=params, timeout=timeout,
+            ) as resp:
+                data = await resp.json(content_type=None)
+                if resp.status >= 400:
+                    return []
+                return data.get("orders", []) if isinstance(data, dict) else []
+        except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+            logging.error("[Kalshi-Order] get_orders failed: %s", exc)
+            return []
+
+    async def cancel_order(self, order_id: str) -> dict:
+        """Cancel an order."""
+        await self._ensure_session()
+        await self._limiter.acquire()
+
+        path = f"{self.ORDER_PATH}/{order_id}"
+        headers = self._sign_request("DELETE", path)
+
+        base = KALSHI_BASE.split("/trade-api/v2")[0] if "/trade-api/v2" in KALSHI_BASE else KALSHI_BASE
+        url = f"{base}{path}"
+
+        timeout = aiohttp.ClientTimeout(total=REQUEST_TIMEOUT)
+        try:
+            async with self._session.delete(
+                url, headers=headers, timeout=timeout,
+            ) as resp:
+                data = await resp.json(content_type=None)
+                return data.get("order", data) if resp.status < 400 else data
+        except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+            logging.error("[Kalshi-Order] cancel_order failed: %s", exc)
+            return {"error": True, "detail": str(exc)}
+
+    async def close(self) -> None:
+        if self._session and not self._session.closed:
+            await self._session.close()
+
+
+# ====================================================================
+# PolymarketOrderClient — order submission via py_clob_client (Phase 3)
+# ====================================================================
+
+class PolymarketOrderClient:
+    """Order client for Polymarket using py_clob_client.
+
+    Uses EIP-712 signed orders on Polygon (chain_id=137).
+    The ClobClient from py_clob_client is synchronous (uses `requests`),
+    so all calls are wrapped in ``asyncio.to_thread()`` to avoid blocking
+    the event loop.
+
+    Order types used:
+      - FOK (Fill-or-Kill) for primary leg execution
+      - FOK for unwind sells (with aggressive pricing)
+
+    Credentials required:
+      - ETH private key (hex) — read from POLY_PRIVATE_KEY_PATH
+      - CLOB API key, secret, passphrase — from env vars
+    """
+
+    def __init__(self, poly_token_cache: Optional[dict] = None) -> None:
+        self._client = None
+        self._token_cache = poly_token_cache or {}
+        self._private_key_hex: str = ""
+        # Serializes create_order + post_order so two concurrent calls
+        # never fetch the same nonce from py_clob_client (which would
+        # cause a "nonce too low" on-chain revert).
+        self._order_lock = asyncio.Lock()
+
+    def _load_private_key(self) -> str:
+        """Load the ETH private key from file."""
+        if self._private_key_hex:
+            return self._private_key_hex
+        key_path = Path(POLY_PRIVATE_KEY_PATH).expanduser()
+        if not key_path.exists():
+            raise FileNotFoundError(
+                f"Polymarket private key not found at {key_path}. "
+                "Set POLY_PRIVATE_KEY_PATH env var."
+            )
+        raw = key_path.read_text().strip()
+        # Accept with or without 0x prefix
+        self._private_key_hex = raw if raw.startswith("0x") else f"0x{raw}"
+        return self._private_key_hex
+
+    def _ensure_client(self) -> None:
+        """Lazy-initialize the ClobClient."""
+        if self._client is not None:
+            return
+        try:
+            from py_clob_client.client import ClobClient
+            from py_clob_client.clob_types import ApiCreds
+        except ImportError:
+            raise ImportError(
+                "py_clob_client is required for live Polymarket trading. "
+                "Install with: pip install py-clob-client"
+            )
+
+        key = self._load_private_key()
+
+        if not all([POLY_API_KEY, POLY_API_SECRET, POLY_PASSPHRASE]):
+            raise ValueError(
+                "Polymarket CLOB credentials required for live trading. "
+                "Set POLY_API_KEY, POLY_API_SECRET, POLY_PASSPHRASE env vars."
+            )
+
+        creds = ApiCreds(
+            api_key=POLY_API_KEY,
+            api_secret=POLY_API_SECRET,
+            api_passphrase=POLY_PASSPHRASE,
+        )
+        self._client = ClobClient(
+            host=CLOB_BASE,
+            key=key,
+            chain_id=POLY_CHAIN_ID,
+            creds=creds,
+        )
+        logging.info(
+            "[Poly-Order] ClobClient initialized (chain_id=%d)", POLY_CHAIN_ID,
+        )
+
+    def resolve_token_id(self, condition_id: str, side: str) -> Optional[str]:
+        """Get the token_id for a given condition_id and side.
+
+        Args:
+            condition_id: Polymarket condition_id (hex)
+            side: "yes" or "no"
+
+        Returns:
+            token_id string, or None if not found in cache.
+        """
+        pair = self._token_cache.get(condition_id)
+        if pair is None:
+            return None
+        yes_tok, no_tok = pair
+        return yes_tok if side == "yes" else no_tok
+
+    async def place_order(
+        self,
+        token_id: str,
+        side: str,
+        price: float,
+        size: float,
+        order_type: str = "fok",
+    ) -> dict:
+        """Create, sign, and post an order to Polymarket.
+
+        Args:
+            token_id: The specific token to trade
+            side: "buy" or "sell"
+            price: Limit price (0.0-1.0)
+            size: Number of contracts (as float for py_clob_client)
+            order_type: "fok" (default) or "gtc"
+
+        Returns:
+            Response dict with orderID, status ("matched"/"unmatched"), etc.
+        """
+        self._ensure_client()
+
+        from py_clob_client.clob_types import OrderArgs, OrderType
+        from py_clob_client.order_builder.constants import BUY, SELL
+
+        clob_side = BUY if side.lower() == "buy" else SELL
+        ot = OrderType.FOK if order_type.lower() == "fok" else OrderType.GTC
+
+        order_args = OrderArgs(
+            token_id=token_id,
+            price=price,
+            size=size,
+            side=clob_side,
+        )
+
+        def _sync_create_and_post():
+            signed = self._client.create_order(order_args)
+            return self._client.post_order(signed, ot)
+
+        try:
+            async with self._order_lock:
+                response = await asyncio.to_thread(_sync_create_and_post)
+            order_id = response.get("orderID", "?") if isinstance(response, dict) else "?"
+            status = response.get("status", "?") if isinstance(response, dict) else str(response)
+            logging.info(
+                "[Poly-Order] %s %s token=%s… size=%.1f @ %.4f → "
+                "orderID=%s status=%s",
+                side.upper(), order_type.upper(),
+                token_id[:16], size, price, order_id, status,
+            )
+            return response if isinstance(response, dict) else {"raw": response}
+        except Exception as exc:
+            logging.error("[Poly-Order] place_order failed: %s", exc, exc_info=True)
+            return {"error": True, "detail": str(exc)}
+
+    async def get_order(self, order_id: str) -> dict:
+        """Check the status of an existing order.
+
+        Serialized under _order_lock to prevent concurrent access to
+        py_clob_client's internal state (session, nonce tracking).
+        """
+        self._ensure_client()
+        try:
+            async with self._order_lock:
+                result = await asyncio.to_thread(self._client.get_order, order_id)
+            return result if isinstance(result, dict) else {"raw": result}
+        except Exception as exc:
+            logging.error("[Poly-Order] get_order failed: %s", exc)
+            return {"error": True, "detail": str(exc)}
+
+    async def cancel_order(self, order_id: str) -> dict:
+        """Cancel an order.
+
+        Serialized under _order_lock to prevent concurrent access to
+        py_clob_client's internal state (session, nonce tracking).
+        """
+        self._ensure_client()
+        try:
+            async with self._order_lock:
+                result = await asyncio.to_thread(self._client.cancel, order_id)
+            return result if isinstance(result, dict) else {"raw": result}
+        except Exception as exc:
+            logging.error("[Poly-Order] cancel_order failed: %s", exc)
+            return {"error": True, "detail": str(exc)}
+
+    async def close(self) -> None:
+        """No persistent connections to close for py_clob_client."""
+        self._client = None
+
+
+# ====================================================================
 # WebSocket Managers — real-time orderbook streaming (Decimal)
 # ====================================================================
 
@@ -1062,6 +1530,7 @@ class PolymarketWS:
         self._listen_task: Optional[asyncio.Task] = None
         self._stale_task: Optional[asyncio.Task] = None
         self._reconnect_attempts = 0
+        self._notifier: Optional["DiscordNotifier"] = None
         # condition_id -> (yes_token_id, no_token_id)
         self._token_map: dict[str, tuple[str, str]] = {}
         # condition_id -> event_name (for queue notifications)
@@ -1134,8 +1603,8 @@ class PolymarketWS:
             while self._connected and self._ws and not self._ws.closed:
                 await self._ws.send_str("PING")
                 await asyncio.sleep(WS_PING_INTERVAL)
-        except Exception:
-            pass  # reconnect handled by listen loop
+        except Exception as exc:
+            logging.debug("[Poly-WS] Ping failed: %s", exc)
 
     async def _stale_watchdog(self) -> None:
         """Kill the WS if no data arrives within STALE_TIMEOUT_SECONDS.
@@ -1283,6 +1752,13 @@ class PolymarketWS:
             "[Poly-WS] Reconnecting in %.1fs (attempt %d)…",
             delay, self._reconnect_attempts,
         )
+        # Phase 4: Discord notification on reconnect
+        if self._notifier is not None:
+            asyncio.ensure_future(
+                self._notifier.notify_reconnect(
+                    "Polymarket", self._reconnect_attempts,
+                )
+            )
         await asyncio.sleep(delay)
         await self._do_connect()
 
@@ -1371,6 +1847,7 @@ class KalshiWS:
         self._stale_task: Optional[asyncio.Task] = None
         self._reconnect_attempts = 0
         self._msg_id = 0
+        self._notifier: Optional["DiscordNotifier"] = None
         self._private_key = None
         # ticker -> event_name (for queue notifications)
         self._ticker_to_event: dict[str, str] = {}
@@ -1380,6 +1857,13 @@ class KalshiWS:
         self.last_update_time: float = 0.0
         # MarketFetcher reference — used for post-reconnect REST snapshots
         self._fetcher: Optional["MarketFetcher"] = None
+        # Phase 3 — Fill tracking for live order execution
+        # Maps order_id -> asyncio.Future that resolves with fill data
+        self._fill_waiters: dict[str, asyncio.Future] = {}
+        # Accumulated fills per order_id: {order_id: total_filled_count}
+        self._fill_counts: dict[str, int] = {}
+        # Whether we’ve subscribed to the fill channel
+        self._fills_subscribed: bool = False
 
     def set_update_queue(self, queue: asyncio.Queue) -> None:
         """Attach the shared update queue for event-driven processing."""
@@ -1468,6 +1952,20 @@ class KalshiWS:
                     "[Kalshi-WS] Re-subscribed to %d tickers",
                     len(self._subscribed_tickers),
                 )
+
+            # Re-subscribe to fill channel if was previously active (Phase 3)
+            if self._fills_subscribed and self._subscribed_tickers:
+                self._msg_id += 1
+                fill_msg = {
+                    "id": self._msg_id,
+                    "cmd": "subscribe",
+                    "params": {
+                        "channels": ["fill"],
+                        "market_tickers": list(self._subscribed_tickers),
+                    },
+                }
+                await self._ws.send_json(fill_msg)
+                logging.info("[Kalshi-WS] Re-subscribed to fill channel.")
 
             self._listen_task = asyncio.create_task(self._listen_loop())
             self._stale_task = asyncio.create_task(self._stale_watchdog())
@@ -1594,6 +2092,35 @@ class KalshiWS:
                 )
                 self._notify_update(ticker)
 
+        elif msg_type == "fill":
+            # Phase 3: Fill notification from the fill channel.
+            # Resolves any pending fill waiter for this order_id.
+            inner = data.get("msg", {})
+            order_id = inner.get("order_id", "")
+            count = int(inner.get("count", 0))
+            if order_id and order_id in self._fill_waiters:
+                # Accumulate fill count (may receive multiple partial fills)
+                prev = self._fill_counts.get(order_id, 0)
+                self._fill_counts[order_id] = prev + count
+                logging.info(
+                    "[Kalshi-WS] Fill received: order=%s count=%d "
+                    "(total filled=%d)",
+                    order_id, count, self._fill_counts[order_id],
+                )
+                # Resolve the future with the accumulated fill data
+                fut = self._fill_waiters.get(order_id)
+                if fut and not fut.done():
+                    fut.set_result({
+                        "order_id": order_id,
+                        "filled_count": self._fill_counts[order_id],
+                        "last_fill": inner,
+                    })
+            elif order_id:
+                logging.debug(
+                    "[Kalshi-WS] Fill for untracked order %s (count=%d)",
+                    order_id, count,
+                )
+
         elif msg_type == "error":
             logging.error(
                 "[Kalshi-WS] Error code=%s: %s",
@@ -1624,6 +2151,13 @@ class KalshiWS:
             "[Kalshi-WS] Reconnecting in %.1fs (attempt %d)…",
             delay, self._reconnect_attempts,
         )
+        # Phase 4: Discord notification on reconnect
+        if self._notifier is not None:
+            asyncio.ensure_future(
+                self._notifier.notify_reconnect(
+                    "Kalshi", self._reconnect_attempts,
+                )
+            )
         await asyncio.sleep(delay)
         await self._do_connect()
 
@@ -1650,6 +2184,60 @@ class KalshiWS:
             }
             await self._ws.send_json(msg)
             logging.info("[Kalshi-WS] Subscribed to %s", ticker)
+
+    async def subscribe_fills(self) -> None:
+        """Subscribe to the fill channel for live order tracking (Phase 3).
+
+        Must be called after connect().  The fill channel delivers real-time
+        notifications when our orders are matched.  Messages include:
+          order_id, count (filled), side, action, yes_price, etc.
+
+        On reconnect, _do_connect() re-subscribes automatically if
+        self._fills_subscribed is True.
+        """
+        if self._fills_subscribed:
+            return
+        if not self._connected or not self._ws or self._ws.closed:
+            logging.warning("[Kalshi-WS] Cannot subscribe fills — not connected.")
+            return
+
+        self._msg_id += 1
+        msg = {
+            "id": self._msg_id,
+            "cmd": "subscribe",
+            "params": {
+                "channels": ["fill"],
+                "market_tickers": list(self._subscribed_tickers),
+            },
+        }
+        await self._ws.send_json(msg)
+        self._fills_subscribed = True
+        logging.info(
+            "[Kalshi-WS] Subscribed to fill channel for %d tickers.",
+            len(self._subscribed_tickers),
+        )
+
+    def register_fill_waiter(self, order_id: str) -> asyncio.Future:
+        """Register a Future that resolves when fill(s) arrive for order_id.
+
+        Call this AFTER placing the order (once you have the order_id).
+        The Future resolves with a dict:
+          {"order_id": ..., "filled_count": ..., "last_fill": ...}
+
+        Use asyncio.wait_for() with a timeout to avoid hanging forever.
+        """
+        loop = asyncio.get_running_loop()
+        fut: asyncio.Future = loop.create_future()
+        self._fill_waiters[order_id] = fut
+        self._fill_counts[order_id] = 0
+        return fut
+
+    def cancel_fill_waiter(self, order_id: str) -> None:
+        """Cancel and clean up a fill waiter."""
+        fut = self._fill_waiters.pop(order_id, None)
+        self._fill_counts.pop(order_id, None)
+        if fut and not fut.done():
+            fut.cancel()
 
     def get_snapshot(self, ticker: str) -> Optional[MarketSnapshot]:
         """Build a MarketSnapshot from local orderbook state (Decimal).
@@ -1884,8 +2472,8 @@ class PaperTrader:
                 csv.DictWriter(fh, fieldnames=self.COLUMNS).writeheader()
             logging.info("Created trade ledger → %s", self.path)
 
-    def log(self, opp: ArbOpportunity) -> None:
-        """Append one row to the ledger CSV."""
+    async def log(self, opp: ArbOpportunity) -> None:
+        """Append one row to the ledger CSV (non-blocking)."""
         row = {
             "timestamp": opp.timestamp,
             "event_name": opp.event_name,
@@ -1902,6 +2490,10 @@ class PaperTrader:
             "poly_depth": opp.poly_depth,
             "fetch_ms": opp.fetch_latency_ms,
         }
+        await asyncio.to_thread(self._write_row, row)
+
+    def _write_row(self, row: dict) -> None:
+        """Synchronous CSV write (called via to_thread)."""
         with open(self.path, mode="a", newline="") as fh:
             csv.DictWriter(fh, fieldnames=self.COLUMNS).writerow(row)
 
@@ -1971,16 +2563,21 @@ class PaperPortfolio:
                 csv.DictWriter(fh, fieldnames=self.PORT_COLUMNS).writeheader()
             logging.info("Created portfolio ledger → %s", self.path)
 
-    def _write_row(self, row: dict) -> None:
+    async def _write_row_async(self, row: dict) -> None:
+        """Non-blocking CSV write (offloaded to thread)."""
+        await asyncio.to_thread(self._write_row_sync, row)
+
+    def _write_row_sync(self, row: dict) -> None:
+        """Synchronous CSV write (called via to_thread or at startup)."""
         with open(self.path, mode="a", newline="") as fh:
             csv.DictWriter(fh, fieldnames=self.PORT_COLUMNS).writerow(row)
 
-    def open_position(self, pos: Position) -> None:
+    async def open_position(self, pos: Position) -> None:
         """Add a position and deduct capital.  Called by ExecutionEngine."""
         self.capital -= pos.total_outlay
         self.open_positions.append(pos)
 
-        self._write_row({
+        await self._write_row_async({
             "action": "OPEN",
             "timestamp": pos.opened_at,
             "event_name": pos.event_name,
@@ -2000,7 +2597,7 @@ class PaperPortfolio:
             pos.total_outlay.quantize(Q2), self.capital.quantize(Q2),
         )
 
-    def close_positions_for_event(self, event_name: str) -> None:
+    async def close_positions_for_event(self, event_name: str) -> None:
         """
         Close all open positions for a resolved event.
         Arb guarantees $1.00 payout per contract.
@@ -2016,7 +2613,7 @@ class PaperPortfolio:
                 self.total_realized_pnl += pnl
                 self.closed_count += 1
 
-                self._write_row({
+                await self._write_row_async({
                     "action": "CLOSE",
                     "timestamp": now,
                     "event_name": pos.event_name,
@@ -2042,7 +2639,7 @@ class PaperPortfolio:
 
         self.open_positions = still_open
 
-    def record_unwind_loss(
+    async def record_unwind_loss(
         self,
         event_name: str,
         direction: str,
@@ -2064,7 +2661,7 @@ class PaperPortfolio:
         self.capital -= loss_amount
         self.total_unwind_losses += loss_amount
 
-        self._write_row({
+        await self._write_row_async({
             "action": "UNWIND",
             "timestamp": _utc_iso(),
             "event_name": event_name,
@@ -2134,8 +2731,8 @@ class OrderLogger:
                 csv.DictWriter(fh, fieldnames=self.COLUMNS).writeheader()
             logging.info("Created order log → %s", self.path)
 
-    def log(self, order: Order) -> None:
-        """Append one order to the CSV."""
+    async def log(self, order: Order) -> None:
+        """Append one order to the CSV (non-blocking)."""
         row = {
             "order_id": order.order_id,
             "timestamp": order.timestamp,
@@ -2156,6 +2753,10 @@ class OrderLogger:
             "kalshi_depth": order.kalshi_depth,
             "poly_depth": order.poly_depth,
         }
+        await asyncio.to_thread(self._write_row, row)
+
+    def _write_row(self, row: dict) -> None:
+        """Synchronous CSV write (called via to_thread)."""
         with open(self.path, mode="a", newline="") as fh:
             csv.DictWriter(fh, fieldnames=self.COLUMNS).writerow(row)
 
@@ -2179,6 +2780,11 @@ class DailyPnLTracker:
         self._today: str = self._current_day()
         self._daily_pnl: Decimal = ZERO
         self._tripped = False
+        self._notifier: Optional["DiscordNotifier"] = None
+
+    def set_notifier(self, notifier: "DiscordNotifier") -> None:
+        """Attach a DiscordNotifier for circuit-breaker alerts."""
+        self._notifier = notifier
 
     @staticmethod
     def _current_day() -> str:
@@ -2213,6 +2819,13 @@ class DailyPnLTracker:
                 "Daily P&L $%s exceeds -$%s limit. Halting new orders.",
                 self._daily_pnl.quantize(Q4), self._daily_limit.quantize(Q2),
             )
+            # Phase 4: Discord notification
+            if self._notifier is not None:
+                asyncio.ensure_future(
+                    self._notifier.notify_circuit_breaker(
+                        self._daily_pnl, self._daily_limit,
+                    )
+                )
 
     @property
     def is_breached(self) -> bool:
@@ -2374,8 +2987,8 @@ class UnwindLogger:
                 csv.DictWriter(fh, fieldnames=self.COLUMNS).writeheader()
             logging.info("Created unwind ledger → %s", self.path)
 
-    def log(self, uw: UnwindOrder) -> None:
-        """Append one row per unwind order lifecycle event."""
+    async def log(self, uw: UnwindOrder) -> None:
+        """Append one row per unwind order lifecycle event (non-blocking)."""
         def _leg_fields(leg: Optional[LegOrder], prefix: str) -> dict:
             if leg is None:
                 return {
@@ -2404,6 +3017,10 @@ class UnwindLogger:
         row.update(_leg_fields(uw.leg1, "leg1"))
         row.update(_leg_fields(uw.leg2, "leg2"))
         row.update(_leg_fields(uw.unwind_leg, "unwind"))
+        await asyncio.to_thread(self._write_row, row)
+
+    def _write_row(self, row: dict) -> None:
+        """Synchronous CSV write (called via to_thread)."""
         with open(self.path, mode="a", newline="") as fh:
             csv.DictWriter(fh, fieldnames=self.COLUMNS).writerow(row)
 
@@ -2422,8 +3039,9 @@ class UnwindManager:
       4. If Leg 1 partially fills: adjust Leg 2 size to match, or unwind
 
     PAPER MODE: Simulates immediate fills.  No real orders placed.
-    PRODUCTION (Phase 3): Replace _submit_leg() / _unwind_leg() with
-    real API calls to Kalshi and Polymarket.
+    LIVE MODE (Phase 3): Uses KalshiOrderClient (IOC) and
+    PolymarketOrderClient (FOK) for real API calls.
+    Kalshi partial IOC fills resize the Poly FOK leg dynamically.
     """
 
     def __init__(
@@ -2432,6 +3050,13 @@ class UnwindManager:
         pnl_tracker: "DailyPnLTracker",
         timeout: int = UNWIND_TIMEOUT_SECONDS,
         logger: Optional[UnwindLogger] = None,
+        *,
+        live_mode: bool = False,
+        kalshi_client: Optional["KalshiOrderClient"] = None,
+        poly_client: Optional["PolymarketOrderClient"] = None,
+        kalshi_ws: Optional["KalshiWS"] = None,
+        poly_ws: Optional["PolymarketWS"] = None,
+        fetcher: Optional["MarketFetcher"] = None,
     ) -> None:
         self._portfolio = portfolio
         self._pnl_tracker = pnl_tracker
@@ -2443,6 +3068,13 @@ class UnwindManager:
         self._completed: list[UnwindOrder] = []
         # Notification callback for Discord (Phase 4 stub)
         self._notify_callback: Optional[object] = None
+        # Phase 3: Live execution infrastructure
+        self._live_mode = live_mode
+        self._kalshi_client = kalshi_client
+        self._poly_client = poly_client
+        self._kalshi_ws = kalshi_ws
+        self._poly_ws = poly_ws
+        self._fetcher = fetcher
 
     def set_notify_callback(self, callback) -> None:
         """Register a callback for Discord alerts (Phase 4).
@@ -2457,30 +3089,41 @@ class UnwindManager:
     def _build_legs(
         opp: ArbOpportunity, contracts: int,
     ) -> tuple[LegOrder, LegOrder]:
-        """Create Leg 1 (Kalshi) and Leg 2 (Polymarket) from an opp."""
+        """Create Leg 1 (Polymarket) and Leg 2 (Kalshi) from an opp.
+
+        Polymarket FOK is executed first because it is less reliable
+        (all-or-nothing fill on a less mature exchange).  If the Poly
+        FOK fails, we avoid placing the Kalshi IOC at all — no legging
+        risk.  Kalshi IOC (Leg 2) is more reliable and supports partial
+        fills, making it the safer second leg.
+        """
         if "YES@Kalshi" in opp.direction:
-            # Direction A: Buy YES @ Kalshi + Buy NO @ Polymarket
+            # Direction A: Buy NO @ Polymarket + Buy YES @ Kalshi
             leg1 = LegOrder(
-                leg_id=str(uuid.uuid4())[:8],
-                platform="kalshi", side="yes",
-                price=opp.kalshi_price, contracts=contracts,
-            )
-            leg2 = LegOrder(
                 leg_id=str(uuid.uuid4())[:8],
                 platform="polymarket", side="no",
                 price=opp.poly_price, contracts=contracts,
-            )
-        else:
-            # Direction B: Buy NO @ Kalshi + Buy YES @ Polymarket
-            leg1 = LegOrder(
-                leg_id=str(uuid.uuid4())[:8],
-                platform="kalshi", side="no",
-                price=opp.kalshi_price, contracts=contracts,
+                market_id=opp.poly_condition_id,
             )
             leg2 = LegOrder(
                 leg_id=str(uuid.uuid4())[:8],
+                platform="kalshi", side="yes",
+                price=opp.kalshi_price, contracts=contracts,
+                market_id=opp.kalshi_ticker,
+            )
+        else:
+            # Direction B: Buy YES @ Polymarket + Buy NO @ Kalshi
+            leg1 = LegOrder(
+                leg_id=str(uuid.uuid4())[:8],
                 platform="polymarket", side="yes",
                 price=opp.poly_price, contracts=contracts,
+                market_id=opp.poly_condition_id,
+            )
+            leg2 = LegOrder(
+                leg_id=str(uuid.uuid4())[:8],
+                platform="kalshi", side="no",
+                price=opp.kalshi_price, contracts=contracts,
+                market_id=opp.kalshi_ticker,
             )
         return leg1, leg2
 
@@ -2510,7 +3153,7 @@ class UnwindManager:
         self._active[uw.unwind_id] = uw
 
         try:
-            # ── Step 1: Submit Leg 1 (Kalshi) ──
+            # ── Step 1: Submit Leg 1 (Polymarket FOK — less reliable) ──
             uw.status = UnwindStatus.LEG1_SUBMITTED
             logging.info(
                 "  [Unwind %s] Leg 1 SUBMITTED: %s %s @ $%s × %d on %s",
@@ -2523,13 +3166,13 @@ class UnwindManager:
             if not leg1_ok:
                 uw.status = UnwindStatus.FAILED
                 uw.error_message = "Leg 1 submission failed"
-                self._finish(uw)
+                await self._finish(uw)
                 return uw
 
             if leg1.filled_contracts == 0:
                 uw.status = UnwindStatus.FAILED
                 uw.error_message = "Leg 1 fill returned 0 contracts"
-                self._finish(uw)
+                await self._finish(uw)
                 return uw
 
             uw.status = UnwindStatus.LEG1_FILLED
@@ -2550,7 +3193,51 @@ class UnwindManager:
                 leg2.contracts = actual_contracts
                 uw.total_contracts = actual_contracts
 
-            # ── Step 2: Submit Leg 2 (Polymarket) ──
+            # ── Spread re-verification after Leg 1 fill ──
+            # Sports markets have a 3-second matching delay.  During
+            # that window the Kalshi price may have moved, making the
+            # arb unprofitable.  Re-fetch the Kalshi book and verify
+            # the spread still holds before committing Leg 2.
+            if self._live_mode and self._fetcher is not None:
+                kalshi_snap = await self._fetcher.fetch_kalshi(
+                    leg2.market_id,
+                )
+                if kalshi_snap is not None:
+                    # Pick the correct side's best ask
+                    side_book = (
+                        kalshi_snap.yes if leg2.side == "yes"
+                        else kalshi_snap.no
+                    )
+                    fresh_ask = side_book.best_ask
+                    if fresh_ask is not None and fresh_ask > ZERO:
+                        new_cost = (leg1.price + fresh_ask).quantize(Q4)
+                        k_fee = kalshi_taker_fee(fresh_ask, 1)
+                        p_fee = poly_taker_fee(leg1.price, 1)
+                        new_net = (ONE - new_cost - k_fee - p_fee).quantize(Q4)
+                        if new_net <= ZERO:
+                            logging.warning(
+                                "  [Unwind %s] Spread evaporated after Leg 1 "
+                                "fill (new_net=$%s). Unwinding.",
+                                uw.unwind_id, new_net.quantize(Q4),
+                            )
+                            uw.error_message = (
+                                f"Spread gone after Leg 1 fill "
+                                f"(net={new_net}). Unwinding."
+                            )
+                            await self._unwind(uw)
+                            return uw
+                        # Update Leg 2 price to the fresh ask
+                        leg2.price = fresh_ask
+                        uw.net_profit_per_contract = new_net
+                        logging.info(
+                            "  [Unwind %s] Spread re-verified: "
+                            "fresh Kalshi ask=$%s, new net=$%s",
+                            uw.unwind_id,
+                            fresh_ask.quantize(Q4),
+                            new_net.quantize(Q4),
+                        )
+
+            # ── Step 2: Submit Leg 2 (Kalshi IOC — more reliable) ──
             uw.status = UnwindStatus.LEG2_SUBMITTED
             logging.info(
                 "  [Unwind %s] Leg 2 SUBMITTED: %s %s @ $%s × %d on %s",
@@ -2599,7 +3286,7 @@ class UnwindManager:
                 f"contracts [{uw.event_name}] {uw.direction} — "
                 f"expected net ${uw.net_profit_per_contract.quantize(Q4)}/c",
             )
-            self._finish(uw)
+            await self._finish(uw)
             return uw
 
         except asyncio.TimeoutError:
@@ -2614,7 +3301,7 @@ class UnwindManager:
                 await self._unwind(uw)
             else:
                 uw.status = UnwindStatus.FAILED
-                self._finish(uw)
+                await self._finish(uw)
             return uw
 
         except Exception as exc:
@@ -2637,7 +3324,7 @@ class UnwindManager:
                         "  [Unwind %s] Unwind also failed!",
                         uw.unwind_id, exc_info=True,
                     )
-            self._finish(uw)
+            await self._finish(uw)
             return uw
 
     # ── Unwind helpers ────────────────────────────────────────────
@@ -2655,23 +3342,20 @@ class UnwindManager:
 
         if contracts_to_unwind <= 0:
             uw.status = UnwindStatus.COMPLETE
-            self._finish(uw)
+            await self._finish(uw)
             return
 
         # Build unwind sell order (opposite of Leg 1 buy)
-        # TODO (Phase 3): In live trading, we cannot submit a limit sell
-        # at our buy price.  We must fetch the real-time best bid from
-        # the exchange orderbook here and execute a market-taking order
-        # to guarantee the unwind fills.  The difference between our
-        # buy price and the actual sell price is slippage, which must
-        # be captured in the loss calculation below.  For paper mode,
-        # sell_price == buy_price (zero slippage).
+        # In live mode, _submit_unwind() handles slippage-protected pricing.
+        # The actual fill price updates leg.price for slippage calculation.
+        # In paper mode, sell_price == buy_price (zero slippage).
         unwind_sell = LegOrder(
             leg_id=str(uuid.uuid4())[:8],
             platform=leg1.platform,
             side=leg1.side,  # selling what we bought
-            price=leg1.price,  # paper: sell at buy price (zero slippage)
+            price=leg1.price,  # starting price (live mode updates after fill)
             contracts=contracts_to_unwind,
+            market_id=leg1.market_id,
         )
         uw.unwind_leg = unwind_sell
 
@@ -2692,8 +3376,13 @@ class UnwindManager:
             #   Unwind fee: Kalshi taker fee on the sell-back
             #   Slippage: (buy_price - sell_price) * contracts
             #     (zero in paper mode; non-zero in production)
-            leg1_fee = kalshi_taker_fee(leg1.price, contracts_to_unwind)
-            unwind_fee = kalshi_taker_fee(unwind_sell.price, contracts_to_unwind)
+            # Use the correct fee function for the platform Leg 1 is on
+            _fee_fn = (
+                poly_taker_fee if leg1.platform == "polymarket"
+                else kalshi_taker_fee
+            )
+            leg1_fee = _fee_fn(leg1.price, contracts_to_unwind)
+            unwind_fee = _fee_fn(unwind_sell.price, contracts_to_unwind)
             slippage = (
                 (leg1.price - unwind_sell.price)
                 * D(contracts_to_unwind)
@@ -2710,7 +3399,7 @@ class UnwindManager:
             )
 
             # Record loss in portfolio and circuit breaker
-            self._portfolio.record_unwind_loss(
+            await self._portfolio.record_unwind_loss(
                 event_name=uw.event_name,
                 direction=uw.direction,
                 contracts=contracts_to_unwind,
@@ -2734,20 +3423,21 @@ class UnwindManager:
             f"{uw.event_name} — {uw.error_message}",
             level="warning",
         )
-        self._finish(uw)
+        await self._finish(uw)
 
     async def _unwind_partial(self, uw: UnwindOrder, excess: int) -> None:
         """Unwind excess contracts when Leg 2 partially fills."""
         leg1 = uw.leg1
         assert leg1 is not None
 
-        # TODO (Phase 3): Same as _unwind — fetch real-time best bid.
+        # In live mode, _submit_unwind() handles aggressive pricing.
         unwind_sell = LegOrder(
             leg_id=str(uuid.uuid4())[:8],
             platform=leg1.platform,
             side=leg1.side,
-            price=leg1.price,  # paper: zero slippage
+            price=leg1.price,  # starting price (live mode updates after fill)
             contracts=excess,
+            market_id=leg1.market_id,
         )
         uw.unwind_leg = unwind_sell
 
@@ -2759,8 +3449,13 @@ class UnwindManager:
         ok = await self._submit_unwind(unwind_sell)
         if ok:
             # Calculate realized loss on the partial unwind
-            leg1_fee = kalshi_taker_fee(leg1.price, excess)
-            unwind_fee = kalshi_taker_fee(unwind_sell.price, excess)
+            # Use the correct fee function for the platform Leg 1 is on
+            _fee_fn = (
+                poly_taker_fee if leg1.platform == "polymarket"
+                else kalshi_taker_fee
+            )
+            leg1_fee = _fee_fn(leg1.price, excess)
+            unwind_fee = _fee_fn(unwind_sell.price, excess)
             slippage = (
                 (leg1.price - unwind_sell.price) * D(excess)
             ).quantize(Q4)
@@ -2775,7 +3470,7 @@ class UnwindManager:
                 slippage.quantize(Q4),
             )
 
-            self._portfolio.record_unwind_loss(
+            await self._portfolio.record_unwind_loss(
                 event_name=uw.event_name,
                 direction=uw.direction,
                 contracts=excess,
@@ -2792,40 +3487,555 @@ class UnwindManager:
                 "  [Unwind %s] Partial unwind FAILED", uw.unwind_id,
             )
 
-    # ── Paper-mode leg submission (Phase 3 replaces with real API) ──
+    # ── Leg submission (paper + live modes) ─────────────────────
 
     async def _submit_leg(self, leg: LegOrder) -> bool:
-        """Submit a leg order.  Paper mode: simulate immediate full fill.
+        """Submit a leg order.
 
-        PRODUCTION (Phase 3): Replace with real API calls:
-          Kalshi:      POST /trade-api/v2/portfolio/orders
-          Polymarket:  POST signed CLOB order via py_clob_client
-        Then await fill confirmation with self._timeout.
+        Paper mode: simulate immediate full fill.
+        Live mode:  Kalshi IOC via REST + WS fill tracking.
+                    Polymarket FOK via py_clob_client.
         """
         leg.submitted_at = _utc_iso()
         leg.status = LegStatus.SUBMITTED
 
-        # Paper mode: instant full fill
-        await asyncio.sleep(0)  # yield to event loop
-        leg.status = LegStatus.FILLED
-        leg.filled_contracts = leg.contracts
-        leg.filled_at = _utc_iso()
-        return True
+        if not self._live_mode:
+            # Paper mode: instant full fill
+            await asyncio.sleep(0)  # yield to event loop
+            leg.status = LegStatus.FILLED
+            leg.filled_contracts = leg.contracts
+            leg.filled_at = _utc_iso()
+            return True
+
+        # ── LIVE MODE ──
+        if leg.platform == "kalshi":
+            return await self._submit_kalshi_buy(leg)
+        else:
+            return await self._submit_poly_buy(leg)
+
+    async def _submit_kalshi_buy(self, leg: LegOrder) -> bool:
+        """Kalshi IOC buy order with WS fill tracking.
+
+        Flow:
+          1. Register fill waiter on KalshiWS (if available).
+          2. POST IOC limit order via KalshiOrderClient.
+          3. Check REST response for immediate fill status.
+          4. If REST shows full fill → done.
+          5. If partial or ambiguous → await WS fill waiter with timeout.
+          6. If timeout → check order status via REST poll.
+
+        IOC on Kalshi executes immediately and cancels the remainder,
+        so the REST response typically contains the final state.
+        WS fill subscription serves as confirmation and handles edge cases.
+        """
+        if self._kalshi_client is None:
+            logging.error("[Unwind] Live mode but no KalshiOrderClient configured.")
+            leg.status = LegStatus.FAILED
+            return False
+
+        ticker = leg.market_id
+        if not ticker:
+            logging.error("[Unwind] Kalshi leg has no market_id (ticker).")
+            leg.status = LegStatus.FAILED
+            return False
+
+        # Convert Decimal price to cents (Kalshi uses integer cents)
+        price_cents = int((leg.price * HUNDRED).quantize(D("1")))
+
+        # Step 1: Register WS fill waiter (if WS available)
+        fill_waiter: Optional[asyncio.Future] = None
+        if self._kalshi_ws is not None and self._kalshi_ws._fills_subscribed:
+            # We don't have the order_id yet, so we'll register after POST.
+            pass
+
+        # Step 2: Submit the IOC order
+        # Use a client_order_id so we can reconcile on timeout.
+        client_order_id = str(uuid.uuid4())
+        result = await self._kalshi_client.place_order(
+            ticker=ticker,
+            action="buy",
+            side=leg.side,
+            count=leg.contracts,
+            price_cents=price_cents,
+            time_in_force="ioc",
+            client_order_id=client_order_id,
+        )
+
+        if result.get("error"):
+            detail = str(result.get("detail", ""))
+            is_timeout = ("timeout" in detail.lower()
+                          or "TimeoutError" in detail)
+            if is_timeout:
+                # ── TIMEOUT RECONCILIATION ──
+                # The POST may have succeeded on the exchange even though
+                # we never received the HTTP response.  Poll by order_id
+                # or, if unavailable, the logs will capture this.
+                logging.warning(
+                    "[Unwind] Kalshi order POST timed out (client_order_id=%s). "
+                    "Reconciling via REST poll…",
+                    client_order_id,
+                )
+                # Give the exchange a moment to settle the order
+                await asyncio.sleep(0.5)
+                reconciled = await self._reconcile_kalshi_order(
+                    leg, client_order_id,
+                )
+                if reconciled:
+                    return True
+                # Fall through to FAILED if reconciliation found nothing
+            logging.error(
+                "[Unwind] Kalshi order failed: %s", result.get("detail"),
+            )
+            leg.status = LegStatus.FAILED
+            return False
+
+        # Extract order info from REST response
+        order_id = result.get("order_id", "")
+        leg.exchange_order_id = order_id
+        status = result.get("status", "")
+        remaining = int(result.get("remaining_count", leg.contracts))
+        filled = leg.contracts - remaining
+
+        logging.info(
+            "[Unwind] Kalshi order %s: status=%s filled=%d/%d remaining=%d",
+            order_id, status, filled, leg.contracts, remaining,
+        )
+
+        # Step 3: Check if IOC already completed (typical case)
+        if remaining == 0 or status in ("executed", "filled"):
+            leg.status = LegStatus.FILLED
+            leg.filled_contracts = leg.contracts
+            leg.filled_at = _utc_iso()
+            return True
+
+        if filled > 0:
+            # Partial fill — IOC cancelled the rest
+            leg.status = LegStatus.PARTIAL if status != "canceled" else LegStatus.FILLED
+            leg.filled_contracts = filled
+            leg.filled_at = _utc_iso()
+            logging.info(
+                "[Unwind] Kalshi IOC partial fill: %d/%d contracts.",
+                filled, leg.contracts,
+            )
+            return True
+
+        # Step 4: No immediate fills — try WS waiter as fallback
+        if order_id and self._kalshi_ws is not None and self._kalshi_ws._fills_subscribed:
+            fill_waiter = self._kalshi_ws.register_fill_waiter(order_id)
+            try:
+                fill_data = await asyncio.wait_for(
+                    fill_waiter, timeout=self._timeout,
+                )
+                ws_filled = fill_data.get("filled_count", 0)
+                if ws_filled > 0:
+                    leg.status = LegStatus.FILLED
+                    leg.filled_contracts = ws_filled
+                    leg.filled_at = _utc_iso()
+                    return True
+            except asyncio.TimeoutError:
+                logging.warning(
+                    "[Unwind] Kalshi WS fill timeout for order %s", order_id,
+                )
+                self._kalshi_ws.cancel_fill_waiter(order_id)
+
+        # Step 5: Final REST poll
+        if order_id:
+            poll_result = await self._kalshi_client.get_order(order_id)
+            poll_remaining = int(poll_result.get("remaining_count", leg.contracts))
+            poll_filled = leg.contracts - poll_remaining
+            if poll_filled > 0:
+                leg.status = LegStatus.FILLED if poll_remaining == 0 else LegStatus.PARTIAL
+                leg.filled_contracts = poll_filled
+                leg.filled_at = _utc_iso()
+                return True
+
+        # No fill at all — IOC was fully cancelled
+        leg.status = LegStatus.FAILED
+        leg.filled_contracts = 0
+        logging.warning(
+            "[Unwind] Kalshi IOC order %s: no fill — cancelled.",
+            order_id,
+        )
+        return False
+
+    async def _reconcile_kalshi_order(
+        self, leg: LegOrder, client_order_id: str,
+    ) -> bool:
+        """Reconcile a Kalshi order after a POST timeout.
+
+        The HTTP POST timed out, so we never received the response.
+        However, the exchange may have accepted and filled the order.
+        Query recent orders by ticker to find a matching order and
+        determine its true state.
+
+        Returns True if the order was found and had fills.
+        """
+        if self._kalshi_client is None:
+            return False
+
+        ticker = leg.market_id
+        try:
+            orders = await self._kalshi_client.get_orders(
+                ticker=ticker, status="executed",
+            )
+            # Also check canceled (IOC partial fills show as canceled)
+            orders += await self._kalshi_client.get_orders(
+                ticker=ticker, status="canceled",
+            )
+        except Exception as exc:
+            logging.error(
+                "[Unwind] Kalshi reconciliation query failed: %s", exc,
+            )
+            return False
+
+        # Find the order matching our client_order_id
+        for order in orders:
+            oid_match = order.get("client_order_id", "") == client_order_id
+            if not oid_match:
+                continue
+
+            order_id = order.get("order_id", "")
+            leg.exchange_order_id = order_id
+            remaining = int(order.get("remaining_count", leg.contracts))
+            filled = leg.contracts - remaining
+
+            logging.info(
+                "[Unwind] Reconciled Kalshi order %s "
+                "(client_order_id=%s): filled=%d/%d",
+                order_id, client_order_id, filled, leg.contracts,
+            )
+
+            if filled > 0:
+                leg.status = LegStatus.FILLED if remaining == 0 else LegStatus.PARTIAL
+                leg.filled_contracts = filled
+                leg.filled_at = _utc_iso()
+                return True
+
+            # Order was found but 0 fills
+            return False
+
+        logging.warning(
+            "[Unwind] Kalshi reconciliation: no order found for "
+            "client_order_id=%s on %s.",
+            client_order_id, ticker,
+        )
+        return False
+
+    async def _submit_poly_buy(self, leg: LegOrder) -> bool:
+        """Polymarket FOK buy order via py_clob_client.
+
+        Flow:
+          1. Resolve token_id from condition_id + side.
+          2. Create and post FOK order via PolymarketOrderClient.
+          3. Check response status: "matched" = filled, "unmatched" = killed.
+
+        FOK orders on Polymarket either fill completely or are killed.
+        No partial fills.
+        """
+        if self._poly_client is None:
+            logging.error("[Unwind] Live mode but no PolymarketOrderClient configured.")
+            leg.status = LegStatus.FAILED
+            return False
+
+        condition_id = leg.market_id
+        if not condition_id:
+            logging.error("[Unwind] Poly leg has no market_id (condition_id).")
+            leg.status = LegStatus.FAILED
+            return False
+
+        # Resolve the specific token_id for this side
+        token_id = self._poly_client.resolve_token_id(condition_id, leg.side)
+        if not token_id:
+            logging.error(
+                "[Unwind] Cannot resolve token_id for %s side=%s.",
+                condition_id[:16], leg.side,
+            )
+            leg.status = LegStatus.FAILED
+            return False
+
+        # Submit FOK buy order
+        result = await self._poly_client.place_order(
+            token_id=token_id,
+            side="buy",
+            price=float(leg.price),
+            size=float(leg.contracts),
+            order_type="fok",
+        )
+
+        if result.get("error"):
+            logging.error("[Unwind] Poly order failed: %s", result.get("detail"))
+            leg.status = LegStatus.FAILED
+            return False
+
+        order_id = result.get("orderID", "")
+        leg.exchange_order_id = order_id
+        status = str(result.get("status", "")).lower()
+
+        if status == "matched":
+            leg.status = LegStatus.FILLED
+            leg.filled_contracts = leg.contracts
+            leg.filled_at = _utc_iso()
+            logging.info(
+                "[Unwind] Poly FOK matched: orderID=%s, %d contracts.",
+                order_id, leg.contracts,
+            )
+            return True
+
+        if status == "delayed":
+            # Rare: order is still being processed.  Poll for result.
+            logging.info("[Unwind] Poly FOK delayed — polling for result…")
+            for _ in range(int(self._timeout * 1000 / KALSHI_FILL_POLL_MS)):
+                await asyncio.sleep(KALSHI_FILL_POLL_MS / 1000)
+                poll = await self._poly_client.get_order(order_id)
+                poll_status = str(poll.get("status", "")).lower()
+                if poll_status == "matched":
+                    leg.status = LegStatus.FILLED
+                    leg.filled_contracts = leg.contracts
+                    leg.filled_at = _utc_iso()
+                    return True
+                if poll_status in ("unmatched", "canceled", "cancelled"):
+                    break
+
+        # FOK was killed (unmatched) or timed out
+        leg.status = LegStatus.FAILED
+        leg.filled_contracts = 0
+        logging.warning(
+            "[Unwind] Poly FOK unmatched/killed: orderID=%s status=%s",
+            order_id, status,
+        )
+        return False
 
     async def _submit_unwind(self, leg: LegOrder) -> bool:
-        """Submit an unwind (sell) order.  Paper mode: instant fill.
+        """Submit an unwind (sell) order.
 
-        PRODUCTION (Phase 3): Sell at market on the appropriate exchange.
+        Paper mode: instant fill.
+        Live mode:  Kalshi IOC sell / Polymarket FOK sell with aggressive pricing.
         """
         leg.submitted_at = _utc_iso()
         leg.status = LegStatus.SUBMITTED
 
-        # Paper mode: instant sell
-        await asyncio.sleep(0)
-        leg.status = LegStatus.UNWOUND
-        leg.filled_contracts = leg.contracts
-        leg.filled_at = _utc_iso()
-        return True
+        if not self._live_mode:
+            # Paper mode: instant sell
+            await asyncio.sleep(0)
+            leg.status = LegStatus.UNWOUND
+            leg.filled_contracts = leg.contracts
+            leg.filled_at = _utc_iso()
+            return True
+
+        # ── LIVE MODE UNWIND ──
+        if leg.platform == "kalshi":
+            return await self._sell_kalshi(leg)
+        else:
+            return await self._sell_poly(leg)
+
+    async def _sell_kalshi(self, leg: LegOrder) -> bool:
+        """Kalshi IOC sell order for unwind.
+
+        Uses a slippage-protected price floor: the higher of
+        (buy_price × UNWIND_MIN_PRICE_RATIO) or UNWIND_ABSOLUTE_MIN_PRICE.
+        IOC cancels any unfilled remainder.
+        """
+        if self._kalshi_client is None:
+            leg.status = LegStatus.FAILED
+            return False
+
+        ticker = leg.market_id
+        if not ticker:
+            leg.status = LegStatus.FAILED
+            return False
+
+        # Slippage-protected sell price (in cents)
+        floor_price = max(
+            leg.price * UNWIND_MIN_PRICE_RATIO,
+            UNWIND_ABSOLUTE_MIN_PRICE,
+        ).quantize(Q2)
+        price_cents = max(1, int((floor_price * HUNDRED).quantize(D("1"))))
+
+        logging.info(
+            "[Unwind] Kalshi sell: buy_price=$%s → floor=$%s (%dc)",
+            leg.price.quantize(Q4), floor_price.quantize(Q4), price_cents,
+        )
+
+        result = await self._kalshi_client.place_order(
+            ticker=ticker,
+            action="sell",
+            side=leg.side,
+            count=leg.contracts,
+            price_cents=price_cents,
+            time_in_force="ioc",
+        )
+
+        if result.get("error"):
+            logging.error("[Unwind] Kalshi sell failed: %s", result.get("detail"))
+            leg.status = LegStatus.FAILED
+            return False
+
+        order_id = result.get("order_id", "")
+        leg.exchange_order_id = order_id
+        remaining = int(result.get("remaining_count", leg.contracts))
+        filled = leg.contracts - remaining
+
+        if filled > 0:
+            leg.status = LegStatus.UNWOUND
+            leg.filled_contracts = filled
+            leg.filled_at = _utc_iso()
+
+            # Update the sell price to the actual execution price
+            # (for slippage calculation)
+            actual_price_cents = result.get("yes_price") or result.get("no_price")
+            if actual_price_cents is not None:
+                leg.price = D(str(actual_price_cents)) / HUNDRED
+
+            logging.info(
+                "[Unwind] Kalshi sell filled: %d/%d contracts @ %dc.",
+                filled, leg.contracts, actual_price_cents or price_cents,
+            )
+            return True
+
+        leg.status = LegStatus.FAILED
+        leg.filled_contracts = 0
+        logging.warning("[Unwind] Kalshi sell: no fill — order %s.", order_id)
+        return False
+
+    async def _fetch_poly_bid_depth(
+        self, token_id: str,
+    ) -> tuple[int, list[dict]]:
+        """Fetch Polymarket orderbook and return (total_bid_qty, bid_levels).
+
+        Uses MarketFetcher._fetch_poly_book() for a fresh REST snapshot.
+        Returns (0, []) if the book is unavailable.
+        """
+        if self._fetcher is None:
+            return 0, []
+        book = await self._fetcher._fetch_poly_book(token_id)
+        if book is None:
+            return 0, []
+        bids = book.get("bids", []) or book.get("buys", [])
+        if not bids:
+            return 0, []
+        # Sort bids descending by price so we consume best prices first
+        sorted_bids = sorted(
+            bids, key=lambda lvl: D(str(lvl.get("price", 0))), reverse=True,
+        )
+        total_qty = sum(int(D(str(lvl.get("size", 0)))) for lvl in sorted_bids)
+        return total_qty, sorted_bids
+
+    async def _sell_poly(self, leg: LegOrder) -> bool:
+        """Polymarket smart-sized FOK sell order for unwind.
+
+        Smart Sizing approach:
+          1. Fetch the live orderbook for the token.
+          2. Sum total resting bid quantity across all price levels.
+          3. Cap FOK size to min(leg.contracts, total_bids) so the FOK
+             never fails due to insufficient counterparty depth.
+          4. If no bids exist, retry up to 3 times (0.5s apart).
+          5. Send FOK at slippage-protected price floor (not $0.01).
+          6. If unwind_size < leg.contracts, mark as FAILED so the
+             StuckPositionMonitor can clean up the remainder — but we
+             dumped what we could immediately.
+        """
+        if self._poly_client is None:
+            leg.status = LegStatus.FAILED
+            return False
+
+        condition_id = leg.market_id
+        token_id = self._poly_client.resolve_token_id(condition_id, leg.side)
+        if not token_id:
+            logging.error("[Unwind] Cannot resolve token for Poly unwind sell.")
+            leg.status = LegStatus.FAILED
+            return False
+
+        # ── Step 1-3: Fetch book and determine available depth ──
+        max_book_retries = 3
+        total_bids = 0
+        for attempt in range(max_book_retries):
+            total_bids, _ = await self._fetch_poly_bid_depth(token_id)
+            if total_bids > 0:
+                break
+            if attempt < max_book_retries - 1:
+                logging.warning(
+                    "[Unwind] Poly sell: no bids on book (attempt %d/%d), "
+                    "retrying in 0.5s…",
+                    attempt + 1, max_book_retries,
+                )
+                await asyncio.sleep(0.5)
+
+        if total_bids == 0:
+            logging.error(
+                "[Unwind] Poly sell: no bids after %d retries — cannot unwind.",
+                max_book_retries,
+            )
+            leg.status = LegStatus.FAILED
+            leg.filled_contracts = 0
+            return False
+
+        # Cap FOK size to available depth
+        unwind_size = min(leg.contracts, total_bids)
+        if unwind_size < leg.contracts:
+            logging.warning(
+                "[Unwind] Poly sell: capping FOK to %d/%d contracts "
+                "(book depth = %d).",
+                unwind_size, leg.contracts, total_bids,
+            )
+
+        # ── Step 4: Send FOK at slippage-protected price ──
+        floor_price = max(
+            leg.price * UNWIND_MIN_PRICE_RATIO,
+            UNWIND_ABSOLUTE_MIN_PRICE,
+        ).quantize(Q4)
+        sell_price = float(floor_price)
+        logging.info(
+            "[Unwind] Poly sell: buy_price=$%s → floor=$%.4f",
+            leg.price.quantize(Q4), sell_price,
+        )
+        result = await self._poly_client.place_order(
+            token_id=token_id,
+            side="sell",
+            price=sell_price,
+            size=float(unwind_size),
+            order_type="fok",
+        )
+
+        if result.get("error"):
+            logging.error(
+                "[Unwind] Poly sell API error: %s", result.get("error"),
+            )
+            leg.status = LegStatus.FAILED
+            leg.filled_contracts = 0
+            return False
+
+        status = str(result.get("status", "")).lower()
+        if status == "matched":
+            leg.exchange_order_id = result.get("orderID", "")
+            leg.filled_contracts = unwind_size
+            leg.filled_at = _utc_iso()
+            leg.price = D(str(sell_price))
+            logging.info(
+                "[Unwind] Poly sell matched at $%.4f, %d/%d contracts.",
+                sell_price, unwind_size, leg.contracts,
+            )
+            if unwind_size >= leg.contracts:
+                leg.status = LegStatus.UNWOUND
+                return True
+            else:
+                # Partial unwind — dumped what was available, remainder
+                # will be handled by StuckPositionMonitor on next pass.
+                leg.status = LegStatus.FAILED
+                logging.warning(
+                    "[Unwind] Poly sell partial: %d contracts remain exposed.",
+                    leg.contracts - unwind_size,
+                )
+                return False
+
+        # FOK was not matched even at capped size — book moved
+        logging.warning(
+            "[Unwind] Poly sell: FOK for %d contracts not matched "
+            "(book may have moved).",
+            unwind_size,
+        )
+        leg.status = LegStatus.FAILED
+        leg.filled_contracts = 0
+        return False
 
     # ── Stuck position detection ──────────────────────────────────
 
@@ -2842,7 +4052,7 @@ class UnwindManager:
             UnwindStatus.LEG2_SUBMITTED,
             UnwindStatus.LEG1_SUBMITTED,
         }
-        for uw in self._active.values():
+        for uw in list(self._active.values()):
             if uw.status not in stuck_states:
                 continue
             created = _parse_iso(uw.created_at)
@@ -2865,7 +4075,7 @@ class UnwindManager:
 
     # ── Lifecycle management ──────────────────────────────────────
 
-    def _finish(self, uw: UnwindOrder) -> None:
+    async def _finish(self, uw: UnwindOrder) -> None:
         """Move an unwind order from active to completed."""
         uw.completed_at = _utc_iso()
         self._active.pop(uw.unwind_id, None)
@@ -2873,17 +4083,30 @@ class UnwindManager:
         # Cap completed list
         if len(self._completed) > MAX_ORDERS_IN_MEMORY:
             self._completed = self._completed[-MAX_ORDERS_IN_MEMORY:]
-        self._logger.log(uw)
+        await self._logger.log(uw)
 
     def _notify(self, message: str, level: str = "info") -> None:
-        """Notification stub for Discord alerts (Phase 4).
+        """Fire Discord alert via DiscordNotifier (Phase 4).
 
-        When Phase 4 is implemented, set_notify_callback() will register
-        the DiscordNotifier.  Until then, this just logs the message.
+        Also logs the message at the appropriate level.
+        Errors in notification delivery are silently caught to avoid
+        disrupting trade execution.
         """
         log_level = getattr(logging, level.upper(), logging.INFO)
         logging.log(log_level, message)
-        # Phase 4: if self._notify_callback: await self._notify_callback(message, level)
+        if self._notify_callback is not None:
+            try:
+                asyncio.ensure_future(
+                    self._notify_callback.notify_unwind(
+                        # Find the most recent active/completed order to send
+                        self._completed[-1] if self._completed else UnwindOrder(
+                            unwind_id="unknown", event_name="unknown",
+                            direction="unknown", error_message=message,
+                        )
+                    )
+                )
+            except Exception:
+                pass  # never disrupt execution for notification failures
 
     # ── Accessors ──────────────────────────────────────────────────
 
@@ -2908,6 +4131,266 @@ class UnwindManager:
             1 for uw in self._completed
             if uw.status in (UnwindStatus.UNWOUND, UnwindStatus.FAILED)
         )
+
+
+# ====================================================================
+# DiscordNotifier — async webhook notifications (Phase 4)
+# ====================================================================
+
+class DiscordNotifier:
+    """Async Discord webhook notifier with rate limiting and embed formatting.
+
+    Sends rich embeds for all critical bot events:
+      - Order filled (green)
+      - Order rejected (red)
+      - Unwind triggered (yellow)
+      - Circuit breaker activated (red)
+      - WS reconnection (yellow)
+      - Error-level log messages (red)
+      - Daily summary (green/red)
+
+    Rate-limited to DISCORD_MAX_POSTS_PER_SEC (default 5) per Discord
+    API limits.  If no webhook URL is configured, all methods are no-ops.
+    """
+
+    # Discord embed color codes
+    COLOR_GREEN = 0x2ECC71   # fills, success
+    COLOR_RED = 0xE74C3C     # errors, rejects, circuit breaker
+    COLOR_YELLOW = 0xF1C40F  # warnings, unwinds, reconnects
+
+    def __init__(
+        self,
+        webhook_url: str = "",
+        max_posts_per_sec: float = DISCORD_MAX_POSTS_PER_SEC,
+    ) -> None:
+        self._url = webhook_url.strip()
+        self._enabled = bool(self._url)
+        self._session: Optional[aiohttp.ClientSession] = None
+        # Token-bucket rate limiter
+        self._min_interval = 1.0 / max_posts_per_sec if max_posts_per_sec > 0 else 0.2
+        self._last_post: float = 0.0
+        self._lock = asyncio.Lock()
+
+    async def _ensure_session(self) -> None:
+        if self._session is None or self._session.closed:
+            self._session = aiohttp.ClientSession()
+
+    async def close(self) -> None:
+        """Close the underlying HTTP session."""
+        if self._session and not self._session.closed:
+            await self._session.close()
+
+    # ── Core send method ──────────────────────────────────────────
+
+    async def send(
+        self,
+        title: str,
+        description: str = "",
+        color: int = COLOR_GREEN,
+        fields: list[dict] | None = None,
+    ) -> None:
+        """Send a Discord embed via webhook POST.
+
+        Rate-limited and error-tolerant — failures are logged but never
+        propagated to avoid disrupting bot operation.
+        """
+        if not self._enabled:
+            return
+
+        # Rate limit
+        async with self._lock:
+            now = asyncio.get_event_loop().time()
+            wait = self._last_post + self._min_interval - now
+            if wait > 0:
+                await asyncio.sleep(wait)
+            self._last_post = asyncio.get_event_loop().time()
+
+        embed: dict = {
+            "title": title[:256],  # Discord limit
+            "color": color,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+        if description:
+            embed["description"] = description[:4096]  # Discord limit
+        if fields:
+            embed["fields"] = [
+                {
+                    "name": f.get("name", "")[:256],
+                    "value": f.get("value", "")[:1024],
+                    "inline": f.get("inline", True),
+                }
+                for f in fields[:25]  # Discord max 25 fields
+            ]
+
+        payload = {"embeds": [embed]}
+
+        try:
+            await self._ensure_session()
+            async with self._session.post(
+                self._url,
+                json=payload,
+                timeout=aiohttp.ClientTimeout(total=5),
+            ) as resp:
+                if resp.status == 429:
+                    # Discord rate limit hit — back off
+                    retry_after = (await resp.json()).get("retry_after", 1.0)
+                    logging.warning(
+                        "[Discord] Rate limited, retry after %.1fs",
+                        retry_after,
+                    )
+                    await asyncio.sleep(float(retry_after))
+                    # Retry once
+                    async with self._session.post(
+                        self._url,
+                        json=payload,
+                        timeout=aiohttp.ClientTimeout(total=5),
+                    ) as retry_resp:
+                        if retry_resp.status >= 400:
+                            logging.warning(
+                                "[Discord] Retry failed: %d", retry_resp.status,
+                            )
+                elif resp.status >= 400:
+                    body = await resp.text()
+                    logging.warning(
+                        "[Discord] Webhook POST failed: %d — %s",
+                        resp.status, body[:200],
+                    )
+        except Exception as exc:
+            logging.warning("[Discord] Webhook POST error: %s", exc)
+
+    # ── Convenience notification methods ──────────────────────────
+
+    async def notify_fill(self, order: "Order") -> None:
+        """Notify: order filled (green embed)."""
+        await self.send(
+            title="✅ Order Filled",
+            color=self.COLOR_GREEN,
+            fields=[
+                {"name": "Event", "value": order.event_name, "inline": True},
+                {"name": "Direction", "value": order.direction, "inline": True},
+                {"name": "Contracts", "value": str(order.filled_contracts), "inline": True},
+                {"name": "Kalshi Price", "value": f"${order.kalshi_price.quantize(Q4)}", "inline": True},
+                {"name": "Poly Price", "value": f"${order.poly_price.quantize(Q4)}", "inline": True},
+                {"name": "Net Profit/c", "value": f"${order.net_profit.quantize(Q4)}", "inline": True},
+                {"name": "Total Outlay", "value": f"${order.total_outlay.quantize(Q2)}", "inline": True},
+            ],
+        )
+
+    async def notify_reject(self, order: "Order") -> None:
+        """Notify: order rejected (red embed)."""
+        await self.send(
+            title="❌ Order Rejected",
+            color=self.COLOR_RED,
+            fields=[
+                {"name": "Event", "value": order.event_name, "inline": True},
+                {"name": "Direction", "value": order.direction, "inline": True},
+                {"name": "Reason", "value": order.reject_reason.value, "inline": True},
+                {"name": "Desired Qty", "value": str(order.desired_contracts), "inline": True},
+                {"name": "Depth K/P", "value": f"{order.kalshi_depth}/{order.poly_depth}", "inline": True},
+            ],
+        )
+
+    async def notify_unwind(self, uw: "UnwindOrder") -> None:
+        """Notify: unwind triggered (yellow embed)."""
+        await self.send(
+            title="⚠️ Unwind Triggered",
+            color=self.COLOR_YELLOW,
+            fields=[
+                {"name": "Unwind ID", "value": uw.unwind_id, "inline": True},
+                {"name": "Event", "value": uw.event_name, "inline": True},
+                {"name": "Direction", "value": uw.direction, "inline": True},
+                {"name": "Status", "value": uw.status.value, "inline": True},
+                {"name": "Contracts", "value": str(uw.total_contracts), "inline": True},
+                {"name": "Details", "value": uw.error_message or "n/a", "inline": False},
+            ],
+        )
+
+    async def notify_circuit_breaker(
+        self, daily_pnl: Decimal, limit: Decimal,
+    ) -> None:
+        """Notify: circuit breaker activated (red embed)."""
+        await self.send(
+            title="🚨 Circuit Breaker Tripped",
+            description=(
+                f"Daily P&L **${daily_pnl.quantize(Q4)}** "
+                f"exceeds **-${limit.quantize(Q2)}** limit.\n"
+                "All new orders are blocked for the rest of the day."
+            ),
+            color=self.COLOR_RED,
+        )
+
+    async def notify_reconnect(
+        self, platform: str, attempt: int,
+    ) -> None:
+        """Notify: WS reconnection event (yellow embed)."""
+        await self.send(
+            title=f"🔌 {platform} WS Reconnecting",
+            description=f"Connection lost.  Reconnect attempt **#{attempt}**.",
+            color=self.COLOR_YELLOW,
+        )
+
+    async def notify_error(self, message: str) -> None:
+        """Notify: error-level log message (red embed)."""
+        await self.send(
+            title="🔴 Error",
+            description=message[:4096],
+            color=self.COLOR_RED,
+        )
+
+    async def send_daily_summary(
+        self,
+        portfolio: "PaperPortfolio",
+        pnl_tracker: "DailyPnLTracker",
+        execution: "ExecutionEngine",
+        unwind_mgr: "UnwindManager",
+    ) -> None:
+        """Send end-of-day summary embed."""
+        pnl = pnl_tracker.daily_pnl
+        color = self.COLOR_GREEN if pnl >= ZERO else self.COLOR_RED
+        await self.send(
+            title="📊 Daily Summary",
+            color=color,
+            fields=[
+                {"name": "Daily P&L", "value": f"${pnl.quantize(Q4)}", "inline": True},
+                {"name": "Loss Limit", "value": f"-${pnl_tracker.daily_limit.quantize(Q2)}", "inline": True},
+                {"name": "Capital", "value": f"${portfolio.capital.quantize(Q2)}", "inline": True},
+                {"name": "Open Positions", "value": str(len(portfolio.open_positions)), "inline": True},
+                {"name": "Orders", "value": f"{execution.filled_count} filled, {execution.rejected_count} rejected", "inline": True},
+                {"name": "Unwinds", "value": f"{unwind_mgr.complete_count} ok, {unwind_mgr.unwound_count} unwound", "inline": True},
+            ],
+        )
+
+
+async def _daily_summary_task(
+    notifier: DiscordNotifier,
+    portfolio: "PaperPortfolio",
+    pnl_tracker: "DailyPnLTracker",
+    execution: "ExecutionEngine",
+    unwind_mgr: "UnwindManager",
+    stop_event: asyncio.Event,
+) -> None:
+    """Background task: sends a daily summary at midnight UTC."""
+    while not stop_event.is_set():
+        # Calculate seconds until next midnight UTC
+        now = datetime.now(timezone.utc)
+        tomorrow = (now + timedelta(days=1)).replace(
+            hour=0, minute=0, second=5, microsecond=0,
+        )
+        wait_seconds = (tomorrow - now).total_seconds()
+
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=wait_seconds)
+            return  # stop_event was set
+        except asyncio.TimeoutError:
+            pass  # midnight — time to send
+
+        try:
+            await notifier.send_daily_summary(
+                portfolio, pnl_tracker, execution, unwind_mgr,
+            )
+            logging.info("[Discord] Daily summary sent.")
+        except Exception as exc:
+            logging.warning("[Discord] Failed to send daily summary: %s", exc)
 
 
 # ====================================================================
@@ -3008,16 +4491,22 @@ class ExecutionEngine:
         order_logger: Optional[OrderLogger] = None,
         risk_manager: Optional[RiskManager] = None,
         unwind_manager: Optional[UnwindManager] = None,
+        notifier: Optional[DiscordNotifier] = None,
     ):
         self._portfolio = portfolio
         self._trader = trader
         self._order_logger = order_logger or OrderLogger()
         self._risk_manager = risk_manager
         self._unwind_manager = unwind_manager
+        self._notifier = notifier
         self._orders: list[Order] = []
         # Track which event+direction combos we've already traded or
         # are currently in-flight (prevents concurrency races).
         self._traded: set[tuple[str, str]] = set()
+        # Per-event locks to guarantee mutual exclusion for concurrent
+        # WS ticks on the same event (prevents the TOCTOU race between
+        # the `if key in self._traded` check and `self._traded.add(key)`).
+        self._event_locks: dict[tuple[str, str], asyncio.Lock] = {}
 
     async def submit(self, opp: ArbOpportunity) -> Optional[Order]:
         """
@@ -3031,6 +4520,19 @@ class ExecutionEngine:
         removed from self._traded so the bot can retry on the next tick.
         """
         key = (opp.event_name, opp.direction)
+
+        # Acquire per-event lock to prevent TOCTOU race between
+        # the duplicate check and the `self._traded.add(key)` call
+        # when two WS ticks for the same event arrive simultaneously.
+        if key not in self._event_locks:
+            self._event_locks[key] = asyncio.Lock()
+        async with self._event_locks[key]:
+            return await self._submit_inner(opp, key)
+
+    async def _submit_inner(
+        self, opp: ArbOpportunity, key: tuple[str, str],
+    ) -> Optional[Order]:
+        """Inner submit logic, called while holding the per-event lock."""
 
         # ── SILENT PRE-TRADE FILTERS ──
         # These return None without creating an Order, writing CSV,
@@ -3102,12 +4604,12 @@ class ExecutionEngine:
                 order = self._make_order(opp, desired)
                 order.status = OrderStatus.REJECTED
                 order.reject_reason = RejectReason.ORDER_RATE_LIMIT
-                self._finalize(order)
+                await self._finalize(order)
                 return order
 
         # ── Log the opportunity (console + CSV) ──
         _log_opportunity(opp)
-        self._trader.log(opp)
+        await self._trader.log(opp)
 
         # ── CREATE ORDER + EXECUTE ──
         order = self._make_order(opp, desired)
@@ -3139,7 +4641,7 @@ class ExecutionEngine:
                         order.filled_contracts = 0
                         order.total_outlay = ZERO
 
-                    self._finalize(order)
+                    await self._finalize(order)
                     return order
 
                 # Both legs filled — use actual filled quantity
@@ -3158,7 +4660,7 @@ class ExecutionEngine:
                     total_outlay=total_outlay,
                     opened_at=opp.timestamp,
                 )
-                self._portfolio.open_position(pos)
+                await self._portfolio.open_position(pos)
 
                 if self._risk_manager is not None:
                     self._risk_manager.pnl_tracker.record(opp.net_profit, actual)
@@ -3178,7 +4680,7 @@ class ExecutionEngine:
                     total_outlay=total_outlay,
                     opened_at=opp.timestamp,
                 )
-                self._portfolio.open_position(pos)
+                await self._portfolio.open_position(pos)
 
                 if self._risk_manager is not None:
                     self._risk_manager.pnl_tracker.record(opp.net_profit, desired)
@@ -3197,10 +4699,10 @@ class ExecutionEngine:
             order.reject_reason = RejectReason.NONE
             order.filled_contracts = 0
             order.total_outlay = ZERO
-            self._finalize(order)
+            await self._finalize(order)
             return order
 
-        self._finalize(order)
+        await self._finalize(order)
         return order
 
     def _make_order(self, opp: ArbOpportunity, desired: int) -> Order:
@@ -3224,7 +4726,7 @@ class ExecutionEngine:
             poly_depth=opp.poly_depth,
         )
 
-    def _finalize(self, order: Order) -> None:
+    async def _finalize(self, order: Order) -> None:
         """Log the order to CSV and store in memory for inspection.
 
         Orders are always persisted to CSV immediately.  The in-memory
@@ -3232,7 +4734,7 @@ class ExecutionEngine:
         growth during long-running sessions.
         """
         self._orders.append(order)
-        self._order_logger.log(order)
+        await self._order_logger.log(order)
 
         if len(self._orders) > MAX_ORDERS_IN_MEMORY:
             self._orders = self._orders[-MAX_ORDERS_IN_MEMORY:]
@@ -3244,6 +4746,9 @@ class ExecutionEngine:
                 order.event_name, order.direction,
                 order.total_outlay.quantize(Q2),
             )
+            # Phase 4: Discord notification
+            if self._notifier is not None:
+                asyncio.ensure_future(self._notifier.notify_fill(order))
         elif order.status == OrderStatus.UNWOUND:
             logging.warning(
                 "  ORDER %s UNWOUND: [%s] %s — "
@@ -3263,6 +4768,9 @@ class ExecutionEngine:
                 order.desired_contracts,
                 order.kalshi_depth, order.poly_depth,
             )
+            # Phase 4: Discord notification
+            if self._notifier is not None:
+                asyncio.ensure_future(self._notifier.notify_reject(order))
 
     @property
     def orders(self) -> list[Order]:
@@ -3293,13 +4801,22 @@ _events_file_path: str = DEFAULT_EVENTS_FILE
 
 def _print_banner(active_events: list[dict], mode: str = "event-driven") -> None:
     """Print a startup banner with current configuration."""
+    is_live = "LIVE" in mode.upper()
     logging.info("=" * 62)
-    logging.info("  ARBITRAGE PAPER-TRADING BOT  v5.0")
-    logging.info("  NO REAL TRADES WILL BE EXECUTED")
+    if is_live:
+        logging.info("  ARBITRAGE BOT  v5.0 — LIVE TRADING")
+        logging.info("  *** REAL ORDERS WILL BE PLACED ***")
+    else:
+        logging.info("  ARBITRAGE BOT  v5.0 — PAPER TRADING")
+        logging.info("  No real trades will be executed.")
     logging.info("=" * 62)
-    logging.info("  Data mode       : %s", mode)
+    logging.info("  Trading mode    : %s", mode)
     logging.info("  Execution model : event-driven (WS only, stale watchdog)")
-    logging.info("  Order type      : Fill or Kill (FOK)")
+    if is_live:
+        logging.info("  Kalshi orders   : IOC (Immediate-or-Cancel)")
+        logging.info("  Poly orders     : FOK (Fill-or-Kill)")
+    else:
+        logging.info("  Order type      : Fill or Kill (FOK) — simulated")
     logging.info("  Precision       : decimal.Decimal (12 sig digits)")
     logging.info(
         "  Min gross margin: %s%%",
@@ -3405,12 +4922,14 @@ async def _setup_websockets(
         poly_ws.set_fetcher(fetcher)
         await poly_ws.connect()
 
-        # Resolve token IDs for each event, then subscribe
+        # Use explicit token IDs from events.json (no runtime resolution)
         for ev in active_events:
             cond_id = ev["poly_condition_id"]
-            tokens = await fetcher._resolve_poly_tokens(cond_id)
-            if tokens:
-                await poly_ws.subscribe(cond_id, tokens[0], tokens[1], ev["name"])
+            yes_tok = ev["poly_yes_token"]
+            no_tok = ev["poly_no_token"]
+            # Pre-populate the token cache so all downstream code works
+            fetcher._poly_token_cache[cond_id] = (yes_tok, no_tok)
+            await poly_ws.subscribe(cond_id, yes_tok, no_tok, ev["name"])
 
         logging.info("[Poly-WS] Subscribed to %d markets.", len(active_events))
     except Exception as exc:
@@ -3456,7 +4975,7 @@ async def _resolution_checker(
             )
             if not k_active or not p_active:
                 logging.info("[%s] Market resolved — removing.", ev["name"])
-                portfolio.close_positions_for_event(ev["name"])
+                await portfolio.close_positions_for_event(ev["name"])
                 to_remove.append(ev)
 
         for ev in to_remove:
@@ -3478,6 +4997,7 @@ async def _process_updates(
     engine: ArbEngine,
     execution: ExecutionEngine,
     stop_event: asyncio.Event,
+    notifier: Optional[DiscordNotifier] = None,
 ) -> int:
     """Main event-driven processor.
 
@@ -3541,6 +5061,9 @@ async def _process_updates(
 
             if opps:
                 for opp in opps:
+                    # Phase 3: Attach market identifiers for live execution
+                    opp.kalshi_ticker = ticker
+                    opp.poly_condition_id = cond_id
                     total_opps += 1
                     asyncio.create_task(execution.submit(opp))
 
@@ -3549,12 +5072,19 @@ async def _process_updates(
                 "Error processing update for %s: %s", event_name, exc,
                 exc_info=True,
             )
+            # Phase 4: Discord notification for error-level messages
+            if notifier is not None:
+                asyncio.ensure_future(
+                    notifier.notify_error(
+                        f"Error processing update for {event_name}: {exc}"
+                    )
+                )
 
     return total_opps
 
 
 def _parse_args() -> argparse.Namespace:
-    """Parse command-line arguments (Phase 0 — config overrides)."""
+    """Parse command-line arguments."""
     parser = argparse.ArgumentParser(
         description="Prediction Market Arbitrage Bot",
     )
@@ -3579,7 +5109,8 @@ def _parse_args() -> argparse.Namespace:
         choices=["paper", "live"],
         default="paper",
         help="Trading mode (default: %(default)s). "
-             "'live' is not yet implemented — reserved for Phase 3.",
+             "'paper' simulates trades; 'live' places real orders "
+             "on Kalshi (IOC) and Polymarket (FOK).",
     )
     return parser.parse_args()
 
@@ -3594,9 +5125,33 @@ async def main() -> None:
         datefmt="%Y-%m-%d %H:%M:%S",
     )
 
-    if args.mode == "live":
-        logging.error("Live trading is not yet implemented (see scope.md Phase 3).")
-        sys.exit(1)
+    live_mode = (args.mode == "live")
+
+    # ── Validate live-mode prerequisites ──
+    if live_mode:
+        missing: list[str] = []
+        if not KALSHI_API_KEY:
+            missing.append("KALSHI_API_KEY")
+        if not KALSHI_PRIVATE_KEY_PATH:
+            missing.append("KALSHI_PRIVATE_KEY_PATH")
+        if not POLY_API_KEY:
+            missing.append("POLY_API_KEY")
+        if not POLY_API_SECRET:
+            missing.append("POLY_API_SECRET")
+        if not POLY_PASSPHRASE:
+            missing.append("POLY_PASSPHRASE")
+        if not POLY_PRIVATE_KEY_PATH:
+            missing.append("POLY_PRIVATE_KEY_PATH")
+        if missing:
+            logging.error(
+                "Live mode requires these env vars: %s",
+                ", ".join(missing),
+            )
+            sys.exit(1)
+        logging.warning("=" * 62)
+        logging.warning("  *** LIVE TRADING MODE ***")
+        logging.warning("  Real orders WILL be placed on Kalshi and Polymarket.")
+        logging.warning("=" * 62)
 
     # ── Load events from JSON ──
     global _events_file_path
@@ -3633,28 +5188,84 @@ async def main() -> None:
         kill_file=KILL_FILE,
     )
 
-    # ── Unwind module (Phase 2) ──
-    unwind_logger = UnwindLogger(path=UNWIND_LOG_FILE)
-    unwind_manager = UnwindManager(
-        portfolio=portfolio,
-        pnl_tracker=pnl_tracker,
-        timeout=UNWIND_TIMEOUT_SECONDS,
-        logger=unwind_logger,
-    )
-
-    execution = ExecutionEngine(
-        portfolio=portfolio,
-        trader=trader,
-        risk_manager=risk_manager,
-        unwind_manager=unwind_manager,
-    )
+    # ── Discord notifications (Phase 4) ──
+    notifier = DiscordNotifier(webhook_url=DISCORD_WEBHOOK_URL)
+    if notifier._enabled:
+        logging.info("[Phase 4] Discord notifications ENABLED.")
+    else:
+        logging.info("[Phase 4] Discord notifications disabled (no DISCORD_WEBHOOK_URL).")
+    # Wire notifier into circuit-breaker tracker
+    pnl_tracker.set_notifier(notifier)
 
     # ── Connect WebSockets ──
     kalshi_ws, poly_ws = await _setup_websockets(
         active_events, fetcher, update_queue,
     )
 
+    # Phase 4: Attach notifier to WS classes for reconnect alerts
+    if kalshi_ws:
+        kalshi_ws._notifier = notifier
+    if poly_ws:
+        poly_ws._notifier = notifier
+
+    # ── Phase 3: Order clients (live mode only) ──
+    kalshi_client: Optional[KalshiOrderClient] = None
+    poly_client: Optional[PolymarketOrderClient] = None
+
+    if live_mode:
+        kalshi_client = KalshiOrderClient()
+        # Share the token cache between MarketFetcher and PolymarketOrderClient
+        # so token resolution (condition_id → token_ids) is done once.
+        poly_client = PolymarketOrderClient(
+            poly_token_cache=fetcher._poly_token_cache,
+        )
+        # Pre-initialize the Poly client to catch credential errors early
+        try:
+            poly_client._ensure_client()
+        except Exception as exc:
+            logging.error("Failed to initialize Polymarket client: %s", exc)
+            if kalshi_ws:
+                await kalshi_ws.close()
+            if poly_ws:
+                await poly_ws.close()
+            await fetcher.close()
+            await notifier.close()
+            sys.exit(1)
+
+        # Subscribe to Kalshi fill channel for live order tracking
+        if kalshi_ws:
+            await kalshi_ws.subscribe_fills()
+            logging.info("[Phase 3] Kalshi WS fill channel active.")
+
+        logging.info("[Phase 3] Order clients initialized for live trading.")
+
+    # ── Unwind module (Phase 2 + Phase 3 live integration) ──
+    unwind_logger = UnwindLogger(path=UNWIND_LOG_FILE)
+    unwind_manager = UnwindManager(
+        portfolio=portfolio,
+        pnl_tracker=pnl_tracker,
+        timeout=UNWIND_TIMEOUT_SECONDS,
+        logger=unwind_logger,
+        live_mode=live_mode,
+        kalshi_client=kalshi_client,
+        poly_client=poly_client,
+        kalshi_ws=kalshi_ws,
+        poly_ws=poly_ws,
+        fetcher=fetcher,
+    )
+    # Phase 4: Wire notifier into UnwindManager
+    unwind_manager.set_notify_callback(notifier)
+
+    execution = ExecutionEngine(
+        portfolio=portfolio,
+        trader=trader,
+        risk_manager=risk_manager,
+        unwind_manager=unwind_manager,
+        notifier=notifier,
+    )
+
     mode_parts = []
+    trade_mode = "LIVE" if live_mode else "PAPER"
     if kalshi_ws:
         mode_parts.append("Kalshi=WS")
     else:
@@ -3663,9 +5274,16 @@ async def main() -> None:
         mode_parts.append("Poly=WS")
     else:
         mode_parts.append("Poly=NONE")
-    mode_str = ", ".join(mode_parts)
+    mode_str = f"{trade_mode} ({', '.join(mode_parts)})"
 
     _print_banner(active_events, mode=mode_str)
+
+    # Phase 4: Startup notification
+    await notifier.send(
+        title="🟢 Bot Started",
+        description=f"Mode: **{mode_str}** — tracking **{len(active_events)}** events.",
+        color=DiscordNotifier.COLOR_GREEN,
+    )
 
     # ── Dry-run: print config and exit ──
     if args.dry_run:
@@ -3675,6 +5293,11 @@ async def main() -> None:
         if poly_ws:
             await poly_ws.close()
         await fetcher.close()
+        await notifier.close()
+        if kalshi_client:
+            await kalshi_client.close()
+        if poly_client:
+            await poly_client.close()
         sys.exit(0)
 
     # ── SIGTERM / SIGINT signal handlers for graceful shutdown ──
@@ -3704,6 +5327,15 @@ async def main() -> None:
         name="stuck-monitor",
     ))
 
+    # Daily summary task (Phase 4): sends P&L summary at midnight UTC
+    bg_tasks.append(asyncio.create_task(
+        _daily_summary_task(
+            notifier, portfolio, pnl_tracker,
+            execution, unwind_manager, stop_event,
+        ),
+        name="daily-summary",
+    ))
+
     # Give websockets a moment to receive initial snapshots
     if kalshi_ws or poly_ws:
         logging.info("Waiting 3s for initial WS snapshots…")
@@ -3716,6 +5348,7 @@ async def main() -> None:
             update_queue, active_events, name_to_event,
             kalshi_ws, poly_ws,
             engine, execution, stop_event,
+            notifier=notifier,
         )
     finally:
         logging.info("")
@@ -3735,6 +5368,11 @@ async def main() -> None:
         if poly_ws:
             await poly_ws.close()
         await fetcher.close()
+        await notifier.close()
+        if kalshi_client:
+            await kalshi_client.close()
+        if poly_client:
+            await poly_client.close()
 
         # Print summary
         logging.info("")
@@ -3757,6 +5395,21 @@ async def main() -> None:
             unwind_manager.unwound_count,
             unwind_manager.active_count,
         )
+        if live_mode:
+            logging.info("  Trading mode     : LIVE")
+        else:
+            logging.info("  Trading mode     : PAPER")
+
+        # Phase 4: Shutdown notification
+        await notifier.send(
+            title="🔴 Bot Stopped",
+            description=(
+                f"Detected **{total_opps}** opportunities.\n"
+                f"Daily P&L: **${pnl_tracker.daily_pnl.quantize(Q4)}**"
+            ),
+            color=DiscordNotifier.COLOR_RED,
+        )
+        await notifier.close()
 
     sys.exit(0)
 

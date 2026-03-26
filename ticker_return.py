@@ -243,28 +243,59 @@ def main():
     print("  Verifying outcomes via CLOB...")
     tokens = verify_clob_outcomes(condition_id)
 
+    yes_token_id = ""
+    no_token_id = ""
+
     if tokens and len(tokens) >= 2:
-        print("  Token outcomes:")
+        print("  Token outcomes from CLOB API:")
         for i, t in enumerate(tokens):
-            print(f"    [{i}] {t.get('outcome', '?')}")
+            outcome = t.get("outcome", "?")
+            tid = t.get("token_id", "?")
+            print(f"    [{i}] outcome={outcome}  token_id={tid}")
     else:
         print("  WARNING: Could not verify token outcomes via CLOB.")
-        print("  Double-check alignment manually.")
+        print("  You must provide token IDs manually.")
 
     # ── Outcome alignment ───────────────────────────────────────────
     print()
     print("  " + "-" * 58)
-    print("  OUTCOME ALIGNMENT")
+    print("  OUTCOME ALIGNMENT + TOKEN ID ASSIGNMENT")
     print("  " + "-" * 58)
     print()
-    print("  The Kalshi ticker's 'Yes' must match Polymarket's")
-    print("  outcome[0] (first token) for the arb logic to work.")
-    print("  If they don't match, arb_bot will be inverted")
-    print("  (guaranteed LOSS instead of profit).")
+    print("  The Kalshi ticker's 'Yes' must match the Polymarket")
+    print("  token you designate as YES.  arb_bot uses explicit")
+    print("  poly_yes_token / poly_no_token from events.json —")
+    print("  NO runtime API resolution (prevents inverted trades).")
     print()
 
+    if tokens and len(tokens) >= 2:
+        print("  Which CLOB token corresponds to YES (matches Kalshi 'Yes')?")
+        print()
+        for i, t in enumerate(tokens):
+            outcome = t.get("outcome", "?")
+            tid = t.get("token_id", "?")
+            print(f"    {i + 1}. outcome={outcome}  token_id={tid[:24]}…")
+        print()
+        choice = prompt_choice(
+            f"  YES token [1-{len(tokens)}]: ", len(tokens),
+        )
+        yes_idx = choice - 1
+        no_idx = 1 - yes_idx  # the other one
+        yes_token_id = tokens[yes_idx].get("token_id", "")
+        no_token_id = tokens[no_idx].get("token_id", "")
+        print(f"  → YES token: {yes_token_id}")
+        print(f"  → NO  token: {no_token_id}")
+    else:
+        yes_token_id = input("  Enter YES token_id manually: ").strip()
+        no_token_id = input("  Enter NO  token_id manually: ").strip()
+
+    if not yes_token_id or not no_token_id:
+        print("  ERROR: Both poly_yes_token and poly_no_token are required.")
+        sys.exit(1)
+
     if len(k_markets) > 1:
-        print("  Which Kalshi ticker has Yes = Polymarket outcome[0]?")
+        print()
+        print("  Which Kalshi ticker has Yes = the token you just chose?")
         print()
         for i, m in enumerate(k_markets, 1):
             ticker = m.get("ticker", "?")
@@ -295,13 +326,15 @@ def main():
     # ── Output ──────────────────────────────────────────────────────
     print()
     print("  " + "=" * 58)
-    print("  Add this to the EVENTS list in arb_bot.py:")
+    print("  Add this to events.json:")
     print("  " + "=" * 58)
     print()
     print("    {")
     print(f'        "name": "{name}",')
     print(f'        "kalshi_ticker": "{selected_ticker}",')
-    print(f'        "poly_condition_id": "{condition_id}"')
+    print(f'        "poly_condition_id": "{condition_id}",')
+    print(f'        "poly_yes_token": "{yes_token_id}",')
+    print(f'        "poly_no_token": "{no_token_id}"')
     print("    }")
     print()
 
