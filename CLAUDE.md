@@ -21,13 +21,13 @@ python ticker_return.py [kalshi_url] [poly_url]   # interactive helper: generate
 python -c "import arb_bot"              # syntax/import check
 ```
 
-There are no tests yet (Phase 7 in scope.md is unchecked). When adding them, the plan is `tests/` with `pytest` + `pytest-asyncio`.
+There are no tests yet (Phase 5 in scope.md is unchecked). When adding them, the plan is `tests/` with `pytest` + `pytest-asyncio`.
 
 Config comes from `.env` (loaded via python-dotenv) with defaults in arb_bot.py lines ~110–216; CLI flags override at runtime. Credentials: `KALSHI_API_KEY` + `KALSHI_PRIVATE_KEY_PATH` (RSA PEM) for paper mode; live mode additionally requires `POLY_API_KEY`, `POLY_API_SECRET`, `POLY_PASSPHRASE`, `POLY_PRIVATE_KEY_PATH` (hex Ethereum key). Never commit `.env`, `keys/`, or `data/`.
 
 ## Architecture
 
-Everything lives in a single file, `arb_bot.py` (~5,100 lines, ~21 classes). README.md documents each component in depth — consult it before changing behavior. `scope.md` is the phase roadmap (Phases 0–4 done; 5 auto-discovery, 6 deployment, 7 testing remain).
+Everything lives in a single file, `arb_bot.py` (~5,100 lines, ~21 classes). README.md documents each component in depth — consult it before changing behavior. `scope.md` is the phase roadmap (Phases 0–4 done; remaining, in execution order: 5 testing, 6 deployment, 7 economics gate, 8 auto-discovery — renumbered 2026-07-09).
 
 Data flow (event-driven, no polling):
 
