@@ -470,6 +470,8 @@ All data files are created in `data/` with headers on first run.
 | `data/orders.csv` | `OrderLogger` | Full order lifecycle. Columns: order_id, timestamp, status (FILLED/REJECTED/UNWOUND/CANCELLED), event, direction, desired/filled contracts, prices, fees, profits, outlay, reject_reason, depth. |
 | `data/portfolio.csv` | `PaperPortfolio` | Position opens, closes, and unwinds. Columns: action (OPEN/CLOSE/UNWIND), timestamp, event, direction, contracts, cost/fees/outlay, payout, P&L, capital_remaining. |
 | `data/unwinds.csv` | `UnwindLogger` | Unwind order lifecycle. Columns: unwind_id, timestamp, event, direction, status, contracts, net_profit, leg1/leg2/unwind leg details (platform, side, price, status, filled), error_message. |
+| `data/observations.csv` | `ObservationLogger` | **Every spread evaluation**, both directions, no margin filter, independent of execution/dedup (throttled: 1s while gross > 0, 60s baseline). The input for the Phase 7 economics analysis. |
+| `data/ws_capture/*.jsonl.gz` | `WSRecorder` | Raw WS messages (`{"ts": …, "raw": "…"}` per line), one file per platform per UTC day, crash-safe multi-member gzip. Enables replay/backtest. |
 
 In-memory order/unwind lists are capped at `MAX_ORDERS_IN_MEMORY` (default 1000) to prevent unbounded growth. CSV persistence is immediate and uncapped.
 

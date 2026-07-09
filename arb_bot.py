@@ -70,6 +70,7 @@ import base64
 import csv
 import decimal
 import enum
+import gzip
 import json
 import logging
 import logging.handlers
@@ -244,6 +245,33 @@ BALANCE_CHECK_INTERVAL: int = int(os.environ.get("BALANCE_CHECK_INTERVAL", "300"
 # Logging: "text" (default) or "json"; LOG_FILE enables 10MB x 5 rotation.
 LOG_FORMAT: str = os.environ.get("LOG_FORMAT", "text")
 LOG_FILE: str = os.environ.get("LOG_FILE", "")
+
+# ---- Instrumentation (Phase 7 data capture) ----
+# Observation ledger: EVERY spread evaluation (both directions, no margin
+# filter, independent of execution/dedup) — this is what the economics
+# gate analyzes.  trade_ledger.csv only records executed trades and is
+# heavily biased by the dedup key and silent filters.
+# Set OBSERVATIONS_FILE="" to disable.
+OBSERVATIONS_FILE: str = os.environ.get(
+    "OBSERVATIONS_FILE", os.path.join(DATA_DIR, "observations.csv"),
+)
+# Positive-gross spreads sample at the hot interval (persistence analysis
+# needs fine resolution); everything else samples at the baseline interval.
+OBS_HOT_INTERVAL_SECONDS: float = float(
+    os.environ.get("OBS_HOT_INTERVAL_SECONDS", "1.0"),
+)
+OBS_BASELINE_INTERVAL_SECONDS: float = float(
+    os.environ.get("OBS_BASELINE_INTERVAL_SECONDS", "60"),
+)
+# Raw WS capture: gzip JSONL, one file per platform per UTC day.  Data
+# recorded now can answer questions formulated later; data not recorded
+# is gone.  Set WS_CAPTURE_DIR="" to disable.
+WS_CAPTURE_DIR: str = os.environ.get(
+    "WS_CAPTURE_DIR", os.path.join(DATA_DIR, "ws_capture"),
+)
+WS_CAPTURE_FLUSH_SECONDS: float = float(
+    os.environ.get("WS_CAPTURE_FLUSH_SECONDS", "5"),
+)
 
 # ====================================================================
 # EVENT LOADING — reads from events.json (or --events-file path)
@@ -1780,6 +1808,8 @@ class PolymarketWS:
         # MarketFetcher reference — used to pull a fresh REST snapshot
         # after every reconnect so we never trade on stale delta-only data.
         self._fetcher: Optional["MarketFetcher"] = None
+        # Raw-message capture for replay/backtest (Phase 7)
+        self._recorder: Optional["WSRecorder"] = None
 
     def set_update_queue(self, queue: asyncio.Queue) -> None:
         """Attach the shared update queue for event-driven processing."""
@@ -1788,6 +1818,10 @@ class PolymarketWS:
     def set_fetcher(self, fetcher: "MarketFetcher") -> None:
         """Attach MarketFetcher for post-reconnect REST snapshots."""
         self._fetcher = fetcher
+
+    def set_recorder(self, recorder: "WSRecorder") -> None:
+        """Attach a WSRecorder to capture raw messages (Phase 7)."""
+        self._recorder = recorder
 
     async def connect(self) -> None:
         """Open the websocket connection.
@@ -1941,6 +1975,8 @@ class PolymarketWS:
         try:
             async for msg in self._ws:
                 if msg.type == aiohttp.WSMsgType.TEXT:
+                    if self._recorder is not None:
+                        self._recorder.record("polymarket", msg.data)
                     if msg.data == "PONG":
                         continue
                     try:
@@ -2153,6 +2189,8 @@ class KalshiWS:
         self.last_update_time: float = 0.0
         # MarketFetcher reference — used for post-reconnect REST snapshots
         self._fetcher: Optional["MarketFetcher"] = None
+        # Raw-message capture for replay/backtest (Phase 7)
+        self._recorder: Optional["WSRecorder"] = None
         # Phase 3 — Fill tracking for live order execution
         # Maps order_id -> asyncio.Future that resolves with fill data
         self._fill_waiters: dict[str, asyncio.Future] = {}
@@ -2168,6 +2206,10 @@ class KalshiWS:
     def set_fetcher(self, fetcher: "MarketFetcher") -> None:
         """Attach MarketFetcher for post-reconnect REST snapshots."""
         self._fetcher = fetcher
+
+    def set_recorder(self, recorder: "WSRecorder") -> None:
+        """Attach a WSRecorder to capture raw messages (Phase 7)."""
+        self._recorder = recorder
 
     def _load_private_key(self):
         """Load RSA private key for Kalshi auth."""
@@ -2362,6 +2404,8 @@ class KalshiWS:
         try:
             async for msg in self._ws:
                 if msg.type == aiohttp.WSMsgType.TEXT:
+                    if self._recorder is not None:
+                        self._recorder.record("kalshi", msg.data)
                     try:
                         data = json.loads(msg.data)
                     except json.JSONDecodeError:
@@ -2702,6 +2746,45 @@ class ArbEngine:
         fillable = min(k_depth, p_depth)
         return fillable, k_depth, p_depth
 
+    def observe(
+        self,
+        event_name: str,
+        kalshi: MarketSnapshot,
+        poly: MarketSnapshot,
+        fetch_latency_ms: int = 0,
+    ) -> list[ArbOpportunity]:
+        """Evaluate both directions WITHOUT the margin filter.
+
+        Phase 7 instrumentation: the observation ledger needs the full
+        spread distribution (including negative gross), not just
+        qualifying arbs.  check() is exactly observe() + margin filter,
+        so detection and observation can never drift apart.
+        """
+        now = _utc_iso()
+        observations: list[ArbOpportunity] = []
+
+        # Direction A: Buy YES @ Kalshi  +  Buy NO @ Polymarket
+        if kalshi.yes.best_ask is not None and poly.no.best_ask is not None:
+            observations.append(self._evaluate(
+                now, event_name,
+                "Buy YES@Kalshi + Buy NO@Polymarket",
+                kalshi.yes.best_ask, poly.no.best_ask,
+                kalshi.yes.ask_levels, poly.no.ask_levels,
+                fetch_latency_ms,
+            ))
+
+        # Direction B: Buy NO @ Kalshi  +  Buy YES @ Polymarket
+        if kalshi.no.best_ask is not None and poly.yes.best_ask is not None:
+            observations.append(self._evaluate(
+                now, event_name,
+                "Buy NO@Kalshi + Buy YES@Polymarket",
+                kalshi.no.best_ask, poly.yes.best_ask,
+                kalshi.no.ask_levels, poly.yes.ask_levels,
+                fetch_latency_ms,
+            ))
+
+        return observations
+
     def check(
         self,
         event_name: str,
@@ -2709,35 +2792,12 @@ class ArbEngine:
         poly: MarketSnapshot,
         fetch_latency_ms: int = 0,
     ) -> list[ArbOpportunity]:
-        """Return a list of ArbOpportunity for every qualifying spread."""
-        now = _utc_iso()
-        opportunities: list[ArbOpportunity] = []
-
-        # Direction A: Buy YES @ Kalshi  +  Buy NO @ Polymarket
-        if kalshi.yes.best_ask is not None and poly.no.best_ask is not None:
-            opp = self._evaluate(
-                now, event_name,
-                "Buy YES@Kalshi + Buy NO@Polymarket",
-                kalshi.yes.best_ask, poly.no.best_ask,
-                kalshi.yes.ask_levels, poly.no.ask_levels,
-                fetch_latency_ms,
-            )
-            if opp is not None:
-                opportunities.append(opp)
-
-        # Direction B: Buy NO @ Kalshi  +  Buy YES @ Polymarket
-        if kalshi.no.best_ask is not None and poly.yes.best_ask is not None:
-            opp = self._evaluate(
-                now, event_name,
-                "Buy NO@Kalshi + Buy YES@Polymarket",
-                kalshi.no.best_ask, poly.yes.best_ask,
-                kalshi.no.ask_levels, poly.yes.ask_levels,
-                fetch_latency_ms,
-            )
-            if opp is not None:
-                opportunities.append(opp)
-
-        return opportunities
+        """Return an ArbOpportunity for every qualifying spread."""
+        return [
+            opp
+            for opp in self.observe(event_name, kalshi, poly, fetch_latency_ms)
+            if opp.gross_profit >= self.min_margin
+        ]
 
     def _evaluate(
         self,
@@ -2749,13 +2809,10 @@ class ArbEngine:
         k_ask_levels: list[OrderbookLevel],
         p_ask_levels: list[OrderbookLevel],
         fetch_ms: int,
-    ) -> Optional[ArbOpportunity]:
-        """Evaluate one direction, applying fees and depth. Return opp or None."""
+    ) -> ArbOpportunity:
+        """Evaluate one direction, applying fees and depth."""
         cost = (k_price + p_price).quantize(Q4)
         gross_profit = (ONE - cost).quantize(Q4)
-
-        if gross_profit < self.min_margin:
-            return None
 
         k_fee = kalshi_taker_fee(k_price, 1)
         p_fee = poly_taker_fee(p_price, 1)
@@ -2850,6 +2907,186 @@ class PaperTrader:
         """Synchronous CSV write (called via to_thread)."""
         with open(self.path, mode="a", newline="") as fh:
             csv.DictWriter(fh, fieldnames=self.COLUMNS).writerow(row)
+
+
+# ====================================================================
+# ObservationLogger — spread observations for the economics gate (Phase 7)
+# ====================================================================
+
+class ObservationLogger:
+    """Throttled CSV of every spread evaluation, both directions.
+
+    Unlike trade_ledger.csv (executed trades only, suppressed by dedup
+    and silent filters), this captures the full spread distribution the
+    Phase 7 go/no-go needs: opportunity frequency, edge size, and
+    persistence.
+
+    Two-tier throttle per (event, direction):
+      - gross > 0:  every OBS_HOT_INTERVAL_SECONDS (persistence analysis
+        needs fine resolution exactly when a spread is live)
+      - otherwise:  every OBS_BASELINE_INTERVAL_SECONDS (cheap sampling
+        of where the market normally sits)
+
+    Writes are synchronous on a line-buffered handle — with the throttle
+    this is a few small writes per second at most, far cheaper than
+    thread-pool hops.
+    """
+
+    COLUMNS = [
+        "timestamp", "event_name", "direction",
+        "kalshi_ask", "poly_ask", "total_cost",
+        "gross_profit", "net_profit",
+        "kalshi_depth", "poly_depth", "max_contracts",
+    ]
+
+    def __init__(
+        self,
+        path: str = OBSERVATIONS_FILE,
+        hot_interval: float = OBS_HOT_INTERVAL_SECONDS,
+        baseline_interval: float = OBS_BASELINE_INTERVAL_SECONDS,
+    ) -> None:
+        self.path = path
+        self._hot = hot_interval
+        self._baseline = baseline_interval
+        self._last: dict[tuple[str, str], float] = {}
+        self.rows_written = 0
+
+        dir_path = os.path.dirname(path)
+        if dir_path:
+            os.makedirs(dir_path, exist_ok=True)
+        is_new = not os.path.exists(path)
+        self._fh = open(path, mode="a", newline="", buffering=1)
+        self._writer = csv.DictWriter(self._fh, fieldnames=self.COLUMNS)
+        if is_new:
+            self._writer.writeheader()
+            logging.info("Created observation ledger → %s", path)
+
+    def maybe_log(self, observations: list[ArbOpportunity]) -> int:
+        """Log throttle-eligible observations.  Returns rows written."""
+        now = time.monotonic()
+        ts = datetime.now(timezone.utc).isoformat(timespec="milliseconds")
+        wrote = 0
+        for obs in observations:
+            key = (obs.event_name, obs.direction)
+            interval = self._hot if obs.gross_profit > ZERO else self._baseline
+            last = self._last.get(key)
+            if last is not None and (now - last) < interval:
+                continue
+            self._last[key] = now
+            self._writer.writerow({
+                "timestamp": ts,
+                "event_name": obs.event_name,
+                "direction": obs.direction,
+                "kalshi_ask": f"{obs.kalshi_price.quantize(Q4)}",
+                "poly_ask": f"{obs.poly_price.quantize(Q4)}",
+                "total_cost": f"{obs.total_cost.quantize(Q4)}",
+                "gross_profit": f"{obs.gross_profit.quantize(Q4)}",
+                "net_profit": f"{obs.net_profit.quantize(Q4)}",
+                "kalshi_depth": obs.kalshi_depth,
+                "poly_depth": obs.poly_depth,
+                "max_contracts": obs.max_contracts,
+            })
+            wrote += 1
+        self.rows_written += wrote
+        return wrote
+
+    def close(self) -> None:
+        try:
+            self._fh.close()
+        except Exception:
+            pass
+
+
+# ====================================================================
+# WSRecorder — raw websocket capture for replay/backtest (Phase 7)
+# ====================================================================
+
+class WSRecorder:
+    """Append raw WS messages to gzip JSONL, one file per platform per
+    UTC day (data/ws_capture/{platform}-{YYYYMMDD}.jsonl.gz).
+
+    Each line: {"ts": <epoch float>, "raw": "<message text verbatim>"}.
+
+    CRASH SAFETY: lines are buffered and each flush is written as a
+    complete, independent gzip member to a raw append-mode file.  The
+    file is therefore ALWAYS valid multi-member gzip — a hard kill
+    (SIGKILL, OOM) loses at most the unflushed buffer
+    (WS_CAPTURE_FLUSH_SECONDS worth), never the readability of the
+    file.  (A single long-lived GzipFile stream would lack its
+    end-of-stream marker after a crash and break strict readers for the
+    whole day.)  Restarts simply append further members.
+
+    Runs synchronously on the WS listener path — appending to a list is
+    nanoseconds; compression happens once per flush interval.  Any write
+    failure disables the recorder for the rest of the run (capture must
+    never take down trading).
+    """
+
+    def __init__(
+        self,
+        directory: str = WS_CAPTURE_DIR,
+        flush_interval: float = WS_CAPTURE_FLUSH_SECONDS,
+    ) -> None:
+        self.directory = directory
+        self._flush_interval = flush_interval
+        # platform -> (day_key, raw binary file handle)
+        self._files: dict[str, tuple[str, object]] = {}
+        self._buffers: dict[str, list[bytes]] = {}
+        self._last_flush: dict[str, float] = {}
+        self.counts: dict[str, int] = {}
+        self._failed = False
+        os.makedirs(directory, exist_ok=True)
+
+    def record(self, platform: str, raw: str) -> None:
+        if self._failed:
+            return
+        try:
+            now = time.time()
+            day = time.strftime("%Y%m%d", time.gmtime(now))
+            entry = self._files.get(platform)
+            if entry is None or entry[0] != day:
+                if entry is not None:
+                    self._flush(platform)
+                    entry[1].close()
+                path = os.path.join(
+                    self.directory, f"{platform}-{day}.jsonl.gz",
+                )
+                self._files[platform] = (day, open(path, "ab"))
+                self._last_flush[platform] = now
+                logging.info("[Recorder] Capturing %s WS → %s", platform, path)
+
+            line = json.dumps({"ts": now, "raw": raw}) + "\n"
+            self._buffers.setdefault(platform, []).append(
+                line.encode("utf-8"),
+            )
+            self.counts[platform] = self.counts.get(platform, 0) + 1
+            if now - self._last_flush.get(platform, 0.0) >= self._flush_interval:
+                self._flush(platform)
+        except Exception as exc:
+            self._failed = True
+            logging.error(
+                "[Recorder] Disabled after write failure: %s", exc,
+            )
+
+    def _flush(self, platform: str) -> None:
+        """Write the buffer as one complete gzip member."""
+        buffer = self._buffers.get(platform)
+        if not buffer:
+            return
+        fh = self._files[platform][1]
+        fh.write(gzip.compress(b"".join(buffer)))
+        fh.flush()
+        self._buffers[platform] = []
+        self._last_flush[platform] = time.time()
+
+    def close(self) -> None:
+        for platform, (_, fh) in list(self._files.items()):
+            try:
+                self._flush(platform)
+                fh.close()
+            except Exception:
+                pass
+        self._files.clear()
 
 
 # ====================================================================
@@ -5258,6 +5495,8 @@ class HealthServer:
         unwind_manager: "UnwindManager",
         execution: "ExecutionEngine",
         active_events: list[dict],
+        obs_logger: Optional["ObservationLogger"] = None,
+        recorder: Optional["WSRecorder"] = None,
     ) -> None:
         self._host = host
         self.port = port  # updated to the bound port after start()
@@ -5270,6 +5509,8 @@ class HealthServer:
         self._unwind_manager = unwind_manager
         self._execution = execution
         self._active_events = active_events
+        self._obs_logger = obs_logger
+        self._recorder = recorder
         self._started = time.time()
         self._runner = None
 
@@ -5316,6 +5557,12 @@ class HealthServer:
             "orders_rejected": self._execution.rejected_count,
             "last_order_at": self._execution.last_order_ts or None,
         }
+        # Phase 7 instrumentation counters — lets a remote operator
+        # confirm data collection is actually happening
+        if self._obs_logger is not None:
+            body["observations_logged"] = self._obs_logger.rows_written
+        if self._recorder is not None:
+            body["ws_capture_messages"] = dict(self._recorder.counts)
         return body, healthy
 
     async def start(self) -> None:
@@ -6084,6 +6331,12 @@ def _print_banner(active_events: list[dict], mode: str = "event-driven") -> None
     logging.info("  Ledger file     : %s", LEDGER_FILE)
     logging.info("  Order file      : %s", ORDER_FILE)
     logging.info("  Portfolio file  : %s", PORTFOLIO_FILE)
+    logging.info(
+        "  Observations    : %s", OBSERVATIONS_FILE or "(disabled)",
+    )
+    logging.info(
+        "  WS capture      : %s", WS_CAPTURE_DIR or "(disabled)",
+    )
     logging.info("  Events file     : %s", _events_file_path)
     logging.info("  Events tracked  : %d", len(active_events))
     for ev in active_events:
@@ -6121,6 +6374,7 @@ async def _setup_websockets(
     active_events: list[dict],
     fetcher: MarketFetcher,
     update_queue: asyncio.Queue,
+    recorder: Optional[WSRecorder] = None,
 ) -> tuple[Optional[KalshiWS], Optional[PolymarketWS]]:
     """Connect websockets, subscribe to all active events, and attach
     the shared update queue.
@@ -6138,6 +6392,8 @@ async def _setup_websockets(
             kalshi_ws = KalshiWS()
             kalshi_ws.set_update_queue(update_queue)
             kalshi_ws.set_fetcher(fetcher)
+            if recorder is not None:
+                kalshi_ws.set_recorder(recorder)
             await kalshi_ws.connect()
             for ev in active_events:
                 await kalshi_ws.subscribe(ev["kalshi_ticker"], ev["name"])
@@ -6159,6 +6415,8 @@ async def _setup_websockets(
         poly_ws = PolymarketWS()
         poly_ws.set_update_queue(update_queue)
         poly_ws.set_fetcher(fetcher)
+        if recorder is not None:
+            poly_ws.set_recorder(recorder)
         await poly_ws.connect()
 
         # Use explicit token IDs from events.json (no runtime resolution)
@@ -6244,6 +6502,7 @@ async def _process_updates(
     execution: ExecutionEngine,
     stop_event: asyncio.Event,
     notifier: Optional[DiscordNotifier] = None,
+    obs_logger: Optional[ObservationLogger] = None,
 ) -> int:
     """Main event-driven processor.
 
@@ -6283,6 +6542,7 @@ async def _process_updates(
             total_opps += _check_event(
                 event_name, active_events, name_to_event,
                 kalshi_ws, poly_ws, engine, execution, notifier,
+                obs_logger,
             )
 
     return total_opps
@@ -6297,6 +6557,7 @@ def _check_event(
     engine: ArbEngine,
     execution: ExecutionEngine,
     notifier: Optional[DiscordNotifier],
+    obs_logger: Optional[ObservationLogger] = None,
 ) -> int:
     """Run one arb check for a single event (snapshot → detect → submit).
 
@@ -6340,8 +6601,17 @@ def _check_event(
             fetch_ms,
         )
 
-        # ── Check for arbitrage ──
-        opps = engine.check(event_name, kalshi_snap, poly_snap, fetch_ms)
+        # ── Evaluate both directions once; observe everything,
+        #    execute only what clears the margin (Phase 7) ──
+        observations = engine.observe(
+            event_name, kalshi_snap, poly_snap, fetch_ms,
+        )
+        if obs_logger is not None:
+            obs_logger.maybe_log(observations)
+        opps = [
+            o for o in observations
+            if o.gross_profit >= engine.min_margin
+        ]
 
         for opp in opps:
             # Phase 3: Attach market identifiers for live execution
@@ -6450,6 +6720,14 @@ async def main() -> None:
     engine = ArbEngine(min_margin=MIN_PROFIT_MARGIN)
     trader = PaperTrader(path=LEDGER_FILE)
 
+    # ── Phase 7 instrumentation: observation ledger + raw WS capture ──
+    obs_logger: Optional[ObservationLogger] = (
+        ObservationLogger(path=OBSERVATIONS_FILE) if OBSERVATIONS_FILE else None
+    )
+    recorder: Optional[WSRecorder] = (
+        WSRecorder(directory=WS_CAPTURE_DIR) if WS_CAPTURE_DIR else None
+    )
+
     # ── State store (Phase 6): capital, positions, and orphaned
     #    exposure survive restarts; also hosts the run lock ──
     state_store = StateStore(STATE_DB_FILE)
@@ -6485,7 +6763,7 @@ async def main() -> None:
 
     # ── Connect WebSockets ──
     kalshi_ws, poly_ws = await _setup_websockets(
-        active_events, fetcher, update_queue,
+        active_events, fetcher, update_queue, recorder=recorder,
     )
 
     # Phase 4: Attach notifier to WS classes for reconnect alerts
@@ -6587,6 +6865,10 @@ async def main() -> None:
             await kalshi_client.close()
         if poly_client:
             await poly_client.close()
+        if obs_logger:
+            obs_logger.close()
+        if recorder:
+            recorder.close()
         state_store.close()
         sys.exit(0)
 
@@ -6677,6 +6959,7 @@ async def main() -> None:
             portfolio=portfolio, pnl_tracker=pnl_tracker,
             unwind_manager=unwind_manager, execution=execution,
             active_events=active_events,
+            obs_logger=obs_logger, recorder=recorder,
         )
         try:
             await health_server.start()
@@ -6701,6 +6984,7 @@ async def main() -> None:
             kalshi_ws, poly_ws,
             engine, execution, stop_event,
             notifier=notifier,
+            obs_logger=obs_logger,
         )
     finally:
         logging.info("")
@@ -6778,6 +7062,12 @@ async def main() -> None:
             color=DiscordNotifier.COLOR_RED,
         )
         await notifier.close()
+
+        # Flush instrumentation
+        if obs_logger is not None:
+            obs_logger.close()
+        if recorder is not None:
+            recorder.close()
 
         # Release the run lock and close the state store last — state
         # writes above (drain, unwinds) must land first.

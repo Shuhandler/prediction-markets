@@ -199,11 +199,25 @@ _The roadmap previously never asked whether the edge exists.  Fees alone are
 must clear that at executable depth, against competitors without a 3-second
 sports matching delay._
 
-- [ ] Analysis tooling over `data/trade_ledger.csv` from the 24/7 paper
-      deployment: opportunity frequency, size-weighted net edge at fillable
-      depth, persistence/half-life, breakdown by market/category/time-of-day
-- [ ] WS record/replay harness: record raw WS messages to disk; replay through
-      the pipeline for regression tests, performance benchmarks, and backtests
+- [x] **Observation ledger** (instrumentation sprint, 2026-07-09):
+      `data/observations.csv` records EVERY spread evaluation (both
+      directions, no margin filter, independent of execution/dedup) with a
+      two-tier throttle (1s when gross > 0, 60s baseline).
+      `trade_ledger.csv` was unusable for this — it only logs executed
+      trades and the dedup key suppresses recurrences.  `ArbEngine.check()`
+      is now literally `observe()` + margin filter so detection and
+      observation cannot drift
+- [x] **WS recording half** of the record/replay harness (instrumentation
+      sprint): raw messages to `data/ws_capture/{platform}-{day}.jsonl.gz`.
+      Crash-safe by construction — each flush is a complete gzip member, so
+      a SIGKILL'd process leaves a strictly-readable file (verified live
+      with a hard kill against the real Polymarket feed)
+- [ ] Replay half: feed captured files back through the pipeline for
+      regression tests, performance benchmarks, and backtests
+- [ ] Analysis tooling over `data/observations.csv` (+ trade_ledger for
+      executed fills): opportunity frequency, size-weighted net edge at
+      fillable depth, persistence/half-life, breakdown by
+      market/category/time-of-day
 - [ ] Fill-quality comparison once small live trades run: realized vs paper
       (slippage, partial-fill rate, unwind frequency)
 - [ ] Define go/no-go criteria (e.g. expected monthly net > infra + capital

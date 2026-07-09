@@ -92,6 +92,26 @@ rm data/KILL      # resume
   addition to stdout. Docker's own json-file driver also applies; cap it
   with `logging: options: max-size` if disk is tight.
 
+## Instrumentation (Phase 7 data capture)
+
+Both are **on by default** — the collection run is the point of deploying:
+
+- `data/observations.csv` — every spread evaluation, both directions, no
+  margin filter. Throttled: 1 row/s per event+direction while a positive
+  spread is live (`OBS_HOT_INTERVAL_SECONDS`), one baseline sample per
+  60s otherwise (`OBS_BASELINE_INTERVAL_SECONDS`). This file — not
+  `trade_ledger.csv` — is what the economics analysis reads. Expect a few
+  MB/day per handful of events. Disable with `OBSERVATIONS_FILE=""`.
+- `data/ws_capture/{platform}-{YYYYMMDD}.jsonl.gz` — raw WS messages for
+  later replay/backtest. Each line is `{"ts": epoch, "raw": "<verbatim>"}`.
+  Files are always-valid multi-member gzip: a crash loses at most
+  `WS_CAPTURE_FLUSH_SECONDS` (5s) of buffer, never the file. Expect
+  ~10–100 MB/day per platform during active games; prune or sync old days
+  off-box. Disable with `WS_CAPTURE_DIR=""`.
+
+Confirm collection is live via the health endpoint:
+`observations_logged` and `ws_capture_messages` should be climbing.
+
 ## Backups
 
 `data/` is the only stateful directory. Nightly cron on the host:
