@@ -16,6 +16,7 @@ python arb_bot.py --dry-run             # validate config, print banner, exit â€
 python arb_bot.py --mode live           # live trading (real orders; validates all credentials at startup)
 python arb_bot.py --events-file X.json --log-level DEBUG
 
+python discover.py --date today [--league mlb] [--json]   # list today's games + exchange search strings (ESPN schedule, no exchange calls)
 python ticker_return.py [kalshi_url] [poly_url]   # interactive helper: generate events.json entries
 
 pytest tests/ -q                        # full test suite (~121 tests, <10s, no network)
