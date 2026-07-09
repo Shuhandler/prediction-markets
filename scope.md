@@ -87,38 +87,48 @@ _Critical for live trading — builds on Phase 1 risk management._
 
 ## Phase 5 — Testing  _(was Phase 7 — moved ahead of discovery/deployment)_
 
-_Do first — protects everything that follows._
+_Do first — protects everything that follows._  **✅ Completed 2026-07-09 —
+87 tests, all green (`pytest tests/ -v`)._
 
-- [ ] Add `tests/` directory with `pytest` + `pytest-asyncio`
-- [ ] **Unit tests (critical)**:
+- [x] Add `tests/` directory with `pytest` + `pytest-asyncio`
+- [x] **Unit tests (critical)**:
   - `ArbEngine.check()` / `_evaluate()` — core arb detection logic
+    (`test_arb_engine.py`)
   - Fee computation (`kalshi_taker_fee`, `poly_taker_fee`) — order-level
     rounding, both Poly regimes (quadratic sports / linear crypto)
+    (`test_fees.py`)
   - `ExecutionEngine.submit()` — all silent-reject paths, size-down-to-depth,
     capital reservation, precise exposure check, fill path
-  - `_LocalOrderbook` snapshot/delta application
-- [ ] **Regression tests for the 2026-07 fix batch** (port the existing smoke
-      script into pytest): fill-waiter race (fill arrives before register),
-      orphan-registry retry, `yes_price`/`no_price` side selection, iterative
-      reconnect, spread re-verification after Leg 1
-- [ ] **Failure-injection tests (highest value)** — mock exchange clients that
-      simulate: POST timeout → `client_order_id` reconciliation, delayed FOK →
-      cancel-on-exhaustion, 429s, partial unwind sells, unwind-sell failure →
-      orphan registration.  The unwind paths only run when things go wrong;
-      they must be exercised somewhere other than production
-- [ ] **Clock-controlled tests** (freezegun or injected clock):
-      `DailyPnLTracker` midnight reset, pre-midnight summary timing,
-      stuck-position aging
-- [ ] **Property-based tests** (`hypothesis`): fee/rounding invariants;
+    (`test_execution.py`)
+  - `_LocalOrderbook` snapshot/delta application (`test_orderbook.py`)
+- [x] **Regression tests for the 2026-07 fix batch**: fill-waiter race (fill
+      arrives before register), orphan-registry retry, `yes_price`/`no_price`
+      side selection, iterative reconnect, spread re-verification after
+      Leg 1, `/book` transient-vs-404 back-off (`test_regressions.py`)
+- [x] **Failure-injection tests** — mock exchange clients simulating: POST
+      timeout → `client_order_id` reconciliation, delayed FOK →
+      cancel-on-exhaustion, 429/5xx/timeout retry behavior, partial IOC and
+      unwind fills, smart-FOK floor sizing (`test_failure_injection.py`,
+      mocks in `tests/mocks.py`)
+- [x] **Clock-controlled tests** (injected clock, no freezegun dependency):
+      `DailyPnLTracker` midnight reset, pre-midnight summary slot
+      (extracted `_seconds_until_daily_summary()` for testability),
+      stuck-position aging (`test_clock.py`, `test_unwind.py`)
+- [x] **Property-based tests** (`hypothesis`): fee/rounding invariants;
       random delta stream applied to a book == rebuild from final snapshot
-- [ ] **Paper/live parity guard**: assert the pipelines diverge only inside
-      `_submit_leg()` / `_submit_unwind()` so paper→live promotion stays valid
-- [ ] **Integration tests**:
-  - End-to-end: mock WS update → queue → arb detection → order fill
+      (`test_fees.py`, `test_orderbook.py`)
+- [x] **Paper/live parity guard**: AST scan pins live-mode branching to the
+      documented seams + behavioral test that a perfect mock exchange yields
+      identical order economics to paper (`test_parity.py`)
+- [x] **Integration tests**:
+  - End-to-end: WS message → local books → queue → arb detection → paper
+    fill → CSV audit rows (`test_integration.py`)
   - REST fetcher with mocked `aiohttp` responses
-  - Unwind manager with simulated partial fills
-- [ ] Add `pytest`, `pytest-asyncio` (and `hypothesis`) as dev dependencies
-- [ ] CI: GitHub Actions workflow running tests on push
+  - Unwind manager with simulated partial fills (paper and live-mocked)
+- [x] Add `pytest`, `pytest-asyncio`, `hypothesis` as dev dependencies
+      (`requirements-dev.txt`)
+- [x] CI: GitHub Actions workflow running tests on push
+      (`.github/workflows/tests.yml`, py3.10 + py3.12 matrix)
 
 ---
 

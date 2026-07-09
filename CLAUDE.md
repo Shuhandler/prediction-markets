@@ -9,7 +9,7 @@ A cross-platform arbitrage bot for binary prediction markets (Kalshi + Polymarke
 ## Commands
 
 ```bash
-pip install -r requirements.txt
+pip install -r requirements-dev.txt     # runtime + test dependencies
 
 python arb_bot.py                       # paper trading (default)
 python arb_bot.py --dry-run             # validate config, print banner, exit — quickest sanity check
@@ -18,10 +18,14 @@ python arb_bot.py --events-file X.json --log-level DEBUG
 
 python ticker_return.py [kalshi_url] [poly_url]   # interactive helper: generate events.json entries
 
+pytest tests/ -q                        # full test suite (~90 tests, <10s, no network)
+pytest tests/test_execution.py -v       # one module
+pytest tests/ -k "orphan"               # tests matching a keyword
+
 python -c "import arb_bot"              # syntax/import check
 ```
 
-There are no tests yet (Phase 5 in scope.md is unchecked). When adding them, the plan is `tests/` with `pytest` + `pytest-asyncio`.
+Tests are offline (mock exchange clients in `tests/mocks.py`; shared fixtures/factories in `tests/conftest.py` — `build_stack()` wires the whole pipeline with CSVs under tmp_path). Config constants are pinned by a session fixture so results don't depend on the local `.env`; constructor defaults bind at import time, so always pass config explicitly in tests. `tests/test_parity.py` enforces that live/paper branching stays confined to `UnwindManager` — extending live-only behavior elsewhere will fail CI by design; update `ALLOWED_LIVE_REFS` only with a deliberate decision.
 
 Config comes from `.env` (loaded via python-dotenv) with defaults in arb_bot.py lines ~110–216; CLI flags override at runtime. Credentials: `KALSHI_API_KEY` + `KALSHI_PRIVATE_KEY_PATH` (RSA PEM) for paper mode; live mode additionally requires `POLY_API_KEY`, `POLY_API_SECRET`, `POLY_PASSPHRASE`, `POLY_PRIVATE_KEY_PATH` (hex Ethereum key). Never commit `.env`, `keys/`, or `data/`.
 

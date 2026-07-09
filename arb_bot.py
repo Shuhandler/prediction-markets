@@ -4684,6 +4684,23 @@ class DiscordNotifier:
         )
 
 
+def _seconds_until_daily_summary(now: datetime) -> float:
+    """Seconds from *now* until the next summary slot (23:59:55 UTC).
+
+    The summary must fire BEFORE midnight — DailyPnLTracker resets on the
+    first access after the UTC day changes.  Always returns a value in
+    (0, 86400].
+    """
+    next_midnight = (now + timedelta(days=1)).replace(
+        hour=0, minute=0, second=0, microsecond=0,
+    )
+    fire_at = next_midnight - timedelta(seconds=5)
+    if fire_at <= now:
+        # Within the final 5s of the day — target the following day
+        fire_at += timedelta(days=1)
+    return (fire_at - now).total_seconds()
+
+
 async def _daily_summary_task(
     notifier: DiscordNotifier,
     portfolio: "PaperPortfolio",
@@ -4699,16 +4716,9 @@ async def _daily_summary_task(
     after midnight would always report $0.00.
     """
     while not stop_event.is_set():
-        # Fire 5 seconds before the next midnight UTC
-        now = datetime.now(timezone.utc)
-        next_midnight = (now + timedelta(days=1)).replace(
-            hour=0, minute=0, second=0, microsecond=0,
+        wait_seconds = _seconds_until_daily_summary(
+            datetime.now(timezone.utc),
         )
-        fire_at = next_midnight - timedelta(seconds=5)
-        if fire_at <= now:
-            # Within the final 5s of the day — target the following day
-            fire_at += timedelta(days=1)
-        wait_seconds = (fire_at - now).total_seconds()
 
         try:
             await asyncio.wait_for(stop_event.wait(), timeout=wait_seconds)
