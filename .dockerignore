@@ -1,0 +1,17 @@
+.git
+.github
+.gitignore
+.dockerignore
+.env
+.DS_Store
+__pycache__
+.pytest_cache
+.hypothesis
+data/
+keys/
+tests/
+deploy/
+*.md
+events.json
+docker-compose.yml
+Dockerfile

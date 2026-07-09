@@ -72,9 +72,13 @@ import decimal
 import enum
 import json
 import logging
+import logging.handlers
 import os
 import signal
+import socket
+import sqlite3
 import sys
+import threading
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -215,6 +219,32 @@ DEFAULT_EVENTS_FILE: str = os.environ.get("EVENTS_FILE", "events.json")
 DISCORD_WEBHOOK_URL: str = os.environ.get("DISCORD_WEBHOOK_URL", "")
 DISCORD_MAX_POSTS_PER_SEC: float = float(os.environ.get("DISCORD_MAX_POSTS_PER_SEC", "5"))
 
+# ---- Deployment / operations (Phase 6) ----
+# SQLite state of record: open positions, capital, orphaned exposure, and
+# the single-instance run lock.  CSVs remain the append-only audit trail.
+STATE_DB_FILE: str = os.environ.get(
+    "STATE_DB_FILE", os.path.join(DATA_DIR, "state.db"),
+)
+# Health endpoint (GET /health).  Set HEALTH_PORT=0 to disable.
+HEALTH_HOST: str = os.environ.get("HEALTH_HOST", "127.0.0.1")
+HEALTH_PORT: int = int(os.environ.get("HEALTH_PORT", "8080"))
+# Seconds to wait for in-flight two-leg executions to finish at shutdown
+# BEFORE closing the order clients.  Container stop grace periods must
+# exceed this (docker-compose sets 45s).
+DRAIN_TIMEOUT_SECONDS: int = int(os.environ.get("DRAIN_TIMEOUT_SECONDS", "20"))
+# Run lock: another instance's heartbeat younger than this blocks startup.
+RUN_LOCK_STALE_SECONDS: int = int(os.environ.get("RUN_LOCK_STALE_SECONDS", "90"))
+RUN_LOCK_HEARTBEAT_SECONDS: int = int(
+    os.environ.get("RUN_LOCK_HEARTBEAT_SECONDS", "15"),
+)
+# Live mode: alert when either platform's available balance drops below
+# this (profits pool on one side until rebalanced manually).
+MIN_PLATFORM_BALANCE: Decimal = D(os.environ.get("MIN_PLATFORM_BALANCE", "50.00"))
+BALANCE_CHECK_INTERVAL: int = int(os.environ.get("BALANCE_CHECK_INTERVAL", "300"))
+# Logging: "text" (default) or "json"; LOG_FILE enables 10MB x 5 rotation.
+LOG_FORMAT: str = os.environ.get("LOG_FORMAT", "text")
+LOG_FILE: str = os.environ.get("LOG_FILE", "")
+
 # ====================================================================
 # EVENT LOADING — reads from events.json (or --events-file path)
 # ====================================================================
@@ -308,6 +338,48 @@ def _utc_iso() -> str:
 def _ceil_penny(amount: Decimal) -> Decimal:
     """Round up to the next cent (ceiling)."""
     return amount.quantize(Q2, rounding=ROUND_CEILING)
+
+
+# ====================================================================
+# LOGGING SETUP (Phase 6) — text or structured JSON, optional rotation
+# ====================================================================
+
+class _JsonLogFormatter(logging.Formatter):
+    """One JSON object per line — machine-parseable for log shipping."""
+
+    def format(self, record: logging.LogRecord) -> str:
+        payload = {
+            "ts": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
+            "level": record.levelname,
+            "logger": record.name,
+            "msg": record.getMessage(),
+        }
+        if record.exc_info:
+            payload["exc"] = self.formatException(record.exc_info)
+        return json.dumps(payload, default=str)
+
+
+def _setup_logging(level: str) -> None:
+    """Configure root logging from LOG_FORMAT / LOG_FILE env config."""
+    handlers: list[logging.Handler] = [logging.StreamHandler()]
+    if LOG_FILE:
+        handlers.append(logging.handlers.RotatingFileHandler(
+            LOG_FILE, maxBytes=10_000_000, backupCount=5, encoding="utf-8",
+        ))
+
+    if LOG_FORMAT.lower() == "json":
+        formatter: logging.Formatter = _JsonLogFormatter()
+    else:
+        formatter = logging.Formatter(
+            "%(asctime)s | %(levelname)-7s | %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S",
+        )
+    for handler in handlers:
+        handler.setFormatter(formatter)
+
+    root = logging.getLogger()
+    root.setLevel(getattr(logging, level))
+    root.handlers = handlers
 
 
 # ====================================================================
@@ -1251,6 +1323,56 @@ class KalshiOrderClient:
             logging.error("[Kalshi-Order] get_orders failed: %s", exc)
             return []
 
+    async def get_positions(self) -> dict:
+        """GET /portfolio/positions — used for startup reconciliation.
+
+        Returns the raw response dict ({"market_positions": [...], ...})
+        or {"error": True} on failure.
+        """
+        await self._ensure_session()
+        await self._limiter.acquire()
+
+        path = "/trade-api/v2/portfolio/positions"
+        headers = self._sign_request("GET", path)
+        url = f"{self._base}{path}"
+
+        timeout = aiohttp.ClientTimeout(total=REQUEST_TIMEOUT)
+        try:
+            async with self._session.get(
+                url, headers=headers, timeout=timeout,
+            ) as resp:
+                data = await resp.json(content_type=None)
+                if resp.status >= 400:
+                    return {"error": True, "status_code": resp.status,
+                            "detail": data}
+                return data
+        except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+            logging.error("[Kalshi-Order] get_positions failed: %s", exc)
+            return {"error": True, "detail": str(exc)}
+
+    async def get_balance(self) -> Optional[Decimal]:
+        """GET /portfolio/balance — available balance in dollars, or None."""
+        await self._ensure_session()
+        await self._limiter.acquire()
+
+        path = "/trade-api/v2/portfolio/balance"
+        headers = self._sign_request("GET", path)
+        url = f"{self._base}{path}"
+
+        timeout = aiohttp.ClientTimeout(total=REQUEST_TIMEOUT)
+        try:
+            async with self._session.get(
+                url, headers=headers, timeout=timeout,
+            ) as resp:
+                data = await resp.json(content_type=None)
+                if resp.status >= 400:
+                    return None
+                # Kalshi reports balance in integer cents
+                return (D(str(data.get("balance", 0))) / HUNDRED).quantize(Q2)
+        except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+            logging.warning("[Kalshi-Order] get_balance failed: %s", exc)
+            return None
+
     async def cancel_order(self, order_id: str) -> dict:
         """Cancel an order."""
         await self._ensure_session()
@@ -1458,6 +1580,74 @@ class PolymarketOrderClient:
         except Exception as exc:
             logging.error("[Poly-Order] cancel_order failed: %s", exc)
             return {"error": True, "detail": str(exc)}
+
+    async def _get_collateral_info(self) -> Optional[dict]:
+        """Fetch USDC balance/allowance via py_clob_client (best effort).
+
+        Response shapes vary across py_clob_client versions, so callers
+        must treat this as advisory — never gate trading on it.
+        """
+        self._ensure_client()
+        try:
+            from py_clob_client.clob_types import (
+                AssetType,
+                BalanceAllowanceParams,
+            )
+            params = BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
+            async with self._order_lock:
+                result = await asyncio.to_thread(
+                    self._client.get_balance_allowance, params,
+                )
+            return result if isinstance(result, dict) else None
+        except Exception as exc:
+            logging.warning(
+                "[Poly-Order] Balance/allowance check unavailable: %s", exc,
+            )
+            return None
+
+    async def get_collateral_balance(self) -> Optional[Decimal]:
+        """USDC balance in dollars, or None if the check is unavailable.
+
+        The CLOB reports collateral in micro-USDC (6 decimals).
+        """
+        info = await self._get_collateral_info()
+        if info is None or info.get("balance") is None:
+            return None
+        try:
+            return (D(str(info["balance"])) / D(10**6)).quantize(Q2)
+        except (decimal.InvalidOperation, TypeError):
+            logging.warning(
+                "[Poly-Order] Unparseable balance response: %r", info,
+            )
+            return None
+
+    async def verify_allowances(self) -> None:
+        """Warn loudly at startup if the exchange allowance looks unset.
+
+        An unset USDC allowance makes the FIRST live order fail with an
+        opaque on-chain error — and the unwind path fails the same way.
+        Advisory only (never blocks startup): the check depends on
+        py_clob_client internals that can't be verified offline.
+        """
+        info = await self._get_collateral_info()
+        if info is None:
+            logging.warning(
+                "[Poly-Order] Could not verify ERC-20 allowances — "
+                "confirm manually before trading live.",
+            )
+            return
+        allowance = info.get("allowance") or info.get("allowances")
+        if allowance in (None, "", "0", 0):
+            logging.error(
+                "[Poly-Order] *** USDC allowance appears UNSET (%r) — live "
+                "orders will fail on-chain.  Approve the exchange contract "
+                "before trading. ***",
+                allowance,
+            )
+        else:
+            logging.info(
+                "[Poly-Order] Collateral allowance present: %r", allowance,
+            )
 
     async def close(self) -> None:
         """No persistent connections to close for py_clob_client."""
@@ -2679,6 +2869,246 @@ class Position:
 
 
 # ====================================================================
+# StateStore — SQLite state of record (Phase 6)
+# ====================================================================
+
+class StateStore:
+    """SQLite-backed state of record: open positions, capital, orphaned
+    exposure, and the single-instance run lock.
+
+    This is what makes a restart safe — without it the portfolio was
+    in-memory and every restart reset capital and forgot open positions.
+    CSVs remain the append-only audit trail; this store holds *state*.
+
+    Decimals are stored as TEXT to preserve exactness.  The connection is
+    created with check_same_thread=False and every operation is guarded
+    by a threading.Lock, so calls may run via asyncio.to_thread.  WAL
+    mode keeps writes atomic and readers unblocked.
+    """
+
+    def __init__(self, path: str = STATE_DB_FILE) -> None:
+        self.path = path
+        dir_path = os.path.dirname(path)
+        if dir_path:
+            os.makedirs(dir_path, exist_ok=True)
+        self._lock = threading.Lock()
+        self._conn = sqlite3.connect(path, check_same_thread=False)
+        self._conn.execute("PRAGMA journal_mode=WAL")
+        self._conn.execute("PRAGMA synchronous=NORMAL")
+        self._create_tables()
+
+    def _create_tables(self) -> None:
+        with self._lock, self._conn:
+            self._conn.executescript("""
+                CREATE TABLE IF NOT EXISTS meta (
+                    id INTEGER PRIMARY KEY CHECK (id = 1),
+                    starting_capital TEXT NOT NULL,
+                    capital TEXT NOT NULL,
+                    realized_pnl TEXT NOT NULL,
+                    unwind_losses TEXT NOT NULL,
+                    closed_count INTEGER NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS positions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    event_name TEXT NOT NULL,
+                    direction TEXT NOT NULL,
+                    contracts INTEGER NOT NULL,
+                    cost_per_contract TEXT NOT NULL,
+                    fees_per_contract TEXT NOT NULL,
+                    total_outlay TEXT NOT NULL,
+                    opened_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS orphans (
+                    unwind_id TEXT PRIMARY KEY,
+                    event_name TEXT NOT NULL,
+                    direction TEXT NOT NULL,
+                    platform TEXT NOT NULL,
+                    side TEXT NOT NULL,
+                    market_id TEXT NOT NULL,
+                    buy_price TEXT NOT NULL,
+                    contracts INTEGER NOT NULL,
+                    attempts INTEGER NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS run_lock (
+                    id INTEGER PRIMARY KEY CHECK (id = 1),
+                    instance TEXT NOT NULL,
+                    pid INTEGER NOT NULL,
+                    heartbeat REAL NOT NULL
+                );
+            """)
+
+    # ── Portfolio meta + positions ─────────────────────────────────
+
+    def load_meta(self) -> Optional[dict]:
+        """Return persisted portfolio state, or None on first run."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT starting_capital, capital, realized_pnl, "
+                "unwind_losses, closed_count FROM meta WHERE id = 1",
+            ).fetchone()
+        if row is None:
+            return None
+        return {
+            "starting_capital": D(row[0]),
+            "capital": D(row[1]),
+            "realized_pnl": D(row[2]),
+            "unwind_losses": D(row[3]),
+            "closed_count": int(row[4]),
+        }
+
+    def init_meta(self, starting_capital: Decimal) -> None:
+        with self._lock, self._conn:
+            self._conn.execute(
+                "INSERT OR REPLACE INTO meta VALUES (1, ?, ?, ?, ?, ?)",
+                (str(starting_capital), str(starting_capital), "0", "0", 0),
+            )
+
+    def _update_meta(self, portfolio: "PaperPortfolio") -> None:
+        # caller holds self._lock inside a transaction
+        self._conn.execute(
+            "UPDATE meta SET capital = ?, realized_pnl = ?, "
+            "unwind_losses = ?, closed_count = ? WHERE id = 1",
+            (
+                str(portfolio.capital),
+                str(portfolio.total_realized_pnl),
+                str(portfolio.total_unwind_losses),
+                portfolio.closed_count,
+            ),
+        )
+
+    def persist_open(self, pos: "Position", portfolio: "PaperPortfolio") -> None:
+        """Atomically record a new position and the updated capital."""
+        with self._lock, self._conn:
+            self._conn.execute(
+                "INSERT INTO positions (event_name, direction, contracts, "
+                "cost_per_contract, fees_per_contract, total_outlay, "
+                "opened_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    pos.event_name, pos.direction, pos.contracts,
+                    str(pos.cost_per_contract), str(pos.fees_per_contract),
+                    str(pos.total_outlay), pos.opened_at,
+                ),
+            )
+            self._update_meta(portfolio)
+
+    def persist_close(self, event_name: str, portfolio: "PaperPortfolio") -> None:
+        """Atomically remove an event's positions and update capital/P&L."""
+        with self._lock, self._conn:
+            self._conn.execute(
+                "DELETE FROM positions WHERE event_name = ?", (event_name,),
+            )
+            self._update_meta(portfolio)
+
+    def persist_meta(self, portfolio: "PaperPortfolio") -> None:
+        """Persist capital/P&L only (e.g. after an unwind loss)."""
+        with self._lock, self._conn:
+            self._update_meta(portfolio)
+
+    def load_positions(self) -> list["Position"]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT event_name, direction, contracts, cost_per_contract, "
+                "fees_per_contract, total_outlay, opened_at FROM positions "
+                "ORDER BY id",
+            ).fetchall()
+        return [
+            Position(
+                event_name=r[0], direction=r[1], contracts=int(r[2]),
+                cost_per_contract=D(r[3]), fees_per_contract=D(r[4]),
+                total_outlay=D(r[5]), opened_at=r[6],
+            )
+            for r in rows
+        ]
+
+    # ── Orphaned unwind exposure ───────────────────────────────────
+
+    def save_orphan(self, unwind_id: str, info: dict) -> None:
+        with self._lock, self._conn:
+            self._conn.execute(
+                "INSERT OR REPLACE INTO orphans VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    unwind_id, info["event_name"], info["direction"],
+                    info["platform"], info["side"], info["market_id"],
+                    str(info["buy_price"]), info["contracts"],
+                    info["attempts"],
+                ),
+            )
+
+    def update_orphan(self, unwind_id: str, contracts: int, attempts: int) -> None:
+        with self._lock, self._conn:
+            self._conn.execute(
+                "UPDATE orphans SET contracts = ?, attempts = ? "
+                "WHERE unwind_id = ?",
+                (contracts, attempts, unwind_id),
+            )
+
+    def delete_orphan(self, unwind_id: str) -> None:
+        with self._lock, self._conn:
+            self._conn.execute(
+                "DELETE FROM orphans WHERE unwind_id = ?", (unwind_id,),
+            )
+
+    def load_orphans(self) -> dict[str, dict]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT unwind_id, event_name, direction, platform, side, "
+                "market_id, buy_price, contracts, attempts FROM orphans",
+            ).fetchall()
+        return {
+            r[0]: {
+                "event_name": r[1], "direction": r[2], "platform": r[3],
+                "side": r[4], "market_id": r[5], "buy_price": D(r[6]),
+                "contracts": int(r[7]), "attempts": int(r[8]),
+            }
+            for r in rows
+        }
+
+    # ── Single-instance run lock ───────────────────────────────────
+
+    def try_acquire_run_lock(self, instance: str, stale_after: float) -> bool:
+        """Claim the run lock unless another live instance holds it.
+
+        A holder is 'live' if its heartbeat is younger than stale_after —
+        a crashed instance's lock expires on its own, so `restart:
+        unless-stopped` recovers without manual cleanup.
+        """
+        now = time.time()
+        with self._lock, self._conn:
+            row = self._conn.execute(
+                "SELECT instance, heartbeat FROM run_lock WHERE id = 1",
+            ).fetchone()
+            if (
+                row is not None
+                and row[0] != instance
+                and (now - float(row[1])) < stale_after
+            ):
+                return False
+            self._conn.execute(
+                "INSERT OR REPLACE INTO run_lock VALUES (1, ?, ?, ?)",
+                (instance, os.getpid(), now),
+            )
+            return True
+
+    def heartbeat_run_lock(self, instance: str) -> None:
+        with self._lock, self._conn:
+            self._conn.execute(
+                "UPDATE run_lock SET heartbeat = ? WHERE id = 1 AND instance = ?",
+                (time.time(), instance),
+            )
+
+    def release_run_lock(self, instance: str) -> None:
+        with self._lock, self._conn:
+            self._conn.execute(
+                "DELETE FROM run_lock WHERE id = 1 AND instance = ?",
+                (instance,),
+            )
+
+    def close(self) -> None:
+        with self._lock:
+            self._conn.close()
+
+
+# ====================================================================
 # PaperPortfolio — simulated capital & position management
 # ====================================================================
 
@@ -2707,6 +3137,7 @@ class PaperPortfolio:
         starting_capital: Decimal = STARTING_CAPITAL,
         position_size: Decimal = POSITION_SIZE,
         path: str = PORTFOLIO_FILE,
+        state_store: Optional[StateStore] = None,
     ):
         self.starting_capital = starting_capital
         self.capital = starting_capital
@@ -2716,7 +3147,31 @@ class PaperPortfolio:
         self.total_realized_pnl: Decimal = ZERO
         self.total_unwind_losses: Decimal = ZERO
         self.closed_count: int = 0
+        self._store = state_store
         self._ensure_file()
+        self._restore_state()
+
+    def _restore_state(self) -> None:
+        """Load persisted portfolio state so restarts don't reset capital
+        or forget open positions (Phase 6)."""
+        if self._store is None:
+            return
+        restored = self._store.load_meta()
+        if restored is None:
+            self._store.init_meta(self.starting_capital)
+            return
+        self.starting_capital = restored["starting_capital"]
+        self.capital = restored["capital"]
+        self.total_realized_pnl = restored["realized_pnl"]
+        self.total_unwind_losses = restored["unwind_losses"]
+        self.closed_count = restored["closed_count"]
+        self.open_positions = self._store.load_positions()
+        logging.info(
+            "[State] Restored portfolio: capital $%s, %d open position(s), "
+            "realized P&L $%s",
+            self.capital.quantize(Q2), len(self.open_positions),
+            self.total_realized_pnl.quantize(Q4),
+        )
 
     def _ensure_file(self) -> None:
         dir_path = os.path.dirname(self.path)
@@ -2740,6 +3195,9 @@ class PaperPortfolio:
         """Add a position and deduct capital.  Called by ExecutionEngine."""
         self.capital -= pos.total_outlay
         self.open_positions.append(pos)
+
+        if self._store is not None:
+            await asyncio.to_thread(self._store.persist_open, pos, self)
 
         await self._write_row_async({
             "action": "OPEN",
@@ -2802,6 +3260,8 @@ class PaperPortfolio:
                 still_open.append(pos)
 
         self.open_positions = still_open
+        if self._store is not None:
+            await asyncio.to_thread(self._store.persist_close, event_name, self)
 
     async def record_unwind_loss(
         self,
@@ -2824,6 +3284,9 @@ class PaperPortfolio:
         """
         self.capital -= loss_amount
         self.total_unwind_losses += loss_amount
+
+        if self._store is not None:
+            await asyncio.to_thread(self._store.persist_meta, self)
 
         await self._write_row_async({
             "action": "UNWIND",
@@ -3234,6 +3697,7 @@ class UnwindManager:
         kalshi_ws: Optional["KalshiWS"] = None,
         poly_ws: Optional["PolymarketWS"] = None,
         fetcher: Optional["MarketFetcher"] = None,
+        state_store: Optional[StateStore] = None,
     ) -> None:
         self._portfolio = portfolio
         self._pnl_tracker = pnl_tracker
@@ -3247,6 +3711,9 @@ class UnwindManager:
         # filled.  StuckPositionMonitor retries these every cycle until
         # the exposure is flat.  unwind_id -> details dict.
         self._orphans: dict[str, dict] = {}
+        # Optional SQLite persistence so orphaned exposure survives a
+        # restart (Phase 6) — call restore_orphans() at startup.
+        self._state_store = state_store
         # Notification callback for Discord (Phase 4 stub)
         self._notify_callback: Optional[object] = None
         # Phase 3: Live execution infrastructure
@@ -3577,6 +4044,13 @@ class UnwindManager:
             "contracts": contracts,
             "attempts": 0,
         }
+        if self._state_store is not None:
+            try:
+                self._state_store.save_orphan(
+                    uw.unwind_id, self._orphans[uw.unwind_id],
+                )
+            except Exception as exc:
+                logging.error("[State] Failed to persist orphan: %s", exc)
         logging.error(
             "  [Unwind %s] ORPHANED EXPOSURE: %d contracts %s/%s on %s — "
             "will retry every monitor cycle.",
@@ -3610,13 +4084,33 @@ class UnwindManager:
                 )
             if ok or sold >= info["contracts"]:
                 self._orphans.pop(oid, None)
+                if self._state_store is not None:
+                    self._state_store.delete_orphan(oid)
                 logging.warning(
                     "[Unwind] Orphaned exposure %s flattened after "
                     "%d attempt(s).",
                     oid, info["attempts"],
                 )
-            elif sold > 0:
-                info["contracts"] -= sold
+            else:
+                if sold > 0:
+                    info["contracts"] -= sold
+                if self._state_store is not None:
+                    self._state_store.update_orphan(
+                        oid, info["contracts"], info["attempts"],
+                    )
+
+    def restore_orphans(self) -> None:
+        """Reload persisted orphaned exposure after a restart (Phase 6)."""
+        if self._state_store is None:
+            return
+        restored = self._state_store.load_orphans()
+        if restored:
+            self._orphans.update(restored)
+            logging.warning(
+                "[Unwind] Restored %d orphaned exposure(s) from state db — "
+                "retries resume via StuckPositionMonitor.",
+                len(restored),
+            )
 
     @property
     def orphan_count(self) -> int:
@@ -4736,6 +5230,286 @@ async def _daily_summary_task(
 
 
 # ====================================================================
+# HealthServer — localhost health/status endpoint (Phase 6)
+# ====================================================================
+
+class HealthServer:
+    """Minimal HTTP endpoint (GET /health) for container healthchecks
+    and remote status checks.
+
+    Returns 200 when both configured websockets are connected and fresh
+    (or still inside the startup grace window), 503 otherwise — Docker
+    healthchecks key off the status code.  The JSON body carries the
+    operational state an operator actually asks about: WS staleness,
+    queue depth, capital, daily P&L, circuit breaker, orphan count.
+    """
+
+    def __init__(
+        self,
+        host: str,
+        port: int,
+        *,
+        mode: str,
+        update_queue: asyncio.Queue,
+        kalshi_ws: Optional["KalshiWS"],
+        poly_ws: Optional["PolymarketWS"],
+        portfolio: "PaperPortfolio",
+        pnl_tracker: "DailyPnLTracker",
+        unwind_manager: "UnwindManager",
+        execution: "ExecutionEngine",
+        active_events: list[dict],
+    ) -> None:
+        self._host = host
+        self.port = port  # updated to the bound port after start()
+        self._mode = mode
+        self._queue = update_queue
+        self._kalshi_ws = kalshi_ws
+        self._poly_ws = poly_ws
+        self._portfolio = portfolio
+        self._pnl_tracker = pnl_tracker
+        self._unwind_manager = unwind_manager
+        self._execution = execution
+        self._active_events = active_events
+        self._started = time.time()
+        self._runner = None
+
+    def _ws_state(self, ws) -> dict:
+        if ws is None:
+            return {"configured": False}
+        last = ws.last_update_time
+        return {
+            "configured": True,
+            "connected": bool(ws._connected),
+            "seconds_since_update": (
+                round(time.time() - last, 1) if last else None
+            ),
+        }
+
+    def _is_fresh(self, state: dict) -> bool:
+        if not state["configured"]:
+            return True
+        grace = (time.time() - self._started) < STALE_TIMEOUT_SECONDS * 2
+        if state["seconds_since_update"] is None:
+            return grace  # never received data: only OK during startup
+        return (
+            state["connected"]
+            and state["seconds_since_update"] < STALE_TIMEOUT_SECONDS * 2
+        )
+
+    def payload(self) -> tuple[dict, bool]:
+        kalshi = self._ws_state(self._kalshi_ws)
+        poly = self._ws_state(self._poly_ws)
+        healthy = self._is_fresh(kalshi) and self._is_fresh(poly)
+        body = {
+            "status": "ok" if healthy else "degraded",
+            "mode": self._mode,
+            "uptime_seconds": round(time.time() - self._started, 1),
+            "events_active": len(self._active_events),
+            "ws": {"kalshi": kalshi, "polymarket": poly},
+            "queue_depth": self._queue.qsize(),
+            "capital": str(self._portfolio.capital.quantize(Q2)),
+            "open_positions": len(self._portfolio.open_positions),
+            "daily_pnl": str(self._pnl_tracker.daily_pnl.quantize(Q4)),
+            "circuit_breaker_tripped": self._pnl_tracker.is_breached,
+            "orphaned_unwinds": self._unwind_manager.orphan_count,
+            "orders_filled": self._execution.filled_count,
+            "orders_rejected": self._execution.rejected_count,
+            "last_order_at": self._execution.last_order_ts or None,
+        }
+        return body, healthy
+
+    async def start(self) -> None:
+        from aiohttp import web
+
+        async def handler(request):
+            body, healthy = self.payload()
+            return web.json_response(
+                body,
+                status=200 if healthy else 503,
+                dumps=lambda obj: json.dumps(obj, default=str),
+            )
+
+        app = web.Application()
+        app.router.add_get("/health", handler)
+        app.router.add_get("/", handler)
+        self._runner = web.AppRunner(app)
+        await self._runner.setup()
+        site = web.TCPSite(self._runner, self._host, self.port)
+        await site.start()
+        # Resolve the actual port (supports port=0 in tests)
+        self.port = site._server.sockets[0].getsockname()[1]
+        logging.info(
+            "[Health] Endpoint listening on http://%s:%d/health",
+            self._host, self.port,
+        )
+
+    async def stop(self) -> None:
+        if self._runner is not None:
+            await self._runner.cleanup()
+            self._runner = None
+
+
+# ====================================================================
+# Operational background helpers (Phase 6)
+# ====================================================================
+
+async def _acquire_run_lock(store: StateStore, instance: str) -> bool:
+    """Claim the single-instance run lock, waiting out a stale holder.
+
+    A crashed predecessor's heartbeat expires after
+    RUN_LOCK_STALE_SECONDS, so `restart: unless-stopped` recovers
+    unattended; a *live* holder means a genuine second instance and we
+    must not trade.
+    """
+    deadline = time.time() + RUN_LOCK_STALE_SECONDS + 30
+    while time.time() < deadline:
+        acquired = await asyncio.to_thread(
+            store.try_acquire_run_lock, instance, RUN_LOCK_STALE_SECONDS,
+        )
+        if acquired:
+            logging.info("[Lock] Run lock acquired (%s).", instance)
+            return True
+        logging.warning(
+            "[Lock] Another instance holds the run lock — retrying in 5s…",
+        )
+        await asyncio.sleep(5)
+    return False
+
+
+async def _run_lock_heartbeat(
+    store: StateStore, instance: str, stop_event: asyncio.Event,
+) -> None:
+    """Keep the run-lock heartbeat fresh until shutdown."""
+    while not stop_event.is_set():
+        try:
+            await asyncio.wait_for(
+                stop_event.wait(), timeout=RUN_LOCK_HEARTBEAT_SECONDS,
+            )
+            return
+        except asyncio.TimeoutError:
+            pass
+        try:
+            await asyncio.to_thread(store.heartbeat_run_lock, instance)
+        except Exception as exc:
+            logging.warning("[Lock] Heartbeat failed: %s", exc)
+
+
+async def _reconcile_startup_positions(
+    kalshi_client: "KalshiOrderClient",
+    portfolio: "PaperPortfolio",
+    name_to_event: dict[str, dict],
+    notifier: Optional["DiscordNotifier"] = None,
+) -> None:
+    """Compare persisted positions against the Kalshi account at boot.
+
+    Catches positions orphaned by a crash mid-trade and state drift
+    across restarts.  Alert-only — never auto-trades on a mismatch.
+    Every arb position has a Kalshi leg, so reconciling the Kalshi side
+    detects any pair-level drift; the Polymarket side has no equivalent
+    authenticated position query in the current client and is verified
+    indirectly.
+    """
+    data = await kalshi_client.get_positions()
+    if data.get("error"):
+        logging.warning(
+            "[Reconcile] Could not fetch Kalshi positions: %s — "
+            "skipping startup reconciliation.",
+            data.get("detail"),
+        )
+        return
+
+    exchange: dict[str, int] = {}
+    for mp in data.get("market_positions", []) or []:
+        ticker = str(mp.get("ticker", ""))
+        qty = abs(int(mp.get("position", 0) or 0))
+        if ticker and qty:
+            exchange[ticker] = qty
+
+    persisted: dict[str, int] = {}
+    for pos in portfolio.open_positions:
+        event_cfg = name_to_event.get(pos.event_name)
+        ticker = (
+            event_cfg["kalshi_ticker"] if event_cfg
+            else f"<unknown-event:{pos.event_name}>"
+        )
+        persisted[ticker] = persisted.get(ticker, 0) + pos.contracts
+
+    mismatches = [
+        (ticker, persisted.get(ticker, 0), exchange.get(ticker, 0))
+        for ticker in sorted(set(exchange) | set(persisted))
+        if persisted.get(ticker, 0) != exchange.get(ticker, 0)
+    ]
+
+    if not mismatches:
+        logging.info(
+            "[Reconcile] Kalshi positions match persisted state "
+            "(%d ticker(s)).", len(persisted),
+        )
+        return
+
+    for ticker, ours, theirs in mismatches:
+        logging.error(
+            "[Reconcile] MISMATCH %s: persisted=%d exchange=%d — "
+            "investigate before trusting the portfolio state!",
+            ticker, ours, theirs,
+        )
+    if notifier is not None:
+        await notifier.notify_error(
+            "Startup reconciliation found position mismatches: "
+            + ", ".join(
+                f"{t} (state {o} vs exchange {e})"
+                for t, o, e in mismatches
+            )
+        )
+
+
+async def _balance_monitor(
+    kalshi_client: "KalshiOrderClient",
+    poly_client: "PolymarketOrderClient",
+    notifier: Optional["DiscordNotifier"],
+    stop_event: asyncio.Event,
+) -> None:
+    """Alert when either platform's balance drops below the threshold.
+
+    Arb profits pool on one platform until rebalanced manually; when the
+    other side runs dry the bot silently stops trading.  Alerts fire on
+    the healthy→low transition only (no spam every cycle).
+    """
+    was_low = {"kalshi": False, "polymarket": False}
+
+    async def check(platform: str, balance: Optional[Decimal]) -> None:
+        if balance is None:
+            return
+        low = balance < MIN_PLATFORM_BALANCE
+        if low and not was_low[platform]:
+            logging.warning(
+                "[Balance] %s balance $%s below $%s threshold — "
+                "rebalance capital.",
+                platform, balance, MIN_PLATFORM_BALANCE,
+            )
+            if notifier is not None:
+                await notifier.notify_error(
+                    f"{platform} balance ${balance} below "
+                    f"${MIN_PLATFORM_BALANCE} threshold — rebalance capital."
+                )
+        was_low[platform] = low
+
+    while not stop_event.is_set():
+        try:
+            await asyncio.wait_for(
+                stop_event.wait(), timeout=BALANCE_CHECK_INTERVAL,
+            )
+            return
+        except asyncio.TimeoutError:
+            pass
+        try:
+            await check("kalshi", await kalshi_client.get_balance())
+            await check("polymarket", await poly_client.get_collateral_balance())
+        except Exception as exc:
+            logging.warning("[Balance] Check failed: %s", exc)
+
+
+# ====================================================================
 # StuckPositionMonitor — detects half-filled arbs & auto-unwinds
 # ====================================================================
 
@@ -4863,6 +5637,11 @@ class ExecutionEngine:
         # this, concurrent submits on different events could each pass
         # the capital/exposure checks and collectively over-commit.
         self._reserved: Decimal = ZERO
+        # In-flight submit tasks (Phase 6): tracked so shutdown can drain
+        # them before order clients close — killing the process between
+        # legs strands a one-legged position.
+        self._inflight: set[asyncio.Task] = set()
+        self._last_order_ts: str = ""
 
     async def submit(self, opp: ArbOpportunity) -> Optional[Order]:
         """
@@ -4884,6 +5663,38 @@ class ExecutionEngine:
             self._event_locks[key] = asyncio.Lock()
         async with self._event_locks[key]:
             return await self._submit_inner(opp, key)
+
+    def submit_background(self, opp: ArbOpportunity) -> asyncio.Task:
+        """Fire-and-forget submit, tracked for shutdown draining."""
+        task = asyncio.create_task(self.submit(opp))
+        self._inflight.add(task)
+        task.add_done_callback(self._inflight.discard)
+        return task
+
+    async def drain(self, timeout: float) -> bool:
+        """Wait for in-flight executions to finish (Phase 6 shutdown).
+
+        Called BEFORE order clients close: interrupting a two-leg trade
+        mid-flight strands a one-legged position on the exchange.
+        Returns True if everything finished within the timeout.
+        """
+        pending = [t for t in self._inflight if not t.done()]
+        if not pending:
+            return True
+        logging.info(
+            "[Exec] Draining %d in-flight execution(s) (up to %.0fs)…",
+            len(pending), timeout,
+        )
+        done, still_pending = await asyncio.wait(pending, timeout=timeout)
+        if still_pending:
+            logging.error(
+                "[Exec] %d execution(s) did not finish before shutdown — "
+                "check exchange positions for stranded legs!",
+                len(still_pending),
+            )
+            return False
+        logging.info("[Exec] All in-flight executions drained.")
+        return True
 
     async def _submit_inner(
         self, opp: ArbOpportunity, key: tuple[str, str],
@@ -5156,6 +5967,7 @@ class ExecutionEngine:
         growth during long-running sessions.
         """
         self._orders.append(order)
+        self._last_order_ts = order.timestamp
         await self._order_logger.log(order)
 
         if len(self._orders) > MAX_ORDERS_IN_MEMORY:
@@ -5206,6 +6018,11 @@ class ExecutionEngine:
     @property
     def rejected_count(self) -> int:
         return sum(1 for o in self._orders if o.status == OrderStatus.REJECTED)
+
+    @property
+    def last_order_ts(self) -> str:
+        """Timestamp of the most recent finalized order ('' if none)."""
+        return self._last_order_ts
 
 
 # ====================================================================
@@ -5531,7 +6348,8 @@ def _check_event(
             opp.kalshi_ticker = ticker
             opp.poly_condition_id = cond_id
             opps_found += 1
-            asyncio.create_task(execution.submit(opp))
+            # Tracked task so shutdown can drain in-flight executions
+            execution.submit_background(opp)
 
     except Exception as exc:
         logging.error(
@@ -5585,11 +6403,7 @@ async def main() -> None:
     # ── Parse CLI args first (before configuring logging) ──
     args = _parse_args()
 
-    logging.basicConfig(
-        level=getattr(logging, args.log_level),
-        format="%(asctime)s | %(levelname)-7s | %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-    )
+    _setup_logging(args.log_level)
 
     live_mode = (args.mode == "live")
 
@@ -5635,10 +6449,16 @@ async def main() -> None:
     fetcher = MarketFetcher()
     engine = ArbEngine(min_margin=MIN_PROFIT_MARGIN)
     trader = PaperTrader(path=LEDGER_FILE)
+
+    # ── State store (Phase 6): capital, positions, and orphaned
+    #    exposure survive restarts; also hosts the run lock ──
+    state_store = StateStore(STATE_DB_FILE)
+
     portfolio = PaperPortfolio(
         starting_capital=STARTING_CAPITAL,
         position_size=POSITION_SIZE,
         path=PORTFOLIO_FILE,
+        state_store=state_store,
     )
 
     # ── Risk management (Phase 1) ──
@@ -5703,6 +6523,13 @@ async def main() -> None:
             await kalshi_ws.subscribe_fills()
             logging.info("[Phase 3] Kalshi WS fill channel active.")
 
+        # Phase 6: reconcile persisted positions against the exchange
+        # (catches legs orphaned by a crash) and sanity-check allowances.
+        await _reconcile_startup_positions(
+            kalshi_client, portfolio, name_to_event, notifier,
+        )
+        await poly_client.verify_allowances()
+
         logging.info("[Phase 3] Order clients initialized for live trading.")
 
     # ── Unwind module (Phase 2 + Phase 3 live integration) ──
@@ -5718,7 +6545,10 @@ async def main() -> None:
         kalshi_ws=kalshi_ws,
         poly_ws=poly_ws,
         fetcher=fetcher,
+        state_store=state_store,
     )
+    # Phase 6: resume retrying any orphaned exposure from a prior run
+    unwind_manager.restore_orphans()
     # Phase 4: Wire notifier into UnwindManager
     unwind_manager.set_notify_callback(notifier)
 
@@ -5757,7 +6587,18 @@ async def main() -> None:
             await kalshi_client.close()
         if poly_client:
             await poly_client.close()
+        state_store.close()
         sys.exit(0)
+
+    # ── Single-instance run lock (Phase 6) ──
+    # A deploy overlap must not produce two instances trading at once.
+    instance_id = f"{socket.gethostname()}:{os.getpid()}"
+    if not await _acquire_run_lock(state_store, instance_id):
+        logging.error(
+            "[Lock] Another live instance holds the run lock — exiting.",
+        )
+        state_store.close()
+        sys.exit(1)
 
     # Phase 4: Startup notification
     await notifier.send(
@@ -5812,6 +6653,41 @@ async def main() -> None:
         name="daily-summary",
     ))
 
+    # Run-lock heartbeat (Phase 6): keeps our claim fresh
+    bg_tasks.append(asyncio.create_task(
+        _run_lock_heartbeat(state_store, instance_id, stop_event),
+        name="run-lock-heartbeat",
+    ))
+
+    # Balance monitor (Phase 6, live only): alerts when either platform
+    # runs low on capital
+    if live_mode:
+        bg_tasks.append(asyncio.create_task(
+            _balance_monitor(kalshi_client, poly_client, notifier, stop_event),
+            name="balance-monitor",
+        ))
+
+    # Health endpoint (Phase 6): container healthchecks + remote status
+    health_server: Optional[HealthServer] = None
+    if HEALTH_PORT > 0:
+        health_server = HealthServer(
+            HEALTH_HOST, HEALTH_PORT,
+            mode=mode_str, update_queue=update_queue,
+            kalshi_ws=kalshi_ws, poly_ws=poly_ws,
+            portfolio=portfolio, pnl_tracker=pnl_tracker,
+            unwind_manager=unwind_manager, execution=execution,
+            active_events=active_events,
+        )
+        try:
+            await health_server.start()
+        except OSError as exc:
+            logging.warning(
+                "[Health] Could not bind %s:%d (%s) — health endpoint "
+                "disabled for this run.",
+                HEALTH_HOST, HEALTH_PORT, exc,
+            )
+            health_server = None
+
     # Give websockets a moment to receive initial snapshots
     if kalshi_ws or poly_ws:
         logging.info("Waiting 3s for initial WS snapshots…")
@@ -5833,10 +6709,20 @@ async def main() -> None:
         )
         stop_event.set()
 
+        # Drain in-flight two-leg executions BEFORE anything closes —
+        # killing an execution between legs strands a one-legged position.
+        # (StuckPositionMonitor is still running and can rescue during
+        # the drain window.)
+        await execution.drain(DRAIN_TIMEOUT_SECONDS)
+
         # Cancel background tasks
         for task in bg_tasks:
             task.cancel()
         await asyncio.gather(*bg_tasks, return_exceptions=True)
+
+        # Stop the health endpoint
+        if health_server is not None:
+            await health_server.stop()
 
         # Close connections (the notifier stays open for the shutdown
         # notification below and is closed after it)
@@ -5892,6 +6778,14 @@ async def main() -> None:
             color=DiscordNotifier.COLOR_RED,
         )
         await notifier.close()
+
+        # Release the run lock and close the state store last — state
+        # writes above (drain, unwinds) must land first.
+        try:
+            state_store.release_run_lock(instance_id)
+        except Exception as exc:
+            logging.warning("[Lock] Release failed: %s", exc)
+        state_store.close()
 
     sys.exit(0)
 

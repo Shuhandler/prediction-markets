@@ -135,41 +135,59 @@ _Do first — protects everything that follows._  **✅ Completed 2026-07-09 —
 ## Phase 6 — Cloud Deployment
 
 _Deploy 24/7 in **paper mode** first — it is the staging environment and
-generates the ledger data Phase 7 needs._
+generates the ledger data Phase 7 needs._  **✅ Code + infra completed
+2026-07-09 (106 tests green); the actual VPS rollout and the pre-live
+checklist below remain operator actions.  See [DEPLOYMENT.md](DEPLOYMENT.md)._
 
-- [ ] Create `Dockerfile` + `docker-compose.yml` with volume mounts for `data/` and `keys/`
-- [ ] Target: US-East VPS (Kalshi and the Polymarket CLOB are US-hosted; an EU
-      region adds ~100ms per leg, directly widening the legging window).
-      Long-running WS connections rule out Lambda/Cloud Run
-- [ ] `systemd` service file or Docker `restart: unless-stopped` policy
-- [ ] Migrate CSV storage → SQLite (atomic writes, concurrent safety, bounded growth, queryable)
-- [ ] **State persistence, not just logs**: positions, capital, and orphaned
-      exposure in SQLite — today the portfolio is in-memory and every restart
-      resets capital and forgets open positions
-- [ ] **Startup reconciliation**: query open positions on both exchanges at
-      boot and reconcile against persisted state (also catches legs orphaned
-      by a crash mid-trade)
-- [ ] **Graceful shutdown drains in-flight executions**: `execution.submit()`
-      tasks are fire-and-forget — track them and await (with timeout) before
-      closing order clients; set the Docker stop grace period above that
-- [ ] **Run lock** (SQLite/PID): a deploy overlap must not produce two
-      instances trading simultaneously
-- [ ] Cross-platform balance monitoring: alert when either platform's
-      available balance drops below a threshold (profits pool on one side)
-- [ ] Add structured JSON logging with log rotation (`logging.handlers.RotatingFileHandler`)
-- [ ] Secrets management: Docker secrets or `.env` file with restricted
-      permissions; hot wallet holds working capital only, ERC-20 allowances
-      capped and verified at startup
-- [ ] Pin dependencies (exact versions / lockfile) — `py_clob_client`
-      breaking changes are a live risk; ensure NTP is active (RSA signature
-      timestamps)
-- [ ] Health-check endpoint: minimal HTTP server on localhost reporting WS
-      status/staleness per platform, queue depth, last trade time, daily P&L,
-      circuit-breaker state, orphan count
-- [ ] Document the container kill-switch path (the `KILL` file check is
-      CWD-relative); back up the data volume
-- [ ] Before live capital: confirm platform eligibility/ToS on both venues
-      and personal-trading compliance clearance
+- [x] Create `Dockerfile` + `docker-compose.yml` with volume mounts for
+      `data/` and `keys/` (non-root user, healthcheck, 45s stop grace)
+- [x] Target: US-East VPS — rationale and sizing documented in DEPLOYMENT.md
+      (Kalshi and the Polymarket CLOB are US-hosted; an EU region adds
+      ~100ms per leg).  Long-running WS connections rule out Lambda/Cloud Run
+- [x] `systemd` service file (`deploy/arb-bot.service`) and Docker
+      `restart: unless-stopped` policy
+- [x] SQLite as **state of record** (`StateStore`, WAL): positions, capital,
+      orphaned exposure, run lock.  *Deliberate deviation from the original
+      "migrate CSVs to SQLite" item:* the CSVs stay as the append-only audit
+      trail — duplicating them into SQLite adds failure modes without adding
+      restart safety, and the ledger stays directly readable for Phase 7
+- [x] **State persistence**: `PaperPortfolio` and `UnwindManager` restore
+      capital/positions/orphans from `data/state.db` at startup; every
+      mutation persists atomically (`test_ops.py` restart tests)
+- [x] **Startup reconciliation** (live): persisted positions vs the Kalshi
+      account at boot; alert-only on mismatch.  *Limitation:* the Polymarket
+      side has no authenticated position query in the current client — every
+      arb position has a Kalshi leg, so pair-level drift is still detected
+- [x] **Graceful shutdown drains in-flight executions**:
+      `ExecutionEngine.submit_background()` tracks tasks; `drain()` runs
+      before order clients close; compose stop grace (45s) >
+      `DRAIN_TIMEOUT_SECONDS` (20s)
+- [x] **Run lock**: heartbeat row in the state DB; a live holder blocks a
+      second instance (verified against a running instance), a crashed
+      holder's lock expires after `RUN_LOCK_STALE_SECONDS` so
+      `restart: unless-stopped` recovers unattended
+- [x] Cross-platform balance monitoring (live): Kalshi `/portfolio/balance`
+      + Poly collateral via `py_clob_client` (best-effort), alert on the
+      healthy→low transition below `MIN_PLATFORM_BALANCE`
+- [x] Structured JSON logging (`LOG_FORMAT=json`) with optional 10MB×5
+      rotation (`LOG_FILE`)
+- [x] Secrets: `.env` + `keys/` volume-mounted (never in the image),
+      permissions documented; USDC allowance checked at startup in live mode
+      (advisory — depends on `py_clob_client` internals, verify on first
+      live run)
+- [x] Dependency pinning: image freezes resolved versions at build
+      (`/requirements.lock.txt`, extraction documented); NTP requirement
+      documented
+- [x] Health endpoint (`GET /health`, 200/503): WS staleness per platform,
+      queue depth, capital, positions, daily P&L, circuit breaker, orphan
+      count, order counts, last order time — verified live against a real
+      Polymarket WS connection
+- [x] Kill-switch path in containers (`KILL_FILE=/app/data/KILL`) and data
+      volume backups documented
+- [ ] **Operator actions before live capital** (see DEPLOYMENT.md checklist):
+      provision US-East VPS, ≥2 weeks clean paper operation, platform
+      eligibility/ToS + personal-trading compliance clearance, verify the
+      allowance/balance checks against the real APIs
 - [ ] Optional: Prometheus metrics export for Grafana dashboards
 
 ---
@@ -255,6 +273,7 @@ sports matching delay._
 | Remaining phases reordered (2026-07-09): tests → deploy → economics gate → discovery | Discovery multiplies any latent bug across N markets; 24/7 paper deployment doubles as staging and produces the ledger data the go/no-go needs |
 | Economics gate before discovery | Fees are ~3.3¢/contract at p=0.5; prove that much dislocation exists at fillable depth before buying more infrastructure |
 | Alignment safety = price coherence, not just name matching | Inverted/misaligned pairs read as huge "spreads" — the detector preferentially trades matching failures, and the loss is unhedged 2× outlay |
+| SQLite for state, CSV retained for audit logs (2026-07-09) | Restart safety needs *state* (positions/capital/orphans/lock); duplicating append-only audit logs into SQLite adds failure modes without adding safety, and CSVs stay directly readable for Phase 7 analysis |
 | SQLite over Postgres | Simpler for single-instance bot; no separate DB process needed |
 | VPS over serverless | WebSocket connections are long-lived; Lambda/Cloud Run would reconnect constantly |
 | Sequential leg execution (not parallel) | Safer — guarantees Leg 1 fill status is known before committing Leg 2 |

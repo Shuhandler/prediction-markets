@@ -18,11 +18,14 @@ python arb_bot.py --events-file X.json --log-level DEBUG
 
 python ticker_return.py [kalshi_url] [poly_url]   # interactive helper: generate events.json entries
 
-pytest tests/ -q                        # full test suite (~90 tests, <10s, no network)
+pytest tests/ -q                        # full test suite (~106 tests, <10s, no network)
 pytest tests/test_execution.py -v       # one module
 pytest tests/ -k "orphan"               # tests matching a keyword
 
 python -c "import arb_bot"              # syntax/import check
+
+docker compose up -d --build            # 24/7 deployment (paper mode default) — see DEPLOYMENT.md
+curl http://127.0.0.1:8080/health       # runtime status (200 healthy / 503 degraded)
 ```
 
 Tests are offline (mock exchange clients in `tests/mocks.py`; shared fixtures/factories in `tests/conftest.py` — `build_stack()` wires the whole pipeline with CSVs under tmp_path). Config constants are pinned by a session fixture so results don't depend on the local `.env`; constructor defaults bind at import time, so always pass config explicitly in tests. `tests/test_parity.py` enforces that live/paper branching stays confined to `UnwindManager` — extending live-only behavior elsewhere will fail CI by design; update `ALLOWED_LIVE_REFS` only with a deliberate decision.
@@ -55,4 +58,4 @@ Key invariants to preserve:
 
 Supporting mechanisms: `RiskManager` gates every order (kill-switch file `KILL`, daily loss circuit breaker, exposure/position caps, spread sanity > 20% rejected as stale data); in-flight submissions reserve capital in `ExecutionEngine._reserved` so concurrent trades can't over-commit; `StuckPositionMonitor` force-unwinds half-filled arbs older than 30s (serialized against in-flight `execute()` via a per-`UnwindOrder` lock) and retries orphaned unwind exposure each cycle; a resolution checker settles positions when markets resolve and unsubscribes dead markets from both WS trackers; both WS classes have stale-data watchdogs with exponential-backoff reconnect that re-pull REST snapshots. Order sizing caps to fillable depth (`opp.max_contracts`) rather than rejecting, and fees are computed once per order (order-level ceil), not per contract. Polymarket token IDs are never resolved at runtime — they come from `events.json` (each entry needs all 5 fields; generate with `ticker_return.py`).
 
-Outputs land in `data/*.csv` (trade_ledger, orders, portfolio, unwinds) — append-only audit logs written immediately.
+Outputs land in `data/*.csv` (trade_ledger, orders, portfolio, unwinds) — append-only audit logs written immediately. **State of record is `data/state.db`** (`StateStore`, SQLite WAL): capital, open positions, orphaned exposure, and the single-instance run lock all survive restarts and are restored at startup — the CSVs are audit only, never read back. Deployment layer (Phase 6): Dockerfile/docker-compose/systemd unit (see DEPLOYMENT.md), a localhost `/health` endpoint (`HealthServer`), shutdown that drains in-flight executions via `ExecutionEngine.drain()` before order clients close, live-mode startup reconciliation against Kalshi positions, and a balance monitor. When touching shutdown or main() wiring, preserve the order: drain → cancel background tasks → close clients → release run lock → close state store.

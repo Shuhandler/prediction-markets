@@ -1,0 +1,22 @@
+services:
+  arb-bot:
+    build: .
+    restart: unless-stopped
+    # Must exceed DRAIN_TIMEOUT_SECONDS (20s): a SIGKILL between legs
+    # strands a one-legged position on the exchange.
+    stop_grace_period: 45s
+    env_file:
+      - .env
+    environment:
+      KILL_FILE: /app/data/KILL     # emergency stop: touch ./data/KILL on host
+      HEALTH_PORT: "8080"
+      # LOG_FORMAT: json            # structured logs for shipping
+      # LOG_FILE: /app/data/arb_bot.log
+    volumes:
+      - ./data:/app/data            # state.db + CSV audit logs + KILL file
+      - ./keys:/app/keys:ro
+      - ./events.json:/app/events.json:ro
+    # Health endpoint stays container-internal by default.  To check it
+    # from the host, uncomment (keep it bound to localhost only):
+    # ports:
+    #   - "127.0.0.1:8080:8080"

@@ -1,0 +1,37 @@
+# systemd alternative to docker-compose (bare-VPS deployment).
+#
+# Setup:
+#   sudo useradd --system --create-home arbbot
+#   sudo mkdir -p /opt/arb-bot && sudo chown arbbot:arbbot /opt/arb-bot
+#   (as arbbot) clone repo to /opt/arb-bot, create venv:
+#       python3 -m venv /opt/arb-bot/venv
+#       /opt/arb-bot/venv/bin/pip install -r requirements.txt
+#   copy .env (chmod 600) and keys/ (chmod 400) into /opt/arb-bot
+#   sudo cp deploy/arb-bot.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now arb-bot
+
+[Unit]
+Description=Prediction market arbitrage bot (Kalshi + Polymarket)
+After=network-online.target time-sync.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=arbbot
+WorkingDirectory=/opt/arb-bot
+EnvironmentFile=/opt/arb-bot/.env
+Environment=KILL_FILE=/opt/arb-bot/data/KILL
+ExecStart=/opt/arb-bot/venv/bin/python arb_bot.py
+Restart=on-failure
+RestartSec=5
+# Must exceed DRAIN_TIMEOUT_SECONDS (20s) so in-flight legs finish
+TimeoutStopSec=45
+# Hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/opt/arb-bot/data
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
