@@ -268,7 +268,10 @@ def main():
     print("  NO runtime API resolution (prevents inverted trades).")
     print()
 
-    if tokens and len(tokens) >= 2:
+    if tokens and len(tokens) == 2:
+        # Binary market: picking YES determines NO as the other token.
+        # With >2 outcomes that inference is wrong, so fall through to
+        # manual entry instead of silently assigning a wrong token.
         print("  Which CLOB token corresponds to YES (matches Kalshi 'Yes')?")
         print()
         for i, t in enumerate(tokens):
@@ -286,6 +289,9 @@ def main():
         print(f"  → YES token: {yes_token_id}")
         print(f"  → NO  token: {no_token_id}")
     else:
+        if tokens and len(tokens) > 2:
+            print(f"  WARNING: {len(tokens)} outcome tokens found — "
+                  "not a simple binary market. Enter token IDs manually.")
         yes_token_id = input("  Enter YES token_id manually: ").strip()
         no_token_id = input("  Enter NO  token_id manually: ").strip()
 

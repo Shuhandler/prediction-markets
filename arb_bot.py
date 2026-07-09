@@ -526,6 +526,12 @@ class UnwindOrder:
     error_message: str = ""
     net_profit_per_contract: Decimal = ZERO
     total_contracts: int = 0
+    # Serializes execute() vs. StuckPositionMonitor.force_unwind() on the
+    # same order — without it the monitor can sell Leg 1 while execute()
+    # is still awaiting Leg 2, leaving a naked short if Leg 2 then fills.
+    lock: asyncio.Lock = field(
+        default_factory=asyncio.Lock, repr=False, compare=False,
+    )
 
 
 # ====================================================================
@@ -643,9 +649,17 @@ class MarketFetcher:
         self._session: aiohttp.ClientSession | None = None
         self._poly_token_cache: dict[str, tuple[str, str]] = {}
         self._kalshi_limiter = RateLimiter(KALSHI_MAX_RPS)
+        # Separate limiter for execution-critical fetches (e.g. the Leg 2
+        # spread re-verification) so a mid-trade snapshot never queues
+        # behind background resolution checks.  Combined worst case is
+        # 2 × KALSHI_MAX_RPS, still well under Kalshi's Basic read limit.
+        self._kalshi_priority_limiter = RateLimiter(KALSHI_MAX_RPS)
         self._poly_limiter = RateLimiter(POLY_MAX_RPS)
-        # Track whether /book works to avoid repeated 404 probes
-        self._poly_book_available: dict[str, bool] = {}
+        # monotonic deadline before which we skip /book probes for a
+        # condition_id.  Set only on a hard 404 (endpoint genuinely
+        # unavailable); transient errors fall back to /price for one
+        # cycle and re-probe on the next.
+        self._poly_book_retry_at: dict[str, float] = {}
 
     async def _ensure_session(self) -> None:
         if self._session is None or self._session.closed:
@@ -750,7 +764,9 @@ class MarketFetcher:
     #  Kalshi — orderbook (Decimal)
     # ----------------------------------------------------------------
 
-    async def fetch_kalshi(self, ticker: str) -> Optional[MarketSnapshot]:
+    async def fetch_kalshi(
+        self, ticker: str, *, priority: bool = False,
+    ) -> Optional[MarketSnapshot]:
         """
         Fetch the Kalshi orderbook for *ticker* and return a MarketSnapshot.
 
@@ -761,12 +777,18 @@ class MarketFetcher:
 
         Prices in the "yes"/"no" arrays are in CENTS (0-99).
         Each entry is [price_cents, quantity].
+
+        priority=True uses a dedicated rate limiter so execution-critical
+        fetches never queue behind background housekeeping calls.
         """
         await self._ensure_session()
+        limiter = (
+            self._kalshi_priority_limiter if priority else self._kalshi_limiter
+        )
         data = await _request_with_retry(
             self._session,
             f"{KALSHI_BASE}/markets/{ticker}/orderbook",
-            self._kalshi_limiter,
+            limiter,
             params={"depth": 5},
             label="Kalshi",
         )
@@ -849,10 +871,16 @@ class MarketFetcher:
     #  Polymarket — /book endpoint (preferred, real orderbook)
     # ----------------------------------------------------------------
 
-    async def _fetch_poly_book(self, token_id: str) -> Optional[dict]:
+    async def _fetch_poly_book(
+        self, token_id: str,
+    ) -> tuple[Optional[dict], bool]:
         """
         Try GET /book?token_id=… for real orderbook data with depth.
-        Returns the JSON response or None if 404 / error.
+
+        Returns (json, is_404).  is_404 is True only for a hard 404
+        (endpoint genuinely unavailable for this market); transient
+        errors (5xx, timeouts) return (None, False) so callers don't
+        permanently downgrade the market to indicative pricing.
         Does NOT log errors for 404 (expected for some markets).
         """
         await self._ensure_session()
@@ -865,12 +893,12 @@ class MarketFetcher:
                 timeout=timeout,
             ) as resp:
                 if resp.status == 404:
-                    return None  # expected for some markets
+                    return None, True  # expected for some markets
                 if resp.status >= 400:
-                    return None
-                return await resp.json(content_type=None)
+                    return None, False
+                return await resp.json(content_type=None), False
         except (aiohttp.ClientError, asyncio.TimeoutError):
-            return None
+            return None, False
 
     @staticmethod
     def _parse_book_tob(book: dict) -> TopOfBook:
@@ -945,7 +973,8 @@ class MarketFetcher:
 
         Tries /book first for real orderbook data with depth.
         Falls back to /price (indicative, no depth) if /book 404s.
-        Remembers whether /book works to skip futile probes.
+        A hard 404 pauses /book probes for 5 minutes; transient errors
+        fall back to /price for this cycle only and re-probe next time.
         """
         tokens = await self._resolve_poly_tokens(condition_id)
         if tokens is None:
@@ -953,15 +982,15 @@ class MarketFetcher:
 
         yes_token, no_token = tokens
 
-        # ── Try /book if we haven't already determined it's unavailable ──
-        if self._poly_book_available.get(condition_id, True):
-            yes_book, no_book = await asyncio.gather(
+        # ── Try /book unless a recent hard 404 told us to back off ──
+        if time.time() >= self._poly_book_retry_at.get(condition_id, 0.0):
+            (yes_book, yes_404), (no_book, no_404) = await asyncio.gather(
                 self._fetch_poly_book(yes_token),
                 self._fetch_poly_book(no_token),
             )
 
             if yes_book is not None and no_book is not None:
-                self._poly_book_available[condition_id] = True
+                self._poly_book_retry_at.pop(condition_id, None)
                 yes_tob = self._parse_book_tob(yes_book)
                 no_tob = self._parse_book_tob(no_book)
                 return MarketSnapshot(
@@ -969,12 +998,20 @@ class MarketFetcher:
                     source="polymarket", price_source="book",
                 )
 
-            # /book not available for this market — remember for future cycles
-            self._poly_book_available[condition_id] = False
-            logging.info(
-                "[Polymarket] /book unavailable for %s…, using /price fallback",
-                condition_id[:16],
-            )
+            if yes_404 or no_404:
+                # Endpoint genuinely missing — pause probes, re-check in 5 min
+                self._poly_book_retry_at[condition_id] = time.time() + 300.0
+                logging.info(
+                    "[Polymarket] /book 404 for %s…, using /price fallback "
+                    "(re-probing in 5 min)",
+                    condition_id[:16],
+                )
+            else:
+                logging.warning(
+                    "[Polymarket] /book transient failure for %s…, "
+                    "using /price this cycle",
+                    condition_id[:16],
+                )
 
         # ── Fall back to /price (4 concurrent calls) ──
         yes_buy, yes_sell, no_buy, no_sell = await asyncio.gather(
@@ -1033,6 +1070,13 @@ class KalshiOrderClient:
         self._session: Optional[aiohttp.ClientSession] = None
         self._private_key = None
         self._limiter = RateLimiter(KALSHI_MAX_RPS)
+        # Host root without the /trade-api/v2 suffix; ORDER_PATH already
+        # carries the full signed path.
+        self._base = (
+            KALSHI_BASE.split("/trade-api/v2")[0]
+            if "/trade-api/v2" in KALSHI_BASE
+            else KALSHI_BASE
+        )
 
     def _load_private_key(self):
         """Load RSA private key for Kalshi auth (same key as WS)."""
@@ -1129,11 +1173,7 @@ class KalshiOrderClient:
         else:
             body["no_price"] = price_cents
 
-        url = f"{KALSHI_BASE.rstrip('/trade-api/v2')}{path}"
-        # Handle the case where KALSHI_BASE already has the right prefix
-        if "/trade-api/v2" in KALSHI_BASE:
-            base = KALSHI_BASE.split("/trade-api/v2")[0]
-            url = f"{base}{path}"
+        url = f"{self._base}{path}"
 
         timeout = aiohttp.ClientTimeout(total=REQUEST_TIMEOUT)
         try:
@@ -1171,8 +1211,7 @@ class KalshiOrderClient:
         path = f"{self.ORDER_PATH}/{order_id}"
         headers = self._sign_request("GET", path)
 
-        base = KALSHI_BASE.split("/trade-api/v2")[0] if "/trade-api/v2" in KALSHI_BASE else KALSHI_BASE
-        url = f"{base}{path}"
+        url = f"{self._base}{path}"
 
         timeout = aiohttp.ClientTimeout(total=REQUEST_TIMEOUT)
         try:
@@ -1197,8 +1236,7 @@ class KalshiOrderClient:
         path = self.ORDER_PATH
         headers = self._sign_request("GET", path)
 
-        base = KALSHI_BASE.split("/trade-api/v2")[0] if "/trade-api/v2" in KALSHI_BASE else KALSHI_BASE
-        url = f"{base}{path}"
+        url = f"{self._base}{path}"
 
         timeout = aiohttp.ClientTimeout(total=REQUEST_TIMEOUT)
         try:
@@ -1221,8 +1259,7 @@ class KalshiOrderClient:
         path = f"{self.ORDER_PATH}/{order_id}"
         headers = self._sign_request("DELETE", path)
 
-        base = KALSHI_BASE.split("/trade-api/v2")[0] if "/trade-api/v2" in KALSHI_BASE else KALSHI_BASE
-        url = f"{base}{path}"
+        url = f"{self._base}{path}"
 
         timeout = aiohttp.ClientTimeout(total=REQUEST_TIMEOUT)
         try:
@@ -1488,21 +1525,29 @@ class _LocalOrderbook:
             self.bids.pop(price, None)
 
     def to_tob(self) -> TopOfBook:
-        """Convert current state to a TopOfBook (Decimal)."""
+        """Convert current state to a TopOfBook (Decimal).
+
+        HOT PATH: called on every WS tick for every book.  Only the
+        top-of-book level is materialized (best bid / best ask) — the
+        arb engine sizes trades from ask_levels[0] exclusively, so
+        sorting the whole book and building full depth lists here was
+        pure overhead.  Callers needing full depth use the REST
+        fetcher's snapshots instead.
+        """
         tob = TopOfBook()
         if self.bids:
-            sorted_bids = sorted(self.bids.items(), key=lambda x: x[0], reverse=True)
-            tob.best_bid = sorted_bids[0][0]
-            tob.best_bid_size = sorted_bids[0][1]
+            best_bid = max(self.bids)
+            tob.best_bid = best_bid
+            tob.best_bid_size = self.bids[best_bid]
             tob.bid_levels = [
-                OrderbookLevel(price=p, size=s) for p, s in sorted_bids
+                OrderbookLevel(price=best_bid, size=self.bids[best_bid]),
             ]
         if self.asks:
-            sorted_asks = sorted(self.asks.items(), key=lambda x: x[0])
-            tob.best_ask = sorted_asks[0][0]
-            tob.best_ask_size = sorted_asks[0][1]
+            best_ask = min(self.asks)
+            tob.best_ask = best_ask
+            tob.best_ask_size = self.asks[best_ask]
             tob.ask_levels = [
-                OrderbookLevel(price=p, size=s) for p, s in sorted_asks
+                OrderbookLevel(price=best_ask, size=self.asks[best_ask]),
             ]
         return tob
 
@@ -1529,12 +1574,15 @@ class PolymarketWS:
         self._ping_task: Optional[asyncio.Task] = None
         self._listen_task: Optional[asyncio.Task] = None
         self._stale_task: Optional[asyncio.Task] = None
+        self._reconnect_task: Optional[asyncio.Task] = None
         self._reconnect_attempts = 0
         self._notifier: Optional["DiscordNotifier"] = None
         # condition_id -> (yes_token_id, no_token_id)
         self._token_map: dict[str, tuple[str, str]] = {}
         # condition_id -> event_name (for queue notifications)
         self._condition_to_event: dict[str, str] = {}
+        # token_id -> event_name (O(1) lookup on the hot WS message path)
+        self._token_to_event: dict[str, str] = {}
         # Shared queue for event-driven processing
         self._update_queue: Optional[asyncio.Queue] = None
         # Stale-data watchdog: updated on every incoming message
@@ -1552,11 +1600,32 @@ class PolymarketWS:
         self._fetcher = fetcher
 
     async def connect(self) -> None:
-        """Open the websocket connection."""
-        self._session = aiohttp.ClientSession()
-        await self._do_connect()
+        """Open the websocket connection.
 
-    async def _do_connect(self) -> None:
+        If the first attempt fails, reconnection continues in a
+        background task so startup is never blocked indefinitely.
+        """
+        self._session = aiohttp.ClientSession()
+        if not await self._do_connect():
+            self._reconnect_task = asyncio.create_task(
+                self._schedule_reconnect(),
+            )
+
+    def _cancel_conn_tasks(self) -> None:
+        """Cancel per-connection tasks from a previous connection.
+
+        Without this, every reconnect leaked a ping loop and a stale
+        watchdog, all re-reading self._ws and racing to close the new
+        socket.  Never cancels the task we are currently running in
+        (a reconnect can be scheduled from inside the old listen task).
+        """
+        current = asyncio.current_task()
+        for task in (self._ping_task, self._listen_task, self._stale_task):
+            if task is not None and not task.done() and task is not current:
+                task.cancel()
+
+    async def _do_connect(self) -> bool:
+        """Attempt one connection.  Returns True on success."""
         try:
             self._ws = await self._session.ws_connect(
                 POLY_WS_URL,
@@ -1579,7 +1648,9 @@ class PolymarketWS:
                     len(self._subscribed_assets),
                 )
 
-            # Start background tasks
+            # Start background tasks (cancelling leftovers from the
+            # previous connection first)
+            self._cancel_conn_tasks()
             self._ping_task = asyncio.create_task(self._ping_loop())
             self._listen_task = asyncio.create_task(self._listen_loop())
             self._stale_task = asyncio.create_task(self._stale_watchdog())
@@ -1591,11 +1662,12 @@ class PolymarketWS:
             # Seed the watchdog timer so it doesn't spin if the WS
             # connects successfully but the first real message is delayed.
             self.last_update_time = time.time()
+            return True
 
         except Exception as exc:
             logging.error("[Poly-WS] Connection failed: %s", exc)
             self._connected = False
-            await self._schedule_reconnect()
+            return False
 
     async def _ping_loop(self) -> None:
         """Send PING every WS_PING_INTERVAL seconds."""
@@ -1710,6 +1782,8 @@ class PolymarketWS:
 
         if event_type == "book":
             asset_id = data.get("asset_id", "")
+            if asset_id not in self._token_to_event:
+                return  # market was removed (resolved) — discard
             if asset_id not in self._books:
                 self._books[asset_id] = _LocalOrderbook()
             self._books[asset_id].apply_snapshot_poly(data)
@@ -1726,41 +1800,48 @@ class PolymarketWS:
         """Non-blocking: put event_name on queue so the processor wakes up.
 
         Uses put_nowait() to ensure we never block the WS listener task.
+        O(1) via the token → event reverse map (this runs on every
+        incoming WS message).
         """
         if self._update_queue is None:
             return
-        for cid, (yes_tok, no_tok) in self._token_map.items():
-            if token_id in (yes_tok, no_tok):
-                event_name = self._condition_to_event.get(cid)
-                if event_name:
-                    try:
-                        self._update_queue.put_nowait(event_name)
-                    except asyncio.QueueFull:
-                        logging.warning(
-                            "[Poly-WS] Update queue full, dropping update for %s",
-                            event_name,
-                        )
-                break
+        event_name = self._token_to_event.get(token_id)
+        if event_name:
+            try:
+                self._update_queue.put_nowait(event_name)
+            except asyncio.QueueFull:
+                logging.warning(
+                    "[Poly-WS] Update queue full, dropping update for %s",
+                    event_name,
+                )
 
     async def _schedule_reconnect(self) -> None:
-        self._reconnect_attempts += 1
-        delay = min(
-            WS_RECONNECT_BASE * (2 ** (self._reconnect_attempts - 1)),
-            WS_RECONNECT_MAX,
-        )
-        logging.info(
-            "[Poly-WS] Reconnecting in %.1fs (attempt %d)…",
-            delay, self._reconnect_attempts,
-        )
-        # Phase 4: Discord notification on reconnect
-        if self._notifier is not None:
-            asyncio.ensure_future(
-                self._notifier.notify_reconnect(
-                    "Polymarket", self._reconnect_attempts,
-                )
+        """Retry connecting with exponential backoff until success.
+
+        Iterative (not recursive): the old mutual recursion with
+        _do_connect grew the coroutine stack on every failed attempt
+        and would hit Python's recursion limit after a sustained outage.
+        """
+        while True:
+            self._reconnect_attempts += 1
+            delay = min(
+                WS_RECONNECT_BASE * (2 ** (self._reconnect_attempts - 1)),
+                WS_RECONNECT_MAX,
             )
-        await asyncio.sleep(delay)
-        await self._do_connect()
+            logging.info(
+                "[Poly-WS] Reconnecting in %.1fs (attempt %d)…",
+                delay, self._reconnect_attempts,
+            )
+            # Phase 4: Discord notification on reconnect
+            if self._notifier is not None:
+                asyncio.ensure_future(
+                    self._notifier.notify_reconnect(
+                        "Polymarket", self._reconnect_attempts,
+                    )
+                )
+            await asyncio.sleep(delay)
+            if await self._do_connect():
+                return
 
     async def subscribe(
         self,
@@ -1772,6 +1853,8 @@ class PolymarketWS:
         """Subscribe to orderbook updates for a market's tokens."""
         self._token_map[condition_id] = (yes_token, no_token)
         self._condition_to_event[condition_id] = event_name
+        self._token_to_event[yes_token] = event_name
+        self._token_to_event[no_token] = event_name
         new_assets = []
         for tok in (yes_token, no_token):
             if tok not in self._books:
@@ -1786,6 +1869,26 @@ class PolymarketWS:
                 "[Poly-WS] Subscribed to %d new assets for %s…",
                 len(new_assets), condition_id[:16],
             )
+
+    def remove_market(self, condition_id: str) -> None:
+        """Stop tracking a resolved market.
+
+        The Polymarket market channel has no unsubscribe command, so we
+        drop the local books and notification mappings instead: further
+        WS updates for these tokens are discarded without queueing, and
+        a reconnect will not re-subscribe them.
+        """
+        tokens = self._token_map.pop(condition_id, None)
+        self._condition_to_event.pop(condition_id, None)
+        if tokens:
+            for tok in tokens:
+                self._token_to_event.pop(tok, None)
+                self._books.pop(tok, None)
+                if tok in self._subscribed_assets:
+                    self._subscribed_assets.remove(tok)
+        logging.info(
+            "[Poly-WS] Removed resolved market %s…", condition_id[:16],
+        )
 
     def get_snapshot(self, condition_id: str) -> Optional[MarketSnapshot]:
         """Build a MarketSnapshot from local orderbook state (Decimal)."""
@@ -1819,6 +1922,8 @@ class PolymarketWS:
             self._listen_task.cancel()
         if self._stale_task:
             self._stale_task.cancel()
+        if self._reconnect_task:
+            self._reconnect_task.cancel()
         if self._ws and not self._ws.closed:
             await self._ws.close()
         if self._session and not self._session.closed:
@@ -1845,6 +1950,7 @@ class KalshiWS:
         self._subscribed_tickers: list[str] = []
         self._listen_task: Optional[asyncio.Task] = None
         self._stale_task: Optional[asyncio.Task] = None
+        self._reconnect_task: Optional[asyncio.Task] = None
         self._reconnect_attempts = 0
         self._msg_id = 0
         self._notifier: Optional["DiscordNotifier"] = None
@@ -1919,11 +2025,30 @@ class KalshiWS:
         }
 
     async def connect(self) -> None:
-        """Open the authenticated websocket connection."""
-        self._session = aiohttp.ClientSession()
-        await self._do_connect()
+        """Open the authenticated websocket connection.
 
-    async def _do_connect(self) -> None:
+        If the first attempt fails, reconnection continues in a
+        background task so startup is never blocked indefinitely.
+        """
+        self._session = aiohttp.ClientSession()
+        if not await self._do_connect():
+            self._reconnect_task = asyncio.create_task(
+                self._schedule_reconnect(),
+            )
+
+    def _cancel_conn_tasks(self) -> None:
+        """Cancel per-connection tasks from a previous connection.
+
+        Prevents leaked listen/watchdog tasks from accumulating across
+        reconnects.  Never cancels the task we are currently running in.
+        """
+        current = asyncio.current_task()
+        for task in (self._listen_task, self._stale_task):
+            if task is not None and not task.done() and task is not current:
+                task.cancel()
+
+    async def _do_connect(self) -> bool:
+        """Attempt one connection.  Returns True on success."""
         try:
             headers = self._sign_ws_request()
             self._ws = await self._session.ws_connect(
@@ -1967,6 +2092,7 @@ class KalshiWS:
                 await self._ws.send_json(fill_msg)
                 logging.info("[Kalshi-WS] Re-subscribed to fill channel.")
 
+            self._cancel_conn_tasks()
             self._listen_task = asyncio.create_task(self._listen_loop())
             self._stale_task = asyncio.create_task(self._stale_watchdog())
 
@@ -1976,11 +2102,12 @@ class KalshiWS:
             # Seed the watchdog timer so it doesn't spin if the WS
             # connects successfully but the first real message is delayed.
             self.last_update_time = time.time()
+            return True
 
         except Exception as exc:
             logging.error("[Kalshi-WS] Connection failed: %s", exc)
             self._connected = False
-            await self._schedule_reconnect()
+            return False
 
     async def _stale_watchdog(self) -> None:
         """Kill the WS if no data arrives within STALE_TIMEOUT_SECONDS."""
@@ -2069,6 +2196,8 @@ class KalshiWS:
         if msg_type == "orderbook_snapshot":
             inner = data.get("msg", {})
             ticker = inner.get("market_ticker", "")
+            if ticker not in self._ticker_to_event:
+                return  # market was removed (resolved) — discard
             if ticker not in self._books:
                 self._books[ticker] = {
                     "yes": _LocalOrderbook(),
@@ -2094,12 +2223,15 @@ class KalshiWS:
 
         elif msg_type == "fill":
             # Phase 3: Fill notification from the fill channel.
-            # Resolves any pending fill waiter for this order_id.
+            # Fills are ALWAYS accumulated, even when no waiter is
+            # registered yet — a fill can beat the REST response (and
+            # thus the register_fill_waiter call) over the wire.
+            # register_fill_waiter() resolves immediately from the
+            # buffered count in that case.
             inner = data.get("msg", {})
             order_id = inner.get("order_id", "")
             count = int(inner.get("count", 0))
-            if order_id and order_id in self._fill_waiters:
-                # Accumulate fill count (may receive multiple partial fills)
+            if order_id:
                 prev = self._fill_counts.get(order_id, 0)
                 self._fill_counts[order_id] = prev + count
                 logging.info(
@@ -2107,19 +2239,19 @@ class KalshiWS:
                     "(total filled=%d)",
                     order_id, count, self._fill_counts[order_id],
                 )
-                # Resolve the future with the accumulated fill data
                 fut = self._fill_waiters.get(order_id)
-                if fut and not fut.done():
+                if fut is not None and not fut.done():
                     fut.set_result({
                         "order_id": order_id,
                         "filled_count": self._fill_counts[order_id],
                         "last_fill": inner,
                     })
-            elif order_id:
-                logging.debug(
-                    "[Kalshi-WS] Fill for untracked order %s (count=%d)",
-                    order_id, count,
-                )
+                # Keep buffered counts bounded: drop oldest unclaimed
+                # entries (fills for orders that never registered).
+                if len(self._fill_counts) > 512:
+                    for stale in list(self._fill_counts)[:64]:
+                        if stale not in self._fill_waiters:
+                            self._fill_counts.pop(stale, None)
 
         elif msg_type == "error":
             logging.error(
@@ -2142,24 +2274,30 @@ class KalshiWS:
                 )
 
     async def _schedule_reconnect(self) -> None:
-        self._reconnect_attempts += 1
-        delay = min(
-            WS_RECONNECT_BASE * (2 ** (self._reconnect_attempts - 1)),
-            WS_RECONNECT_MAX,
-        )
-        logging.info(
-            "[Kalshi-WS] Reconnecting in %.1fs (attempt %d)…",
-            delay, self._reconnect_attempts,
-        )
-        # Phase 4: Discord notification on reconnect
-        if self._notifier is not None:
-            asyncio.ensure_future(
-                self._notifier.notify_reconnect(
-                    "Kalshi", self._reconnect_attempts,
-                )
+        """Retry connecting with exponential backoff until success.
+
+        Iterative (not recursive) — see PolymarketWS._schedule_reconnect.
+        """
+        while True:
+            self._reconnect_attempts += 1
+            delay = min(
+                WS_RECONNECT_BASE * (2 ** (self._reconnect_attempts - 1)),
+                WS_RECONNECT_MAX,
             )
-        await asyncio.sleep(delay)
-        await self._do_connect()
+            logging.info(
+                "[Kalshi-WS] Reconnecting in %.1fs (attempt %d)…",
+                delay, self._reconnect_attempts,
+            )
+            # Phase 4: Discord notification on reconnect
+            if self._notifier is not None:
+                asyncio.ensure_future(
+                    self._notifier.notify_reconnect(
+                        "Kalshi", self._reconnect_attempts,
+                    )
+                )
+            await asyncio.sleep(delay)
+            if await self._do_connect():
+                return
 
     async def subscribe(self, ticker: str, event_name: str) -> None:
         """Subscribe to orderbook updates for a ticker."""
@@ -2217,6 +2355,21 @@ class KalshiWS:
             len(self._subscribed_tickers),
         )
 
+    def remove_market(self, ticker: str) -> None:
+        """Stop tracking a resolved market.
+
+        Drops the local books and notification mapping so further WS
+        deltas are discarded without queueing, and a reconnect will not
+        re-subscribe the ticker.  (We don't track Kalshi subscription
+        sids, so no protocol-level unsubscribe is sent — stray messages
+        are simply ignored.)
+        """
+        self._ticker_to_event.pop(ticker, None)
+        self._books.pop(ticker, None)
+        if ticker in self._subscribed_tickers:
+            self._subscribed_tickers.remove(ticker)
+        logging.info("[Kalshi-WS] Removed resolved market %s", ticker)
+
     def register_fill_waiter(self, order_id: str) -> asyncio.Future:
         """Register a Future that resolves when fill(s) arrive for order_id.
 
@@ -2229,7 +2382,16 @@ class KalshiWS:
         loop = asyncio.get_running_loop()
         fut: asyncio.Future = loop.create_future()
         self._fill_waiters[order_id] = fut
-        self._fill_counts[order_id] = 0
+        # Do NOT reset the count — fills may already have arrived before
+        # registration (WS beats the REST response).  Resolve immediately
+        # from the buffered count in that case.
+        already_filled = self._fill_counts.setdefault(order_id, 0)
+        if already_filled > 0:
+            fut.set_result({
+                "order_id": order_id,
+                "filled_count": already_filled,
+                "last_fill": {},
+            })
         return fut
 
     def cancel_fill_waiter(self, order_id: str) -> None:
@@ -2298,6 +2460,8 @@ class KalshiWS:
             self._listen_task.cancel()
         if self._stale_task:
             self._stale_task.cancel()
+        if self._reconnect_task:
+            self._reconnect_task.cancel()
         if self._ws and not self._ws.closed:
             await self._ws.close()
         if self._session and not self._session.closed:
@@ -2954,6 +3118,19 @@ class RiskManager:
 
         return None
 
+    def exposure_headroom(self) -> Decimal:
+        """Dollar headroom before MAX_TOTAL_EXPOSURE is reached.
+
+        Used by ExecutionEngine for the precise post-sizing check:
+        planned outlay + in-flight reservations must fit inside this,
+        otherwise a single new trade could blow through the cap that
+        check() only enforces against already-open positions.
+        """
+        current_exposure = sum(
+            (p.total_outlay for p in self._portfolio.open_positions), ZERO,
+        )
+        return self._max_exposure - current_exposure
+
 
 # ====================================================================
 # UnwindLogger — CSV logger for unwind lifecycle
@@ -3066,6 +3243,10 @@ class UnwindManager:
         self._active: dict[str, UnwindOrder] = {}
         # Completed unwind orders (capped for memory)
         self._completed: list[UnwindOrder] = []
+        # Orphaned exposure: unwind sells that failed or only partially
+        # filled.  StuckPositionMonitor retries these every cycle until
+        # the exposure is flat.  unwind_id -> details dict.
+        self._orphans: dict[str, dict] = {}
         # Notification callback for Discord (Phase 4 stub)
         self._notify_callback: Optional[object] = None
         # Phase 3: Live execution infrastructure
@@ -3152,6 +3333,18 @@ class UnwindManager:
         )
         self._active[uw.unwind_id] = uw
 
+        # Hold the per-order lock for the whole execution so
+        # StuckPositionMonitor.force_unwind() cannot act on this order
+        # concurrently.  Every await inside is timeout-bounded, so the
+        # monitor's wait is bounded too.
+        async with uw.lock:
+            return await self._execute_locked(uw, opp, desired_contracts)
+
+    async def _execute_locked(
+        self, uw: UnwindOrder, opp: ArbOpportunity, desired_contracts: int,
+    ) -> UnwindOrder:
+        leg1, leg2 = uw.leg1, uw.leg2
+
         try:
             # ── Step 1: Submit Leg 1 (Polymarket FOK — less reliable) ──
             uw.status = UnwindStatus.LEG1_SUBMITTED
@@ -3200,7 +3393,7 @@ class UnwindManager:
             # the spread still holds before committing Leg 2.
             if self._live_mode and self._fetcher is not None:
                 kalshi_snap = await self._fetcher.fetch_kalshi(
-                    leg2.market_id,
+                    leg2.market_id, priority=True,
                 )
                 if kalshi_snap is not None:
                     # Pick the correct side's best ask
@@ -3285,6 +3478,7 @@ class UnwindManager:
                 f"[Unwind {uw.unwind_id}] COMPLETE: {uw.total_contracts} "
                 f"contracts [{uw.event_name}] {uw.direction} — "
                 f"expected net ${uw.net_profit_per_contract.quantize(Q4)}/c",
+                uw=uw,
             )
             await self._finish(uw)
             return uw
@@ -3329,6 +3523,105 @@ class UnwindManager:
 
     # ── Unwind helpers ────────────────────────────────────────────
 
+    async def _record_unwind_loss_for(
+        self,
+        event_name: str,
+        direction: str,
+        platform: str,
+        buy_price: Decimal,
+        sell_price: Decimal,
+        contracts: int,
+    ) -> Decimal:
+        """Compute and book the realized loss for *contracts* sold back.
+
+        Loss = Leg 1 fee + unwind fee + slippage, using the fee formula
+        of the platform the position is on.  Feeds the portfolio and the
+        daily-loss circuit breaker.  Returns the loss amount.
+        """
+        fee_fn = (
+            poly_taker_fee if platform == "polymarket" else kalshi_taker_fee
+        )
+        leg1_fee = fee_fn(buy_price, contracts)
+        unwind_fee = fee_fn(sell_price, contracts)
+        slippage = ((buy_price - sell_price) * D(contracts)).quantize(Q4)
+        loss = (leg1_fee + unwind_fee + slippage).quantize(Q4)
+
+        await self._portfolio.record_unwind_loss(
+            event_name=event_name,
+            direction=direction,
+            contracts=contracts,
+            loss_amount=loss,
+        )
+        # Feed negative P&L to circuit breaker (loss is negative)
+        self._pnl_tracker.record(-loss, 1)
+        return loss
+
+    def _register_orphan(
+        self, uw: UnwindOrder, leg1: LegOrder, contracts: int,
+    ) -> None:
+        """Register un-unwound exposure for retry by StuckPositionMonitor.
+
+        Previously a failed or partially-filled unwind sell was logged
+        with 'MANUAL INTERVENTION NEEDED' and then dropped from _active,
+        so nothing ever retried it.  The orphan registry keeps the
+        exposure visible and retry_orphaned_unwinds() keeps selling
+        until flat.
+        """
+        self._orphans[uw.unwind_id] = {
+            "event_name": uw.event_name,
+            "direction": uw.direction,
+            "platform": leg1.platform,
+            "side": leg1.side,
+            "market_id": leg1.market_id,
+            "buy_price": leg1.price,
+            "contracts": contracts,
+            "attempts": 0,
+        }
+        logging.error(
+            "  [Unwind %s] ORPHANED EXPOSURE: %d contracts %s/%s on %s — "
+            "will retry every monitor cycle.",
+            uw.unwind_id, contracts, leg1.side, leg1.market_id,
+            leg1.platform,
+        )
+
+    async def retry_orphaned_unwinds(self) -> None:
+        """Retry selling orphaned exposure.  Called by StuckPositionMonitor."""
+        for oid, info in list(self._orphans.items()):
+            info["attempts"] += 1
+            sell = LegOrder(
+                leg_id=str(uuid.uuid4())[:8],
+                platform=info["platform"],
+                side=info["side"],
+                price=info["buy_price"],
+                contracts=info["contracts"],
+                market_id=info["market_id"],
+            )
+            logging.warning(
+                "[Unwind] Retrying orphaned unwind %s (attempt %d): "
+                "%d contracts on %s",
+                oid, info["attempts"], info["contracts"], info["platform"],
+            )
+            ok = await self._submit_unwind(sell)
+            sold = sell.filled_contracts
+            if sold > 0:
+                await self._record_unwind_loss_for(
+                    info["event_name"], info["direction"], info["platform"],
+                    info["buy_price"], sell.price, sold,
+                )
+            if ok or sold >= info["contracts"]:
+                self._orphans.pop(oid, None)
+                logging.warning(
+                    "[Unwind] Orphaned exposure %s flattened after "
+                    "%d attempt(s).",
+                    oid, info["attempts"],
+                )
+            elif sold > 0:
+                info["contracts"] -= sold
+
+    @property
+    def orphan_count(self) -> int:
+        return len(self._orphans)
+
     async def _unwind(self, uw: UnwindOrder) -> None:
         """Sell Leg 1 at market to fully unwind the position."""
         uw.status = UnwindStatus.UNWINDING
@@ -3367,61 +3660,46 @@ class UnwindManager:
         )
 
         ok = await self._submit_unwind(unwind_sell)
+        sold = unwind_sell.filled_contracts
+
+        # Book the realized loss for whatever actually sold, even on a
+        # partial fill (previously partial sells were never accounted).
+        if sold > 0:
+            unwind_loss = await self._record_unwind_loss_for(
+                uw.event_name, uw.direction, leg1.platform,
+                leg1.price, unwind_sell.price, sold,
+            )
+            logging.info(
+                "  [Unwind %s] Sold %d/%d contracts — loss $%s",
+                uw.unwind_id, sold, contracts_to_unwind,
+                unwind_loss.quantize(Q4),
+            )
+            # Stash loss on the UnwindOrder for ExecutionEngine to read
+            existing = getattr(uw, "_unwind_loss", ZERO)
+            uw._unwind_loss = existing + unwind_loss
+
         if ok:
             uw.status = UnwindStatus.UNWOUND
-
-            # ── Calculate realized unwind loss ──
-            # Loss = Leg1 fees + Unwind fees + Slippage
-            #   Leg 1 fee: Kalshi taker fee on the original buy
-            #   Unwind fee: Kalshi taker fee on the sell-back
-            #   Slippage: (buy_price - sell_price) * contracts
-            #     (zero in paper mode; non-zero in production)
-            # Use the correct fee function for the platform Leg 1 is on
-            _fee_fn = (
-                poly_taker_fee if leg1.platform == "polymarket"
-                else kalshi_taker_fee
-            )
-            leg1_fee = _fee_fn(leg1.price, contracts_to_unwind)
-            unwind_fee = _fee_fn(unwind_sell.price, contracts_to_unwind)
-            slippage = (
-                (leg1.price - unwind_sell.price)
-                * D(contracts_to_unwind)
-            ).quantize(Q4)
-            unwind_loss = (leg1_fee + unwind_fee + slippage).quantize(Q4)
-
-            logging.info(
-                "  [Unwind %s] UNWOUND: sold %d contracts — "
-                "loss $%s (fees $%s + $%s, slippage $%s)",
-                uw.unwind_id, unwind_sell.filled_contracts,
-                unwind_loss.quantize(Q4),
-                leg1_fee.quantize(Q4), unwind_fee.quantize(Q4),
-                slippage.quantize(Q4),
-            )
-
-            # Record loss in portfolio and circuit breaker
-            await self._portfolio.record_unwind_loss(
-                event_name=uw.event_name,
-                direction=uw.direction,
-                contracts=contracts_to_unwind,
-                loss_amount=unwind_loss,
-            )
-            # Feed negative P&L to circuit breaker (loss is negative)
-            self._pnl_tracker.record(-unwind_loss, 1)
-
-            # Stash loss on the UnwindOrder for ExecutionEngine to read
-            uw._unwind_loss = unwind_loss
         else:
+            remaining = contracts_to_unwind - sold
+            if remaining > 0:
+                self._register_orphan(uw, leg1, remaining)
             uw.status = UnwindStatus.FAILED
-            uw.error_message += " | Unwind sell also failed!"
+            uw.error_message += (
+                f" | Unwind sell incomplete ({sold}/{contracts_to_unwind} "
+                "sold) — remainder registered for automatic retry."
+            )
             logging.error(
-                "  [Unwind %s] UNWIND FAILED — MANUAL INTERVENTION NEEDED",
-                uw.unwind_id,
+                "  [Unwind %s] UNWIND INCOMPLETE — %d contracts still "
+                "exposed, retrying via StuckPositionMonitor.",
+                uw.unwind_id, remaining,
             )
 
         self._notify(
             f"[Unwind {uw.unwind_id}] {uw.status.value}: "
             f"{uw.event_name} — {uw.error_message}",
             level="warning",
+            uw=uw,
         )
         await self._finish(uw)
 
@@ -3447,44 +3725,33 @@ class UnwindManager:
         )
 
         ok = await self._submit_unwind(unwind_sell)
-        if ok:
-            # Calculate realized loss on the partial unwind
-            # Use the correct fee function for the platform Leg 1 is on
-            _fee_fn = (
-                poly_taker_fee if leg1.platform == "polymarket"
-                else kalshi_taker_fee
-            )
-            leg1_fee = _fee_fn(leg1.price, excess)
-            unwind_fee = _fee_fn(unwind_sell.price, excess)
-            slippage = (
-                (leg1.price - unwind_sell.price) * D(excess)
-            ).quantize(Q4)
-            partial_loss = (leg1_fee + unwind_fee + slippage).quantize(Q4)
+        sold = unwind_sell.filled_contracts
 
+        if sold > 0:
+            partial_loss = await self._record_unwind_loss_for(
+                uw.event_name, uw.direction, leg1.platform,
+                leg1.price, unwind_sell.price, sold,
+            )
             logging.info(
-                "  [Unwind %s] Partial unwind OK: sold %d — "
-                "loss $%s (fees $%s + $%s, slippage $%s)",
-                uw.unwind_id, excess,
-                partial_loss.quantize(Q4),
-                leg1_fee.quantize(Q4), unwind_fee.quantize(Q4),
-                slippage.quantize(Q4),
+                "  [Unwind %s] Partial unwind: sold %d/%d — loss $%s",
+                uw.unwind_id, sold, excess, partial_loss.quantize(Q4),
             )
-
-            await self._portfolio.record_unwind_loss(
-                event_name=uw.event_name,
-                direction=uw.direction,
-                contracts=excess,
-                loss_amount=partial_loss,
-            )
-            self._pnl_tracker.record(-partial_loss, 1)
-
             # Accumulate on the UnwindOrder for ExecutionEngine
             existing = getattr(uw, '_unwind_loss', ZERO)
             uw._unwind_loss = existing + partial_loss
-        else:
-            uw.error_message += f" | Partial unwind of {excess} contracts failed!"
+
+        if not ok:
+            remaining = excess - sold
+            if remaining > 0:
+                self._register_orphan(uw, leg1, remaining)
+            uw.error_message += (
+                f" | Partial unwind incomplete ({sold}/{excess} sold) — "
+                "remainder registered for automatic retry."
+            )
             logging.error(
-                "  [Unwind %s] Partial unwind FAILED", uw.unwind_id,
+                "  [Unwind %s] Partial unwind incomplete — %d contracts "
+                "registered for retry.",
+                uw.unwind_id, remaining,
             )
 
     # ── Leg submission (paper + live modes) ─────────────────────
@@ -3517,12 +3784,12 @@ class UnwindManager:
         """Kalshi IOC buy order with WS fill tracking.
 
         Flow:
-          1. Register fill waiter on KalshiWS (if available).
-          2. POST IOC limit order via KalshiOrderClient.
-          3. Check REST response for immediate fill status.
-          4. If REST shows full fill → done.
-          5. If partial or ambiguous → await WS fill waiter with timeout.
-          6. If timeout → check order status via REST poll.
+          1. POST IOC limit order via KalshiOrderClient.
+          2. Check REST response for immediate fill status.
+          3. If REST shows full/partial fill → done.
+          4. If ambiguous → await WS fill waiter with timeout (fills
+             that arrived before registration are buffered by KalshiWS).
+          5. If timeout → check order status via REST poll.
 
         IOC on Kalshi executes immediately and cancels the remainder,
         so the REST response typically contains the final state.
@@ -3542,13 +3809,7 @@ class UnwindManager:
         # Convert Decimal price to cents (Kalshi uses integer cents)
         price_cents = int((leg.price * HUNDRED).quantize(D("1")))
 
-        # Step 1: Register WS fill waiter (if WS available)
-        fill_waiter: Optional[asyncio.Future] = None
-        if self._kalshi_ws is not None and self._kalshi_ws._fills_subscribed:
-            # We don't have the order_id yet, so we'll register after POST.
-            pass
-
-        # Step 2: Submit the IOC order
+        # Step 1: Submit the IOC order
         # Use a client_order_id so we can reconcile on timeout.
         client_order_id = str(uuid.uuid4())
         result = await self._kalshi_client.place_order(
@@ -3601,7 +3862,7 @@ class UnwindManager:
             order_id, status, filled, leg.contracts, remaining,
         )
 
-        # Step 3: Check if IOC already completed (typical case)
+        # Step 2/3: Check if IOC already completed (typical case)
         if remaining == 0 or status in ("executed", "filled"):
             leg.status = LegStatus.FILLED
             leg.filled_contracts = leg.contracts
@@ -3610,7 +3871,7 @@ class UnwindManager:
 
         if filled > 0:
             # Partial fill — IOC cancelled the rest
-            leg.status = LegStatus.PARTIAL if status != "canceled" else LegStatus.FILLED
+            leg.status = LegStatus.PARTIAL
             leg.filled_contracts = filled
             leg.filled_at = _utc_iso()
             logging.info(
@@ -3795,6 +4056,24 @@ class UnwindManager:
                     return True
                 if poll_status in ("unmatched", "canceled", "cancelled"):
                     break
+            else:
+                # Poll window exhausted with the order still pending.
+                # Cancel it so it can't match AFTER we report failure
+                # (which would leave an untracked one-legged position),
+                # then check one last time in case it matched while the
+                # cancel was in flight.
+                logging.warning(
+                    "[Unwind] Poly FOK still delayed after %ds — "
+                    "cancelling order %s.",
+                    self._timeout, order_id,
+                )
+                await self._poly_client.cancel_order(order_id)
+                final = await self._poly_client.get_order(order_id)
+                if str(final.get("status", "")).lower() == "matched":
+                    leg.status = LegStatus.FILLED
+                    leg.filled_contracts = leg.contracts
+                    leg.filled_at = _utc_iso()
+                    return True
 
         # FOK was killed (unmatched) or timed out
         leg.status = LegStatus.FAILED
@@ -3880,9 +4159,15 @@ class UnwindManager:
             leg.filled_contracts = filled
             leg.filled_at = _utc_iso()
 
-            # Update the sell price to the actual execution price
-            # (for slippage calculation)
-            actual_price_cents = result.get("yes_price") or result.get("no_price")
+            # Update the sell price for slippage calculation.  Kalshi's
+            # order object carries BOTH yes_price and no_price (they are
+            # complements), so we must select by the side we traded —
+            # `yes_price or no_price` picked the wrong (complementary)
+            # price for NO-side sells, recording phantom gains.  This is
+            # the order's limit price, not the average fill price, so
+            # the recorded loss is a conservative upper bound.
+            price_key = "yes_price" if leg.side == "yes" else "no_price"
+            actual_price_cents = result.get(price_key)
             if actual_price_cents is not None:
                 leg.price = D(str(actual_price_cents)) / HUNDRED
 
@@ -3898,24 +4183,32 @@ class UnwindManager:
         return False
 
     async def _fetch_poly_bid_depth(
-        self, token_id: str,
+        self, token_id: str, min_price: Decimal = ZERO,
     ) -> tuple[int, list[dict]]:
-        """Fetch Polymarket orderbook and return (total_bid_qty, bid_levels).
+        """Fetch Polymarket orderbook and return (fillable_bid_qty, levels).
 
         Uses MarketFetcher._fetch_poly_book() for a fresh REST snapshot.
+        Only bids priced >= *min_price* are counted — a FOK sell at the
+        slippage floor cannot fill against bids below the floor, so
+        counting them would size the FOK too large and guarantee a kill
+        in exactly the thin-book scenario this sizing exists for.
         Returns (0, []) if the book is unavailable.
         """
         if self._fetcher is None:
             return 0, []
-        book = await self._fetcher._fetch_poly_book(token_id)
+        book, _ = await self._fetcher._fetch_poly_book(token_id)
         if book is None:
             return 0, []
         bids = book.get("bids", []) or book.get("buys", [])
-        if not bids:
+        eligible = [
+            lvl for lvl in bids
+            if D(str(lvl.get("price", 0))) >= min_price
+        ]
+        if not eligible:
             return 0, []
         # Sort bids descending by price so we consume best prices first
         sorted_bids = sorted(
-            bids, key=lambda lvl: D(str(lvl.get("price", 0))), reverse=True,
+            eligible, key=lambda lvl: D(str(lvl.get("price", 0))), reverse=True,
         )
         total_qty = sum(int(D(str(lvl.get("size", 0)))) for lvl in sorted_bids)
         return total_qty, sorted_bids
@@ -3945,44 +4238,50 @@ class UnwindManager:
             leg.status = LegStatus.FAILED
             return False
 
-        # ── Step 1-3: Fetch book and determine available depth ──
+        # Slippage-protected floor — computed BEFORE the depth check so
+        # sizing only counts bids the FOK can actually fill against.
+        floor_price = max(
+            leg.price * UNWIND_MIN_PRICE_RATIO,
+            UNWIND_ABSOLUTE_MIN_PRICE,
+        ).quantize(Q4)
+
+        # ── Step 1-3: Fetch book and determine fillable depth ──
         max_book_retries = 3
         total_bids = 0
         for attempt in range(max_book_retries):
-            total_bids, _ = await self._fetch_poly_bid_depth(token_id)
+            total_bids, _ = await self._fetch_poly_bid_depth(
+                token_id, min_price=floor_price,
+            )
             if total_bids > 0:
                 break
             if attempt < max_book_retries - 1:
                 logging.warning(
-                    "[Unwind] Poly sell: no bids on book (attempt %d/%d), "
-                    "retrying in 0.5s…",
-                    attempt + 1, max_book_retries,
+                    "[Unwind] Poly sell: no bids >= floor $%s on book "
+                    "(attempt %d/%d), retrying in 0.5s…",
+                    floor_price, attempt + 1, max_book_retries,
                 )
                 await asyncio.sleep(0.5)
 
         if total_bids == 0:
             logging.error(
-                "[Unwind] Poly sell: no bids after %d retries — cannot unwind.",
+                "[Unwind] Poly sell: no fillable bids after %d retries — "
+                "cannot unwind.",
                 max_book_retries,
             )
             leg.status = LegStatus.FAILED
             leg.filled_contracts = 0
             return False
 
-        # Cap FOK size to available depth
+        # Cap FOK size to fillable depth at/above the floor
         unwind_size = min(leg.contracts, total_bids)
         if unwind_size < leg.contracts:
             logging.warning(
                 "[Unwind] Poly sell: capping FOK to %d/%d contracts "
-                "(book depth = %d).",
+                "(fillable depth = %d).",
                 unwind_size, leg.contracts, total_bids,
             )
 
         # ── Step 4: Send FOK at slippage-protected price ──
-        floor_price = max(
-            leg.price * UNWIND_MIN_PRICE_RATIO,
-            UNWIND_ABSOLUTE_MIN_PRICE,
-        ).quantize(Q4)
         sell_price = float(floor_price)
         logging.info(
             "[Unwind] Poly sell: buy_price=$%s → floor=$%.4f",
@@ -4061,17 +4360,41 @@ class UnwindManager:
         return stuck
 
     async def force_unwind(self, uw: UnwindOrder) -> None:
-        """Force-unwind a stuck position.  Called by StuckPositionMonitor."""
-        logging.warning(
-            "  [Unwind %s] FORCE UNWIND triggered by StuckPositionMonitor",
-            uw.unwind_id,
-        )
-        self._notify(
-            f"[StuckMonitor] Force-unwinding {uw.unwind_id} "
-            f"[{uw.event_name}] — stuck in {uw.status.value}",
-            level="warning",
-        )
-        await self._unwind(uw)
+        """Force-unwind a stuck position.  Called by StuckPositionMonitor.
+
+        Acquires the order's lock first: if execute() is still running
+        (all its awaits are timeout-bounded), we wait for it to finish
+        and then re-check — it may have resolved the order itself, in
+        which case there is nothing to do.  This closes the race where
+        the monitor sold Leg 1 while execute() was still awaiting Leg 2.
+        """
+        async with uw.lock:
+            still_stuck = (
+                uw.unwind_id in self._active
+                and uw.status in (
+                    UnwindStatus.LEG1_SUBMITTED,
+                    UnwindStatus.LEG1_FILLED,
+                    UnwindStatus.LEG2_SUBMITTED,
+                )
+            )
+            if not still_stuck:
+                logging.info(
+                    "  [Unwind %s] Stuck order resolved itself (%s) — "
+                    "skipping force unwind.",
+                    uw.unwind_id, uw.status.value,
+                )
+                return
+            logging.warning(
+                "  [Unwind %s] FORCE UNWIND triggered by StuckPositionMonitor",
+                uw.unwind_id,
+            )
+            self._notify(
+                f"[StuckMonitor] Force-unwinding {uw.unwind_id} "
+                f"[{uw.event_name}] — stuck in {uw.status.value}",
+                level="warning",
+                uw=uw,
+            )
+            await self._unwind(uw)
 
     # ── Lifecycle management ──────────────────────────────────────
 
@@ -4085,26 +4408,26 @@ class UnwindManager:
             self._completed = self._completed[-MAX_ORDERS_IN_MEMORY:]
         await self._logger.log(uw)
 
-    def _notify(self, message: str, level: str = "info") -> None:
+    def _notify(
+        self,
+        message: str,
+        level: str = "info",
+        uw: Optional[UnwindOrder] = None,
+    ) -> None:
         """Fire Discord alert via DiscordNotifier (Phase 4).
 
-        Also logs the message at the appropriate level.
+        Also logs the message at the appropriate level.  The order being
+        notified about is passed explicitly — the old lookup via
+        self._completed[-1] ran before _finish() appended the current
+        order, so every alert described the PREVIOUS unwind.
         Errors in notification delivery are silently caught to avoid
         disrupting trade execution.
         """
         log_level = getattr(logging, level.upper(), logging.INFO)
         logging.log(log_level, message)
-        if self._notify_callback is not None:
+        if self._notify_callback is not None and uw is not None:
             try:
-                asyncio.ensure_future(
-                    self._notify_callback.notify_unwind(
-                        # Find the most recent active/completed order to send
-                        self._completed[-1] if self._completed else UnwindOrder(
-                            unwind_id="unknown", event_name="unknown",
-                            direction="unknown", error_message=message,
-                        )
-                    )
-                )
+                asyncio.ensure_future(self._notify_callback.notify_unwind(uw))
             except Exception:
                 pass  # never disrupt execution for notification failures
 
@@ -4199,11 +4522,11 @@ class DiscordNotifier:
 
         # Rate limit
         async with self._lock:
-            now = asyncio.get_event_loop().time()
-            wait = self._last_post + self._min_interval - now
+            loop = asyncio.get_running_loop()
+            wait = self._last_post + self._min_interval - loop.time()
             if wait > 0:
                 await asyncio.sleep(wait)
-            self._last_post = asyncio.get_event_loop().time()
+            self._last_post = loop.time()
 
         embed: dict = {
             "title": title[:256],  # Discord limit
@@ -4369,20 +4692,29 @@ async def _daily_summary_task(
     unwind_mgr: "UnwindManager",
     stop_event: asyncio.Event,
 ) -> None:
-    """Background task: sends a daily summary at midnight UTC."""
+    """Background task: sends a daily summary just BEFORE midnight UTC.
+
+    Firing before midnight matters: DailyPnLTracker resets itself on
+    the first access after the UTC day changes, so a summary sent
+    after midnight would always report $0.00.
+    """
     while not stop_event.is_set():
-        # Calculate seconds until next midnight UTC
+        # Fire 5 seconds before the next midnight UTC
         now = datetime.now(timezone.utc)
-        tomorrow = (now + timedelta(days=1)).replace(
-            hour=0, minute=0, second=5, microsecond=0,
+        next_midnight = (now + timedelta(days=1)).replace(
+            hour=0, minute=0, second=0, microsecond=0,
         )
-        wait_seconds = (tomorrow - now).total_seconds()
+        fire_at = next_midnight - timedelta(seconds=5)
+        if fire_at <= now:
+            # Within the final 5s of the day — target the following day
+            fire_at += timedelta(days=1)
+        wait_seconds = (fire_at - now).total_seconds()
 
         try:
             await asyncio.wait_for(stop_event.wait(), timeout=wait_seconds)
             return  # stop_event was set
         except asyncio.TimeoutError:
-            pass  # midnight — time to send
+            pass  # time to send
 
         try:
             await notifier.send_daily_summary(
@@ -4448,6 +4780,15 @@ class StuckPositionMonitor:
                         uw.unwind_id, exc, exc_info=True,
                     )
 
+            # Retry any orphaned exposure from failed/partial unwind sells
+            try:
+                await self._manager.retry_orphaned_unwinds()
+            except Exception as exc:
+                logging.error(
+                    "[StuckMonitor] Orphan retry failed: %s", exc,
+                    exc_info=True,
+                )
+
 
 # ====================================================================
 # ExecutionEngine — EXECUTION: OMS + Fill-or-Kill validation
@@ -4507,6 +4848,11 @@ class ExecutionEngine:
         # WS ticks on the same event (prevents the TOCTOU race between
         # the `if key in self._traded` check and `self._traded.add(key)`).
         self._event_locks: dict[tuple[str, str], asyncio.Lock] = {}
+        # Capital reserved by in-flight submissions.  Capital is only
+        # deducted from the portfolio once BOTH legs fill, so without
+        # this, concurrent submits on different events could each pass
+        # the capital/exposure checks and collectively over-commit.
+        self._reserved: Decimal = ZERO
 
     async def submit(self, opp: ArbOpportunity) -> Optional[Order]:
         """
@@ -4564,13 +4910,37 @@ class ExecutionEngine:
             )
             return None
 
-        # 4. Compute desired contracts from capital and position size
+        # 4. Size the trade from capital, position size, and book depth.
+        #    Capital already reserved by other in-flight submissions is
+        #    excluded — the portfolio only deducts once both legs fill.
         cost_plus_fees = opp.total_cost + opp.kalshi_fee + opp.poly_fee
         if cost_plus_fees <= ZERO:
             return None
 
-        available = min(self._portfolio.position_size, self._portfolio.capital)
+        available = min(
+            self._portfolio.position_size,
+            self._portfolio.capital - self._reserved,
+        )
+        if available <= ZERO:
+            logging.debug(
+                "[Exec] Skipped [%s] %s — no unreserved capital",
+                opp.event_name, opp.direction,
+            )
+            return None
         desired = int(available / cost_plus_fees)
+
+        # 5. Size down to fillable depth (min of both books at best ask)
+        #    rather than rejecting outright — a 9-deep book against a
+        #    10-contract budget is still a profitable 9-contract trade.
+        #    Both legs are still all-or-nothing at the sized quantity.
+        if opp.max_contracts < 1:
+            logging.debug(
+                "[Exec] Skipped [%s] %s — no depth (K=%d P=%d)",
+                opp.event_name, opp.direction,
+                opp.kalshi_depth, opp.poly_depth,
+            )
+            return None
+        desired = min(desired, opp.max_contracts)
         if desired < 1:
             logging.debug(
                 "[Exec] Skipped [%s] %s — insufficient capital for 1 contract",
@@ -4578,21 +4948,58 @@ class ExecutionEngine:
             )
             return None
 
-        # 5. Fill or Kill depth check
-        k_short = opp.kalshi_depth < desired
-        p_short = opp.poly_depth < desired
-        if k_short or p_short:
-            reason = (
-                "both" if (k_short and p_short)
-                else ("kalshi" if k_short else "poly")
-            )
-            logging.debug(
-                "[Exec] Skipped [%s] %s — FOK depth %s "
-                "(wanted %d, K=%d P=%d)",
-                opp.event_name, opp.direction, reason,
-                desired, opp.kalshi_depth, opp.poly_depth,
-            )
+        # Exact order-level cost: exchanges round fees once per ORDER,
+        # not per contract, so ceil(per-contract fee) × N systematically
+        # overstates fees (worst at extreme prices).  The fee functions
+        # already take a contract count — use them.
+        def _order_outlay(contracts: int) -> Decimal:
+            return (
+                opp.total_cost * D(contracts)
+                + kalshi_taker_fee(opp.kalshi_price, contracts)
+                + poly_taker_fee(opp.poly_price, contracts)
+            ).quantize(Q4)
+
+        # Safety net: the per-contract estimate above is always >= the
+        # exact order cost, so this loop should never fire — but never
+        # commit more than `available`.
+        while desired >= 1 and _order_outlay(desired) > available:
+            desired -= 1
+        if desired < 1:
             return None
+
+        planned_outlay = _order_outlay(desired)
+
+        # 6. Precise exposure check: planned outlay plus all in-flight
+        #    reservations must fit under MAX_TOTAL_EXPOSURE.  The cheap
+        #    pre-check in RiskManager.check() only sees open positions.
+        if self._risk_manager is not None:
+            headroom = self._risk_manager.exposure_headroom()
+            if planned_outlay + self._reserved > headroom:
+                logging.debug(
+                    "[Exec] Skipped [%s] %s — would exceed exposure cap "
+                    "(planned $%s + reserved $%s > headroom $%s)",
+                    opp.event_name, opp.direction,
+                    planned_outlay, self._reserved, headroom,
+                )
+                return None
+
+        # Reserve capital for this in-flight order (released on exit).
+        self._reserved += planned_outlay
+        try:
+            return await self._execute_gated(
+                opp, key, desired, _order_outlay,
+            )
+        finally:
+            self._reserved -= planned_outlay
+
+    async def _execute_gated(
+        self,
+        opp: ArbOpportunity,
+        key: tuple[str, str],
+        desired: int,
+        order_outlay,
+    ) -> Optional[Order]:
+        """Post-filter gate + execution.  Runs with capital reserved."""
 
         # ── POST-TRADE GATE ──
         # All silent checks passed.  Now consume a rate-limit slot.
@@ -4646,7 +5053,7 @@ class ExecutionEngine:
 
                 # Both legs filled — use actual filled quantity
                 actual = uw_order.total_contracts
-                total_outlay = (D(actual) * cost_plus_fees).quantize(Q4)
+                total_outlay = order_outlay(actual)
                 order.filled_contracts = actual
                 order.total_outlay = total_outlay
                 order.status = OrderStatus.FILLED
@@ -4663,10 +5070,15 @@ class ExecutionEngine:
                 await self._portfolio.open_position(pos)
 
                 if self._risk_manager is not None:
-                    self._risk_manager.pnl_tracker.record(opp.net_profit, actual)
+                    # Use the (possibly re-verified) net from the unwind
+                    # manager — after a Leg 2 price refresh, opp.net_profit
+                    # is stale.
+                    self._risk_manager.pnl_tracker.record(
+                        uw_order.net_profit_per_contract, actual,
+                    )
             else:
                 # Legacy path (no unwind manager) — instant paper fill
-                total_outlay = (D(desired) * cost_plus_fees).quantize(Q4)
+                total_outlay = order_outlay(desired)
                 order.filled_contracts = desired
                 order.total_outlay = total_outlay
                 order.status = OrderStatus.FILLED
@@ -4948,12 +5360,15 @@ async def _resolution_checker(
     fetcher: MarketFetcher,
     portfolio: PaperPortfolio,
     stop_event: asyncio.Event,
+    kalshi_ws: Optional[KalshiWS] = None,
+    poly_ws: Optional[PolymarketWS] = None,
 ) -> None:
     """Periodically check if any active markets have resolved.
 
     Runs every RESOLUTION_CHECK_INTERVAL seconds.  When a market
-    resolves, closes open positions and removes the event from
-    the active list.
+    resolves, closes open positions, removes the event from the
+    active list, and drops it from both WS trackers so dead markets
+    stop generating ticks and queue entries.
     """
     while not stop_event.is_set():
         try:
@@ -4981,6 +5396,10 @@ async def _resolution_checker(
         for ev in to_remove:
             active_events.remove(ev)
             name_to_event.pop(ev["name"], None)
+            if kalshi_ws is not None:
+                kalshi_ws.remove_market(ev["kalshi_ticker"])
+            if poly_ws is not None:
+                poly_ws.remove_market(ev["poly_condition_id"])
             logging.info("Removed resolved event: %s", ev["name"])
 
         if not active_events:
@@ -5015,72 +5434,109 @@ async def _process_updates(
         # Wait for an update from a WS callback.
         # Timeout so we can check stop_event periodically.
         try:
-            event_name = await asyncio.wait_for(queue.get(), timeout=5.0)
+            first = await asyncio.wait_for(queue.get(), timeout=5.0)
         except asyncio.TimeoutError:
             continue
 
-        # Look up the event config
-        event_cfg = name_to_event.get(event_name)
-        if event_cfg is None or event_cfg not in active_events:
-            continue
+        # Coalesce the burst: drain everything already queued and dedupe.
+        # A hot market can push hundreds of ticks per second; snapshots
+        # are read live from the WS books, so processing each unique
+        # event once per burst always sees the LATEST data instead of
+        # replaying a backlog of stale ticks.
+        pending: set[str] = {first}
+        while True:
+            try:
+                pending.add(queue.get_nowait())
+            except asyncio.QueueEmpty:
+                break
 
-        ticker = event_cfg["kalshi_ticker"]
-        cond_id = event_cfg["poly_condition_id"]
-
-        try:
-            # ── Get snapshots (WS only — no REST fallback) ──
-            loop = asyncio.get_running_loop()
-            t0 = loop.time()
-
-            kalshi_snap: Optional[MarketSnapshot] = None
-            if kalshi_ws:
-                kalshi_snap = kalshi_ws.get_snapshot(ticker)
-
-            poly_snap: Optional[MarketSnapshot] = None
-            if poly_ws:
-                poly_snap = poly_ws.get_snapshot(cond_id)
-
-            fetch_ms = int((loop.time() - t0) * 1000)
-
-            if kalshi_snap is None or poly_snap is None:
-                continue
-
-            # ── Log top-of-book for this update ──
-            logging.debug(
-                "[%s] K(WS) Yes=%s No=%s | P(WS) Yes=%s No=%s [%dms]",
-                event_name,
-                _fmt_price(kalshi_snap.yes.best_ask),
-                _fmt_price(kalshi_snap.no.best_ask),
-                _fmt_price(poly_snap.yes.best_ask),
-                _fmt_price(poly_snap.no.best_ask),
-                fetch_ms,
+        for event_name in pending:
+            if stop_event.is_set():
+                break
+            total_opps += _check_event(
+                event_name, active_events, name_to_event,
+                kalshi_ws, poly_ws, engine, execution, notifier,
             )
-
-            # ── Check for arbitrage ──
-            opps = engine.check(event_name, kalshi_snap, poly_snap, fetch_ms)
-
-            if opps:
-                for opp in opps:
-                    # Phase 3: Attach market identifiers for live execution
-                    opp.kalshi_ticker = ticker
-                    opp.poly_condition_id = cond_id
-                    total_opps += 1
-                    asyncio.create_task(execution.submit(opp))
-
-        except Exception as exc:
-            logging.error(
-                "Error processing update for %s: %s", event_name, exc,
-                exc_info=True,
-            )
-            # Phase 4: Discord notification for error-level messages
-            if notifier is not None:
-                asyncio.ensure_future(
-                    notifier.notify_error(
-                        f"Error processing update for {event_name}: {exc}"
-                    )
-                )
 
     return total_opps
+
+
+def _check_event(
+    event_name: str,
+    active_events: list[dict],
+    name_to_event: dict[str, dict],
+    kalshi_ws: Optional[KalshiWS],
+    poly_ws: Optional[PolymarketWS],
+    engine: ArbEngine,
+    execution: ExecutionEngine,
+    notifier: Optional[DiscordNotifier],
+) -> int:
+    """Run one arb check for a single event (snapshot → detect → submit).
+
+    Returns the number of opportunities detected and dispatched.
+    """
+    # Look up the event config
+    event_cfg = name_to_event.get(event_name)
+    if event_cfg is None or event_cfg not in active_events:
+        return 0
+
+    ticker = event_cfg["kalshi_ticker"]
+    cond_id = event_cfg["poly_condition_id"]
+    opps_found = 0
+
+    try:
+        # ── Get snapshots (WS only — no REST fallback) ──
+        loop = asyncio.get_running_loop()
+        t0 = loop.time()
+
+        kalshi_snap: Optional[MarketSnapshot] = None
+        if kalshi_ws:
+            kalshi_snap = kalshi_ws.get_snapshot(ticker)
+
+        poly_snap: Optional[MarketSnapshot] = None
+        if poly_ws:
+            poly_snap = poly_ws.get_snapshot(cond_id)
+
+        fetch_ms = int((loop.time() - t0) * 1000)
+
+        if kalshi_snap is None or poly_snap is None:
+            return 0
+
+        # ── Log top-of-book for this update ──
+        logging.debug(
+            "[%s] K(WS) Yes=%s No=%s | P(WS) Yes=%s No=%s [%dms]",
+            event_name,
+            _fmt_price(kalshi_snap.yes.best_ask),
+            _fmt_price(kalshi_snap.no.best_ask),
+            _fmt_price(poly_snap.yes.best_ask),
+            _fmt_price(poly_snap.no.best_ask),
+            fetch_ms,
+        )
+
+        # ── Check for arbitrage ──
+        opps = engine.check(event_name, kalshi_snap, poly_snap, fetch_ms)
+
+        for opp in opps:
+            # Phase 3: Attach market identifiers for live execution
+            opp.kalshi_ticker = ticker
+            opp.poly_condition_id = cond_id
+            opps_found += 1
+            asyncio.create_task(execution.submit(opp))
+
+    except Exception as exc:
+        logging.error(
+            "Error processing update for %s: %s", event_name, exc,
+            exc_info=True,
+        )
+        # Phase 4: Discord notification for error-level messages
+        if notifier is not None:
+            asyncio.ensure_future(
+                notifier.notify_error(
+                    f"Error processing update for {event_name}: {exc}"
+                )
+            )
+
+    return opps_found
 
 
 def _parse_args() -> argparse.Namespace:
@@ -5278,14 +5734,7 @@ async def main() -> None:
 
     _print_banner(active_events, mode=mode_str)
 
-    # Phase 4: Startup notification
-    await notifier.send(
-        title="🟢 Bot Started",
-        description=f"Mode: **{mode_str}** — tracking **{len(active_events)}** events.",
-        color=DiscordNotifier.COLOR_GREEN,
-    )
-
-    # ── Dry-run: print config and exit ──
+    # ── Dry-run: print config and exit (before any outward notification) ──
     if args.dry_run:
         logging.info("--dry-run flag set. Exiting without trading.")
         if kalshi_ws:
@@ -5300,10 +5749,26 @@ async def main() -> None:
             await poly_client.close()
         sys.exit(0)
 
+    # Phase 4: Startup notification
+    await notifier.send(
+        title="🟢 Bot Started",
+        description=f"Mode: **{mode_str}** — tracking **{len(active_events)}** events.",
+        color=DiscordNotifier.COLOR_GREEN,
+    )
+
     # ── SIGTERM / SIGINT signal handlers for graceful shutdown ──
+    # add_signal_handler is not implemented on Windows event loops;
+    # fall back to signal.signal there (Ctrl+C still works — the
+    # handler sets the stop_event from the signal context).
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGTERM, signal.SIGINT):
-        loop.add_signal_handler(sig, stop_event.set)
+        try:
+            loop.add_signal_handler(sig, stop_event.set)
+        except NotImplementedError:
+            signal.signal(
+                sig,
+                lambda *_: loop.call_soon_threadsafe(stop_event.set),
+            )
 
     # ── Start background tasks ──
     bg_tasks: list[asyncio.Task] = []
@@ -5312,6 +5777,7 @@ async def main() -> None:
     bg_tasks.append(asyncio.create_task(
         _resolution_checker(
             active_events, name_to_event, fetcher, portfolio, stop_event,
+            kalshi_ws=kalshi_ws, poly_ws=poly_ws,
         ),
         name="resolution-check",
     ))
@@ -5362,13 +5828,13 @@ async def main() -> None:
             task.cancel()
         await asyncio.gather(*bg_tasks, return_exceptions=True)
 
-        # Close connections
+        # Close connections (the notifier stays open for the shutdown
+        # notification below and is closed after it)
         if kalshi_ws:
             await kalshi_ws.close()
         if poly_ws:
             await poly_ws.close()
         await fetcher.close()
-        await notifier.close()
         if kalshi_client:
             await kalshi_client.close()
         if poly_client:
@@ -5395,6 +5861,12 @@ async def main() -> None:
             unwind_manager.unwound_count,
             unwind_manager.active_count,
         )
+        if unwind_manager.orphan_count > 0:
+            logging.error(
+                "  *** %d ORPHANED unwind(s) with live exposure — "
+                "check exchange positions manually! ***",
+                unwind_manager.orphan_count,
+            )
         if live_mode:
             logging.info("  Trading mode     : LIVE")
         else:

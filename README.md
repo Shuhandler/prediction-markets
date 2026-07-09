@@ -63,7 +63,7 @@ An opportunity qualifies only when `Gross Profit >= MIN_PROFIT_MARGIN` (default 
 - Best-ask depth on Kalshi (contracts available at the top-of-book price)
 - Best-ask depth on Polymarket (contracts available at the top-of-book price)
 
-The bot uses **Fill or Kill** semantics: if either leg lacks sufficient orderbook depth for the desired contract count, the trade is silently rejected.
+The bot uses **Fill or Kill** semantics at the sized quantity: the desired contract count is first capped to the fillable depth on both legs (best-ask depth), so a thin book shrinks the trade rather than rejecting it. Only when fewer than 1 contract is fillable (or affordable) is the opportunity silently skipped. Order-level fee rounding (fees are ceiled once per order, not per contract) is used for sizing and outlay.
 
 ---
 
@@ -207,7 +207,7 @@ A lightweight in-memory orderbook (dict of `{price: size}` for bids and asks) ma
 | Method | Purpose |
 | ------ | ------- |
 | `fetch_kalshi(ticker)` | Fetches Kalshi REST orderbook. Parses the binary format — YES bids + NO bids, with implied asks via `1 - price`. |
-| `fetch_polymarket(condition_id)` | Tries `/book` endpoint first (real orderbook with depth). Falls back to `/price` (indicative midpoint, no depth). Remembers per-condition which endpoint works. |
+| `fetch_polymarket(condition_id)` | Tries `/book` endpoint first (real orderbook with depth). Falls back to `/price` (indicative midpoint, no depth). A hard 404 pauses `/book` probes for 5 minutes; transient errors (5xx/timeout) fall back for one cycle only and re-probe next time. |
 | `fetch_both(ticker, condition_id)` | Concurrent fetch of both platforms via `asyncio.gather`. |
 | `check_kalshi_active(ticker)` | Checks if a Kalshi market is still active by inspecting `status` and `result` fields (does NOT use `close_time`). |
 | `check_poly_active(condition_id)` | Checks Polymarket `closed` and `active` flags. |
@@ -257,7 +257,7 @@ These checks return `None` silently on every WS tick that doesn't qualify:
 2. **Risk management gate** — Delegates to `RiskManager.check()` (see [Risk Management](#risk-management)). Covers kill switch, daily loss limit, exposure cap, position limit, and spread sanity — but NOT the rate limiter.
 3. **Net profitability** — Rejects if `net_profit <= 0` after fees.
 4. **Capital & sizing** — Computes `desired_contracts = min(POSITION_SIZE, available_capital) / cost_per_contract`. Rejects if < 1.
-5. **FOK depth check** — Rejects if either platform's orderbook depth at best ask is less than `desired_contracts`.
+5. **Depth sizing** — Caps `desired_contracts` to the fillable depth at best ask on both legs (`opp.max_contracts`); rejects only when nothing is fillable. A precise exposure check then verifies `planned_outlay` + in-flight reservations fit under `MAX_TOTAL_EXPOSURE`, and the planned outlay is **reserved** against capital until execution finishes (concurrent submits cannot over-commit).
 
 ### Post-Trade Gate (Order created, CSV logged)
 
@@ -333,15 +333,15 @@ When Leg 2 fails and Leg 1 is filled, the bot sells Leg 1 back:
 
 **Kalshi sell (`_sell_kalshi`):**
 - IOC sell at the floor price.
-- Updates `leg.price` to the actual execution price from the REST response (for accurate slippage calculation).
+- Updates `leg.price` from the REST response for slippage calculation, selecting `yes_price` or `no_price` by the side traded (the response carries both as complements). This is the order's limit price, so the recorded loss is a conservative upper bound.
 
 **Polymarket sell (`_sell_poly`) — Smart-sized FOK:**
 1. Fetch the live orderbook for the token via REST.
-2. Sum total resting bid quantity across all price levels.
-3. Cap FOK size to `min(contracts_to_sell, total_bids)` to avoid certain rejection for insufficient counterparty depth.
-4. If no bids exist, retry up to 3 times (0.5s apart).
+2. Sum resting bid quantity **at or above the slippage floor** (bids below the floor can't fill a floor-priced FOK).
+3. Cap FOK size to `min(contracts_to_sell, fillable_bids)` to avoid certain rejection for insufficient counterparty depth.
+4. If no fillable bids exist, retry up to 3 times (0.5s apart).
 5. Send FOK at the slippage-protected floor price.
-6. If the capped size is less than the full amount, mark as `FAILED` so the `StuckPositionMonitor` can handle the remainder.
+6. Any sold portion is loss-accounted immediately; any remainder is registered as **orphaned exposure**, which `StuckPositionMonitor` retries every cycle via `retry_orphaned_unwinds()` until flat.
 
 ### Unwind loss calculation
 
@@ -427,7 +427,9 @@ MAX_POSITIONS, SPREAD_TOO_WIDE, KILL_SWITCH
 - `LEG1_FILLED`
 - `LEG2_SUBMITTED`
 
-If an `UnwindOrder` has been in one of these states for longer than `STUCK_POSITION_MAX_AGE` seconds (default 30s), the monitor triggers `UnwindManager.force_unwind()` to sell back the filled leg.
+If an `UnwindOrder` has been in one of these states for longer than `STUCK_POSITION_MAX_AGE` seconds (default 30s), the monitor triggers `UnwindManager.force_unwind()` to sell back the filled leg. `force_unwind()` acquires the order's per-order lock first — if `execute()` is still running (all of its awaits are timeout-bounded), the monitor waits and re-checks, so the two can never unwind the same order concurrently.
+
+Each cycle the monitor also calls `retry_orphaned_unwinds()`, which re-attempts any unwind sells that previously failed or only partially filled, until the exposure is flat.
 
 ---
 
