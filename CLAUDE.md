@@ -35,7 +35,7 @@ Config comes from `.env` (loaded via python-dotenv) with defaults in arb_bot.py 
 
 ## Architecture
 
-Everything lives in a single file, `arb_bot.py` (~5,100 lines, ~21 classes). README.md documents each component in depth — consult it before changing behavior. `scope.md` is the phase roadmap (Phases 0–4 done; remaining, in execution order: 5 testing, 6 deployment, 7 economics gate, 8 auto-discovery — renumbered 2026-07-09).
+Everything lives in a single file, `arb_bot.py` (~5,100 lines, ~21 classes). README.md documents each component in depth — consult it before changing behavior. `scope.md` is the phase roadmap (Phases 0–4 done; remaining, in execution order: 5 testing, 6 deployment, 7 economics gate, 8 auto-discovery — renumbered 2026-07-09). `IBKR_ROLLOUT.md` plans the parallel ForecastEx/IBKR venue-expansion track (phases FX-A…FX-D; not started).
 
 Data flow (event-driven, no polling):
 

@@ -12,6 +12,11 @@
 > markets, 24/7 paper deployment generates the ledger data the go/no-go
 > analysis needs, and discovery is only worth building if that analysis says
 > the edge exists.
+>
+> **Parallel track**: ForecastEx/IBKR venue expansion (econ markets,
+> near-zero fee floor, coupon carry) is planned separately in
+> [IBKR_ROLLOUT.md](IBKR_ROLLOUT.md) — phases FX-A…FX-D, feeding the same
+> Phase 7 economics gate.
 
 ---
 
