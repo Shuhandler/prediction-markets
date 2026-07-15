@@ -1,17 +1,19 @@
 # Production Readiness Roadmap — Prediction Market Arb Bot
 
-> **Current state**: v5.0 paper-trading bot with event-driven WS architecture,
-> Decimal precision, Fill-or-Kill execution, OMS, and stale-data watchdog.
+> **Current state**: v6.0 — event-driven WS architecture, Decimal precision,
+> Fill-or-Kill execution, OMS, live order execution with unwind protection,
+> SQLite state of record, and 24/7 deployment infrastructure.
 >
 > **Goal**: Transform into a production-ready live-trading system.
 >
-> **Execution order (revised 2026-07-09)**: Phases 0–4 are done. The remaining
-> phases were reordered to **5 Testing → 6 Deployment → 7 Economics Gate →
-> 8 Auto Discovery** (testing and deployment were previously last, discovery
-> first). Rationale: discovery multiplies any latent bug across hundreds of
-> markets, 24/7 paper deployment generates the ledger data the go/no-go
-> analysis needs, and discovery is only worth building if that analysis says
-> the edge exists.
+> **Execution order (revised 2026-07-09)**: Phases 0–6 are done. The remaining
+> phases were reordered to **7 Economics Gate → 8 Auto Discovery** (testing
+> and deployment were previously last, discovery first). Rationale: discovery
+> multiplies any latent bug across hundreds of markets, 24/7 paper deployment
+> generates the ledger data the go/no-go analysis needs, and discovery is only
+> worth building if that analysis says the edge exists.  See also the
+> **Code-Review Follow-ups** section below for open correctness/hardening
+> decisions from the 2026-07 reviews.
 >
 > **Parallel track**: ForecastEx/IBKR venue expansion (econ markets,
 > near-zero fee floor, coupon carry) is planned separately in
@@ -265,6 +267,86 @@ sports matching delay._
 - [ ] Scale the risk limits: per-market and per-category exposure caps;
       revisit the global order rate limit and queue/CPU headroom at hundreds
       of markets
+
+---
+
+## Code-Review Follow-ups  _(folded from the 2026-07-13/14 review tracker)_
+
+_Two full review passes ran against v6.0: a module-by-module correctness
+review (findings F1–F11, all fixed) and an xhigh-effort review of that fix
+batch (15 verified findings; 11 repaired).  Every applied fix is pinned by
+regression tests in `tests/test_review_fixes.py`.  The items below are what
+remains open._
+
+### Design decisions (need a deliberate call, not a patch)
+
+- [ ] **Settlement payout model**: `check_kalshi_settled` treats any truthy
+      `result` as settled, and `close_positions_for_event` credits a flat
+      $1.00/contract — voided (refund) and scalar (`settlement_value` ≤ $1)
+      outcomes overstate capital in the state of record.  Key the payout on
+      the actual result; overlaps with the Phase 8 resolution-rule-equivalence
+      item
+- [ ] **Restart-safe settlement**: `pending_settlement` lives in the
+      resolution-checker task's memory; a restart with the event pruned from
+      `events.json` strands restored positions uncredited forever.  Persist
+      `kalshi_ticker` on position rows in state.db and re-enroll at startup
+- [ ] **Leg-2 reprice cap**: the post-Leg-1 spread re-verification accepts any
+      fresh ask with net > 0, so the executed outlay can exceed the capital
+      reservation (negative capital / exposure-cap breach under concurrency).
+      Bound the accepted reprice or re-check headroom before submitting Leg 2
+- [ ] **Paired-contract booking home**: ExecutionEngine books
+      `min(leg1, leg2)` fills only on the `execute()` return path; a
+      force-unwind after a cancelled `execute()` (e.g. drain timeout) bypasses
+      it, leaving real two-sided exposure unbooked.  Deeper home:
+      `UnwindManager._finish`
+- [ ] **Circuit-breaker semantics** (deliberate design, pinned by
+      `test_clock.py`): expected profits offset realized unwind losses in the
+      daily tracker, weakening the loss limit on busy days.  Decide whether a
+      losses-only accumulator should drive the breaker
+
+### Live verification before the next live session
+
+- [ ] Grep VPS `data/ws_capture/polymarket-*.jsonl.gz` for `"bids"` vs
+      `"buys"` in book events — the parsers now accept both schemas; this
+      confirms which one production actually sends
+- [ ] Probe Kalshi with a 1-contract `immediate_or_cancel` order on the legacy
+      endpoint, and plan the migration to `/portfolio/events/orders` — the
+      legacy `/portfolio/orders` endpoint is past its announced deprecation
+      window, and the replacement uses a different schema (fixed-point dollar
+      `price`, `side: bid|ask`)
+
+### Verified cleanup batch (safe any time)
+
+- [ ] One Kalshi market-status classifier shared by `check_kalshi_active` /
+      `check_kalshi_settled` — the two hand-maintained status tuples already
+      disagree (`complete` halts trading but never satisfies settlement:
+      liveness risk), and the transition cycle fetches the same ticker twice
+- [ ] One Kalshi IOC lifecycle helper (place → resolve fills → defensive
+      cancel) shared by `_submit_kalshi_buy` / `_sell_kalshi` — the two copies
+      have already diverged once
+- [ ] One order-outlay helper shared by `_submit_inner._order_outlay` and
+      `ExecutionEngine._book_position` (order-level fee rounding invariant in
+      two places)
+- [ ] One Polymarket schema normalizer — bids/buys key tolerance is hand-rolled
+      at four sites (WS book, WS price_change, REST `_parse_book_tob`,
+      `_fetch_poly_bid_depth`)
+- [ ] Module-level except tuple for the six `KalshiOrderClient` methods
+- [ ] orders.csv non-COMPLETE rows: `total_outlay` carries only the unwind
+      loss and excludes the booked paired outlay — audit rows don't reconcile
+      with portfolio.csv/state.db for partial-pair trades
+- [ ] Skip the step-5 REST poll when the WS waiter already confirmed a full
+      fill (wasted rate-limited call on the execution hot path)
+- [ ] Tests: merge `test_review_fixes.py` / `test_regressions.py` into topical
+      modules; consolidate `FakeResolutionFetcher` into `tests/mocks.py`
+
+### Still open from the pre-v6 external audit (2026-02-25, report since deleted)
+
+- [ ] Per-market staleness check (the stale-data watchdog is per-connection
+      only — one quiet market among active ones can trade on stale prices)
+- [ ] Consecutive-unwind circuit breaker (halt after N unwinds in M minutes —
+      catches systematic issues the daily loss limit reacts to slowly)
+- [ ] Minimum-depth economic threshold (skip sub-economic 1-contract trades —
+      Phase 7 analysis will quantify where the floor belongs)
 
 ---
 

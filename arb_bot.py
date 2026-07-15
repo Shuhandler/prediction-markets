@@ -102,6 +102,10 @@ load_dotenv()
 decimal.getcontext().prec = 12
 decimal.getcontext().rounding = ROUND_HALF_UP
 
+# Single source of truth for the version shown in the banner and the
+# HTTP User-Agent (the module docstring should be kept in step manually).
+BOT_VERSION = "6.0"
+
 # Shorthand and constants
 D = Decimal
 ZERO = D("0")
@@ -779,7 +783,7 @@ class MarketFetcher:
             self._session = aiohttp.ClientSession(
                 headers={
                     "Accept": "application/json",
-                    "User-Agent": "PredictionArbBot/5.0 (paper-trading)",
+                    "User-Agent": f"PredictionArbBot/{BOT_VERSION}",
                 },
             )
 
@@ -6657,10 +6661,10 @@ def _print_banner(active_events: list[dict], mode: str = "event-driven") -> None
     is_live = "LIVE" in mode.upper()
     logging.info("=" * 62)
     if is_live:
-        logging.info("  ARBITRAGE BOT  v5.0 — LIVE TRADING")
+        logging.info("  ARBITRAGE BOT  v%s — LIVE TRADING", BOT_VERSION)
         logging.info("  *** REAL ORDERS WILL BE PLACED ***")
     else:
-        logging.info("  ARBITRAGE BOT  v5.0 — PAPER TRADING")
+        logging.info("  ARBITRAGE BOT  v%s — PAPER TRADING", BOT_VERSION)
         logging.info("  No real trades will be executed.")
     logging.info("=" * 62)
     logging.info("  Trading mode    : %s", mode)
