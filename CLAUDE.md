@@ -19,7 +19,7 @@ python arb_bot.py --events-file X.json --log-level DEBUG
 python discover.py --date today [--league mlb] [--json]   # list today's games + exchange search strings (ESPN schedule, no exchange calls)
 python ticker_return.py [kalshi_url] [poly_url]   # interactive helper: generate events.json entries
 
-pytest tests/ -q                        # full test suite (~121 tests, <10s, no network)
+pytest tests/ -q                        # full test suite (~160 tests, <10s, no network)
 pytest tests/test_execution.py -v       # one module
 pytest tests/ -k "orphan"               # tests matching a keyword
 
@@ -53,7 +53,7 @@ Key invariants to preserve:
 - **All monetary/probability math uses `decimal.Decimal`** (12-digit precision, `ROUND_HALF_UP`; fees ceil to the penny with `ROUND_CEILING`). Never introduce floats into price, fee, or P&L calculations.
 - **Strategy/execution/rollback are strictly separated**: `ArbEngine` only detects; `ExecutionEngine` only validates and routes; `UnwindManager` owns order placement and unwind.
 - **Polymarket FOK is always Leg 1.** If it fails, no Kalshi order is placed — zero legging risk. Kalshi IOC (Leg 2) supports partial fills; excess Leg 1 contracts get unwound.
-- **Pre-trade rejections are silent** (no Order object, no CSV row) so hot WS ticks don't spam logs; only the order rate limiter produces a `REJECTED` CSV row. On any non-complete outcome the `(event, direction)` dedup key is released so the next tick can retry.
+- **Pre-trade rejections are silent** (no Order object, no CSV row) so hot WS ticks don't spam logs; only the order rate limiter produces a `REJECTED` CSV row. On a non-complete outcome the `(event, direction)` dedup key is released so the next tick can retry — unless a paired portion was booked as a position (partial Leg 2 fill survived the unwind), in which case the key stays held like a completed trade.
 - **Kalshi only publishes bids**; asks are implied (`Ask(YES) = 1 − Bid(NO)`), and REST prices are integer cents while Polymarket uses decimal dollars — conversion bugs here create false arbs.
 - Paper and live mode share the entire pipeline; they diverge only inside `UnwindManager._submit_leg()` / `_submit_unwind()` (paper simulates instant zero-slippage fills).
 

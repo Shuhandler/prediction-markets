@@ -26,6 +26,7 @@ class MockKalshiOrderClient:
         self.orders_calls: list[dict] = []
         self.orders_responses: list[list] = []
         self.cancel_calls: list[str] = []
+        self.cancel_responses: list[dict] = []
 
     async def place_order(self, **kwargs):
         self.place_calls.append(kwargs)
@@ -40,7 +41,7 @@ class MockKalshiOrderClient:
 
     async def cancel_order(self, order_id):
         self.cancel_calls.append(order_id)
-        return {}
+        return _pop(self.cancel_responses, default={})
 
 
 class MockPolyOrderClient:

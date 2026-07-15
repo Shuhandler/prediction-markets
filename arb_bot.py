@@ -368,6 +368,19 @@ def _ceil_penny(amount: Decimal) -> Decimal:
     return amount.quantize(Q2, rounding=ROUND_CEILING)
 
 
+def _int_or(value, default: int) -> int:
+    """int(value), or *default* when value is None or malformed.
+
+    API count fields (e.g. Kalshi remaining_count) must never crash an
+    execution path mid-trade — a None here previously raised TypeError
+    after the order was already live on the exchange.
+    """
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
 # ====================================================================
 # LOGGING SETUP (Phase 6) — text or structured JSON, optional rotation
 # ====================================================================
@@ -820,6 +833,30 @@ class MarketFetcher:
 
         return True
 
+    async def check_kalshi_settled(self, ticker: str) -> bool:
+        """Return True once the Kalshi market has an actual outcome.
+
+        Stricter than ``not check_kalshi_active()``: statuses like
+        "closed"/"ceased_trading" only mean trading halted — the outcome
+        is not yet known, so arb positions must NOT be credited their
+        $1.00 payout yet.  Transient errors return False (re-check next
+        cycle).
+        """
+        await self._ensure_session()
+        data = await _request_with_retry(
+            self._session,
+            f"{KALSHI_BASE}/markets/{ticker}",
+            self._kalshi_limiter,
+            label="Kalshi-settled",
+        )
+        if data is None:
+            return False
+        market = data.get("market", data)
+        status = str(market.get("status", "")).lower()
+        return bool(market.get("result")) or status in (
+            "settled", "finalized", "determined",
+        )
+
     async def check_poly_active(self, condition_id: str) -> bool:
         """Return True if the Polymarket market is still active.
 
@@ -1233,7 +1270,7 @@ class KalshiOrderClient:
         side: str,
         count: int,
         price_cents: int,
-        time_in_force: str = "ioc",
+        time_in_force: str = "immediate_or_cancel",
         client_order_id: str = "",
     ) -> dict:
         """Place an order on Kalshi.
@@ -1244,7 +1281,11 @@ class KalshiOrderClient:
             side: "yes" or "no"
             count: Number of contracts
             price_cents: Limit price in cents (1-99)
-            time_in_force: "ioc" (default) or "gtc"
+            time_in_force: one of Kalshi's documented enum values —
+                "immediate_or_cancel" (default), "fill_or_kill", or
+                "good_till_canceled".  Anything else (e.g. the old
+                "ioc") is not in the API's oneof and risks either a 400
+                or, worse, being ignored so the order rests as GTC.
             client_order_id: Optional idempotency / reconciliation key (UUID)
 
         Returns:
@@ -1299,7 +1340,10 @@ class KalshiOrderClient:
                     order.get("remaining_count", "?"),
                 )
                 return order
-        except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+        except (aiohttp.ClientError, asyncio.TimeoutError, ValueError) as exc:
+            # ValueError covers json.JSONDecodeError: gateways can return
+            # non-JSON error bodies (HTML 502 pages) that must surface as
+            # an error dict, not an unhandled exception mid-trade.
             logging.error("[Kalshi-Order] Request failed: %s", exc)
             return {"error": True, "detail": str(exc)}
 
@@ -1320,7 +1364,7 @@ class KalshiOrderClient:
             ) as resp:
                 data = await resp.json(content_type=None)
                 return data.get("order", data) if resp.status < 400 else data
-        except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+        except (aiohttp.ClientError, asyncio.TimeoutError, ValueError) as exc:
             logging.error("[Kalshi-Order] get_order failed: %s", exc)
             return {"error": True, "detail": str(exc)}
 
@@ -1347,7 +1391,7 @@ class KalshiOrderClient:
                 if resp.status >= 400:
                     return []
                 return data.get("orders", []) if isinstance(data, dict) else []
-        except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+        except (aiohttp.ClientError, asyncio.TimeoutError, ValueError) as exc:
             logging.error("[Kalshi-Order] get_orders failed: %s", exc)
             return []
 
@@ -1374,7 +1418,7 @@ class KalshiOrderClient:
                     return {"error": True, "status_code": resp.status,
                             "detail": data}
                 return data
-        except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+        except (aiohttp.ClientError, asyncio.TimeoutError, ValueError) as exc:
             logging.error("[Kalshi-Order] get_positions failed: %s", exc)
             return {"error": True, "detail": str(exc)}
 
@@ -1397,7 +1441,8 @@ class KalshiOrderClient:
                     return None
                 # Kalshi reports balance in integer cents
                 return (D(str(data.get("balance", 0))) / HUNDRED).quantize(Q2)
-        except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+        except (aiohttp.ClientError, asyncio.TimeoutError,
+                ValueError, decimal.InvalidOperation) as exc:
             logging.warning("[Kalshi-Order] get_balance failed: %s", exc)
             return None
 
@@ -1418,7 +1463,7 @@ class KalshiOrderClient:
             ) as resp:
                 data = await resp.json(content_type=None)
                 return data.get("order", data) if resp.status < 400 else data
-        except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+        except (aiohttp.ClientError, asyncio.TimeoutError, ValueError) as exc:
             logging.error("[Kalshi-Order] cancel_order failed: %s", exc)
             return {"error": True, "detail": str(exc)}
 
@@ -1698,23 +1743,42 @@ class _LocalOrderbook:
         self.asks: dict[Decimal, Decimal] = {}
 
     def apply_snapshot_poly(self, data: dict) -> None:
-        """Apply a Polymarket 'book' event (full snapshot)."""
+        """Apply a Polymarket 'book' event (full snapshot).
+
+        The market channel's book message has used two key conventions:
+        current docs say "bids"/"asks"; older payloads used
+        "buys"/"sells".  Accept either — reading only the wrong pair
+        silently wipes the book on every snapshot, after which levels
+        rebuild solely from price_change deltas and any resting level
+        that predates the subscription stays invisible.
+        """
         self.bids.clear()
         self.asks.clear()
-        for lvl in data.get("buys", []):
+        for lvl in (data.get("bids") or data.get("buys") or []):
             p, s = D(str(lvl["price"])), D(str(lvl["size"]))
             if s > ZERO:
                 self.bids[p] = s
-        for lvl in data.get("sells", []):
+        for lvl in (data.get("asks") or data.get("sells") or []):
             p, s = D(str(lvl["price"])), D(str(lvl["size"]))
             if s > ZERO:
                 self.asks[p] = s
 
     def apply_price_change_poly(self, change: dict) -> None:
-        """Apply a Polymarket 'price_change' event (absolute size update)."""
-        price = D(str(change["price"]))
-        size = D(str(change["size"]))
-        side = change["side"]  # "BUY" or "SELL"
+        """Apply a Polymarket 'price_change' event (absolute size update).
+
+        Malformed entries are dropped: an exception here propagates out
+        of the WS listener and tears down the whole connection.
+        """
+        price_raw = change.get("price")
+        size_raw = change.get("size")
+        side = change.get("side")
+        if price_raw is None or size_raw is None or side not in ("BUY", "SELL"):
+            return
+        try:
+            price = D(str(price_raw))
+            size = D(str(size_raw))
+        except decimal.InvalidOperation:
+            return
         book = self.bids if side == "BUY" else self.asks
         if size > ZERO:
             book[price] = size
@@ -2016,7 +2080,23 @@ class PolymarketWS:
             self._notify_update(asset_id)
 
         elif event_type == "price_change":
-            for change in data.get("price_changes", []):
+            # Current schema: batched "price_changes" with asset_id nested
+            # in each change.  Legacy schema: top-level asset_id plus a
+            # "changes" array.  Accept both (same rationale as the dual
+            # bids/buys handling in apply_snapshot_poly).
+            changes = data.get("price_changes")
+            if changes is None:
+                top_asset = data.get("asset_id", "")
+                changes = [
+                    {**c, "asset_id": top_asset}
+                    for c in data.get("changes", [])
+                    if isinstance(c, dict)
+                ]
+            if not isinstance(changes, list):
+                return
+            for change in changes:
+                if not isinstance(change, dict):
+                    continue
                 asset_id = change.get("asset_id", "")
                 if asset_id in self._books:
                     self._books[asset_id].apply_price_change_poly(change)
@@ -3105,6 +3185,22 @@ class Position:
     opened_at: str
 
 
+@dataclass(frozen=True)
+class PortfolioMeta:
+    """Immutable snapshot of the portfolio's meta fields.
+
+    StateStore writes run in a worker thread via asyncio.to_thread while
+    the event loop keeps mutating the live portfolio — persisting from a
+    frozen snapshot taken on the loop keeps each state.db transaction
+    internally consistent (capital always matches the position rows of
+    the same moment).
+    """
+    capital: Decimal
+    total_realized_pnl: Decimal
+    total_unwind_losses: Decimal
+    closed_count: int
+
+
 # ====================================================================
 # StateStore — SQLite state of record (Phase 6)
 # ====================================================================
@@ -3200,20 +3296,23 @@ class StateStore:
                 (str(starting_capital), str(starting_capital), "0", "0", 0),
             )
 
-    def _update_meta(self, portfolio: "PaperPortfolio") -> None:
-        # caller holds self._lock inside a transaction
+    def _update_meta(self, meta: "PortfolioMeta") -> None:
+        # caller holds self._lock inside a transaction.  *meta* is a
+        # frozen snapshot taken on the event loop (any object with the
+        # same four attributes works) — never the live portfolio, which
+        # the loop may mutate while this thread writes.
         self._conn.execute(
             "UPDATE meta SET capital = ?, realized_pnl = ?, "
             "unwind_losses = ?, closed_count = ? WHERE id = 1",
             (
-                str(portfolio.capital),
-                str(portfolio.total_realized_pnl),
-                str(portfolio.total_unwind_losses),
-                portfolio.closed_count,
+                str(meta.capital),
+                str(meta.total_realized_pnl),
+                str(meta.total_unwind_losses),
+                meta.closed_count,
             ),
         )
 
-    def persist_open(self, pos: "Position", portfolio: "PaperPortfolio") -> None:
+    def persist_open(self, pos: "Position", meta: "PortfolioMeta") -> None:
         """Atomically record a new position and the updated capital."""
         with self._lock, self._conn:
             self._conn.execute(
@@ -3226,20 +3325,20 @@ class StateStore:
                     str(pos.total_outlay), pos.opened_at,
                 ),
             )
-            self._update_meta(portfolio)
+            self._update_meta(meta)
 
-    def persist_close(self, event_name: str, portfolio: "PaperPortfolio") -> None:
+    def persist_close(self, event_name: str, meta: "PortfolioMeta") -> None:
         """Atomically remove an event's positions and update capital/P&L."""
         with self._lock, self._conn:
             self._conn.execute(
                 "DELETE FROM positions WHERE event_name = ?", (event_name,),
             )
-            self._update_meta(portfolio)
+            self._update_meta(meta)
 
-    def persist_meta(self, portfolio: "PaperPortfolio") -> None:
+    def persist_meta(self, meta: "PortfolioMeta") -> None:
         """Persist capital/P&L only (e.g. after an unwind loss)."""
         with self._lock, self._conn:
-            self._update_meta(portfolio)
+            self._update_meta(meta)
 
     def load_positions(self) -> list["Position"]:
         with self._lock:
@@ -3385,6 +3484,10 @@ class PaperPortfolio:
         self.total_unwind_losses: Decimal = ZERO
         self.closed_count: int = 0
         self._store = state_store
+        # Serializes state-store writes: concurrent asyncio.to_thread
+        # commits are otherwise unordered, so an OLDER meta snapshot
+        # could be the last one written (see _persist).
+        self._persist_lock = asyncio.Lock()
         self._ensure_file()
         self._restore_state()
 
@@ -3428,15 +3531,58 @@ class PaperPortfolio:
         with open(self.path, mode="a", newline="") as fh:
             csv.DictWriter(fh, fieldnames=self.PORT_COLUMNS).writerow(row)
 
+    def _meta_snapshot(self) -> PortfolioMeta:
+        """Frozen meta copy taken on the event loop — see PortfolioMeta."""
+        return PortfolioMeta(
+            capital=self.capital,
+            total_realized_pnl=self.total_realized_pnl,
+            total_unwind_losses=self.total_unwind_losses,
+            closed_count=self.closed_count,
+        )
+
+    async def _persist(self, fn, *args) -> None:
+        """Run one StateStore write with a fresh meta snapshot.
+
+        The lock serializes commits AND the snapshot is taken inside it,
+        so the last write always carries the latest meta — without this,
+        two concurrent to_thread commits could land in the wrong order
+        and leave a stale capital value as the final state.db row.
+        """
+        async with self._persist_lock:
+            await asyncio.to_thread(fn, *args, self._meta_snapshot())
+
     async def open_position(self, pos: Position) -> None:
-        """Add a position and deduct capital.  Called by ExecutionEngine."""
+        """Add a position and deduct capital.  Called by ExecutionEngine.
+
+        Persistence failures are logged but never raised: once capital is
+        deducted and the position appended, an exception escaping here
+        would make the caller misreport the trade as CANCELLED and
+        release its dedup key — stacking a duplicate trade on top of the
+        live exposure.
+        """
         self.capital -= pos.total_outlay
         self.open_positions.append(pos)
 
-        if self._store is not None:
-            await asyncio.to_thread(self._store.persist_open, pos, self)
+        try:
+            if self._store is not None:
+                await self._persist(self._store.persist_open, pos)
+            await self._write_row_async(self._open_row(pos))
+        except Exception:
+            logging.critical(
+                "  PORTFOLIO: position [%s] booked in memory but "
+                "persisting failed — state.db/CSV lag until the next "
+                "successful write.",
+                pos.event_name, exc_info=True,
+            )
 
-        await self._write_row_async({
+        logging.info(
+            "  PORTFOLIO: Opened %d contracts [%s] %s — outlay $%s, capital $%s",
+            pos.contracts, pos.event_name, pos.direction,
+            pos.total_outlay.quantize(Q2), self.capital.quantize(Q2),
+        )
+
+    def _open_row(self, pos: Position) -> dict:
+        return {
             "action": "OPEN",
             "timestamp": pos.opened_at,
             "event_name": pos.event_name,
@@ -3448,13 +3594,7 @@ class PaperPortfolio:
             "payout": "",
             "pnl": "",
             "capital_remaining": f"{self.capital.quantize(Q2)}",
-        })
-
-        logging.info(
-            "  PORTFOLIO: Opened %d contracts [%s] %s — outlay $%s, capital $%s",
-            pos.contracts, pos.event_name, pos.direction,
-            pos.total_outlay.quantize(Q2), self.capital.quantize(Q2),
-        )
+        }
 
     async def close_positions_for_event(self, event_name: str) -> None:
         """
@@ -3498,7 +3638,7 @@ class PaperPortfolio:
 
         self.open_positions = still_open
         if self._store is not None:
-            await asyncio.to_thread(self._store.persist_close, event_name, self)
+            await self._persist(self._store.persist_close, event_name)
 
     async def record_unwind_loss(
         self,
@@ -3523,7 +3663,7 @@ class PaperPortfolio:
         self.total_unwind_losses += loss_amount
 
         if self._store is not None:
-            await asyncio.to_thread(self._store.persist_meta, self)
+            await self._persist(self._store.persist_meta)
 
         await self._write_row_async({
             "action": "UNWIND",
@@ -3535,7 +3675,7 @@ class PaperPortfolio:
             "fees_per_contract": "",
             "total_outlay": f"{loss_amount.quantize(Q4)}",
             "payout": "",
-            "pnl": f"-{loss_amount.quantize(Q4)}",
+            "pnl": f"{(-loss_amount).quantize(Q4)}",
             "capital_remaining": f"{self.capital.quantize(Q2)}",
         })
 
@@ -3920,6 +4060,12 @@ class UnwindManager:
     PolymarketOrderClient (FOK) for real API calls.
     Kalshi partial IOC fills resize the Poly FOK leg dynamically.
     """
+
+    # Kalshi order statuses that are terminal: the order cannot rest or
+    # fill further, so a defensive cancel would be a wasted REST call.
+    _KALSHI_TERMINAL_ORDER_STATUSES = frozenset(
+        ("canceled", "cancelled", "executed"),
+    )
 
     def __init__(
         self,
@@ -4365,7 +4511,15 @@ class UnwindManager:
             contracts_to_unwind = leg1.filled_contracts - uw.leg2.filled_contracts
 
         if contracts_to_unwind <= 0:
-            uw.status = UnwindStatus.COMPLETE
+            # Nothing unpaired to sell.  COMPLETE only if something
+            # actually filled — a force-unwound order with zero fills is
+            # a failed trade, not a completed arb.
+            if leg1.filled_contracts > 0:
+                uw.status = UnwindStatus.COMPLETE
+            else:
+                uw.status = UnwindStatus.FAILED
+                if not uw.error_message:
+                    uw.error_message = "Nothing filled — nothing to unwind"
             await self._finish(uw)
             return
 
@@ -4549,23 +4703,26 @@ class UnwindManager:
             side=leg.side,
             count=leg.contracts,
             price_cents=price_cents,
-            time_in_force="ioc",
+            time_in_force="immediate_or_cancel",
             client_order_id=client_order_id,
         )
 
         if result.get("error"):
-            detail = str(result.get("detail", ""))
-            is_timeout = ("timeout" in detail.lower()
-                          or "TimeoutError" in detail)
-            if is_timeout:
-                # ── TIMEOUT RECONCILIATION ──
-                # The POST may have succeeded on the exchange even though
-                # we never received the HTTP response.  Poll by order_id
-                # or, if unavailable, the logs will capture this.
+            # ── AMBIGUOUS-OUTCOME RECONCILIATION ──
+            # Timeouts, connection errors, garbled bodies (HTML from a
+            # gateway), and 5xx all mean the exchange MAY have accepted
+            # the order even though we got no usable response.  Only a
+            # clean 4xx reject proves it was never placed.
+            status_code = result.get("status_code")
+            clean_reject = (
+                isinstance(status_code, int) and 400 <= status_code < 500
+            )
+            if not clean_reject:
                 logging.warning(
-                    "[Unwind] Kalshi order POST timed out (client_order_id=%s). "
-                    "Reconciling via REST poll…",
-                    client_order_id,
+                    "[Unwind] Kalshi order POST outcome ambiguous "
+                    "(client_order_id=%s, detail=%s). Reconciling via "
+                    "REST poll…",
+                    client_order_id, result.get("detail"),
                 )
                 # Give the exchange a moment to settle the order
                 await asyncio.sleep(0.5)
@@ -4584,8 +4741,10 @@ class UnwindManager:
         # Extract order info from REST response
         order_id = result.get("order_id", "")
         leg.exchange_order_id = order_id
-        status = result.get("status", "")
-        remaining = int(result.get("remaining_count", leg.contracts))
+        status = str(result.get("status", "")).lower()
+        remaining = _int_or(
+            result.get("remaining_count", leg.contracts), leg.contracts,
+        )
         filled = leg.contracts - remaining
 
         logging.info(
@@ -4601,8 +4760,19 @@ class UnwindManager:
             return True
 
         if filled > 0:
-            # Partial fill — IOC cancelled the rest
-            leg.status = LegStatus.PARTIAL
+            # Partial fill — a genuine IOC cancelled the rest.  If the
+            # order is NOT in a terminal state, cancel the remainder
+            # defensively and absorb any fills the cancel reveals: a
+            # resting remainder that fills after we return is untracked
+            # exposure.
+            if status not in self._KALSHI_TERMINAL_ORDER_STATUSES:
+                filled += await self._cancel_kalshi_remainder(
+                    leg, order_id, already_filled=filled,
+                )
+            leg.status = (
+                LegStatus.FILLED if filled >= leg.contracts
+                else LegStatus.PARTIAL
+            )
             leg.filled_contracts = filled
             leg.filled_at = _utc_iso()
             logging.info(
@@ -4611,37 +4781,84 @@ class UnwindManager:
             )
             return True
 
-        # Step 4: No immediate fills — try WS waiter as fallback
+        # Step 4: No immediate fills in the REST response — use the WS
+        # fill waiter as a wake-up signal only.  The waiter resolves on
+        # the FIRST fill message for the order, and a single IOC can
+        # match several resting orders whose fills stream as separate
+        # messages, so the WS count is a floor — the REST poll below is
+        # the authoritative final state.
+        ws_filled = 0
+        waiter_registered = False
         if order_id and self._kalshi_ws is not None and self._kalshi_ws._fills_subscribed:
+            waiter_registered = True
             fill_waiter = self._kalshi_ws.register_fill_waiter(order_id)
             try:
                 fill_data = await asyncio.wait_for(
                     fill_waiter, timeout=self._timeout,
                 )
-                ws_filled = fill_data.get("filled_count", 0)
-                if ws_filled > 0:
-                    leg.status = LegStatus.FILLED
-                    leg.filled_contracts = ws_filled
-                    leg.filled_at = _utc_iso()
-                    return True
+                ws_filled = int(fill_data.get("filled_count", 0))
             except asyncio.TimeoutError:
                 logging.warning(
                     "[Unwind] Kalshi WS fill timeout for order %s", order_id,
                 )
+
+        try:
+            # Step 5: Final REST poll (authoritative), floored by the WS count
+            if order_id:
+                poll_result = await self._kalshi_client.get_order(order_id)
+                poll_status = str(poll_result.get("status", "")).lower()
+                poll_remaining = _int_or(
+                    poll_result.get("remaining_count", leg.contracts),
+                    leg.contracts,
+                )
+                if waiter_registered:
+                    # The waiter resolved on the FIRST fill message; the
+                    # live counter kept accumulating while we polled —
+                    # re-read it so a failed poll falls back to the
+                    # freshest count, not the first message's snapshot.
+                    ws_filled = max(
+                        ws_filled,
+                        self._kalshi_ws._fill_counts.get(order_id, 0),
+                    )
+                filled_final = max(leg.contracts - poll_remaining, ws_filled)
+                if filled_final > 0:
+                    if (
+                        filled_final < leg.contracts
+                        and poll_status not in self._KALSHI_TERMINAL_ORDER_STATUSES
+                    ):
+                        filled_final += await self._cancel_kalshi_remainder(
+                            leg, order_id, already_filled=filled_final,
+                        )
+                    leg.status = (
+                        LegStatus.FILLED if filled_final >= leg.contracts
+                        else LegStatus.PARTIAL
+                    )
+                    leg.filled_contracts = filled_final
+                    leg.filled_at = _utc_iso()
+                    return True
+
+                # No fill reported.  A genuine IOC is already cancelled by
+                # the exchange; cancel defensively in case the order is
+                # resting, absorbing any fills the cancel response reveals
+                # (a resting order that fills after we report failure
+                # becomes an untracked position).
+                late_fills = 0
+                if poll_status not in self._KALSHI_TERMINAL_ORDER_STATUSES:
+                    late_fills = await self._cancel_kalshi_remainder(
+                        leg, order_id, already_filled=0,
+                    )
+                if late_fills > 0:
+                    leg.status = (
+                        LegStatus.FILLED if late_fills >= leg.contracts
+                        else LegStatus.PARTIAL
+                    )
+                    leg.filled_contracts = late_fills
+                    leg.filled_at = _utc_iso()
+                    return True
+        finally:
+            if waiter_registered:
                 self._kalshi_ws.cancel_fill_waiter(order_id)
 
-        # Step 5: Final REST poll
-        if order_id:
-            poll_result = await self._kalshi_client.get_order(order_id)
-            poll_remaining = int(poll_result.get("remaining_count", leg.contracts))
-            poll_filled = leg.contracts - poll_remaining
-            if poll_filled > 0:
-                leg.status = LegStatus.FILLED if poll_remaining == 0 else LegStatus.PARTIAL
-                leg.filled_contracts = poll_filled
-                leg.filled_at = _utc_iso()
-                return True
-
-        # No fill at all — IOC was fully cancelled
         leg.status = LegStatus.FAILED
         leg.filled_contracts = 0
         logging.warning(
@@ -4649,6 +4866,42 @@ class UnwindManager:
             order_id,
         )
         return False
+
+    async def _cancel_kalshi_remainder(
+        self, leg: LegOrder, order_id: str, already_filled: int,
+    ) -> int:
+        """Cancel a possibly-resting Kalshi remainder; return extra fills.
+
+        A genuine IOC is already cancelled server-side, so this is a
+        no-op there.  In the defensive scenario (time_in_force not
+        honored, order resting), the cancel response carries the order's
+        final remaining_count — fills that landed after our last read
+        would otherwise be discarded and become untracked exposure, so
+        they are absorbed into the leg instead.
+        """
+        if not order_id or self._kalshi_client is None:
+            return 0
+        try:
+            result = await self._kalshi_client.cancel_order(order_id)
+        except Exception as exc:
+            logging.warning(
+                "[Unwind] Defensive cancel failed for %s: %s", order_id, exc,
+            )
+            return 0
+        if not isinstance(result, dict) or result.get("error"):
+            return 0
+        remaining = _int_or(result.get("remaining_count"), -1)
+        if remaining < 0:
+            return 0
+        extra = leg.contracts - remaining - already_filled
+        if extra > 0:
+            logging.warning(
+                "[Unwind] Cancel response revealed %d additional fill(s) "
+                "for order %s (order was resting).",
+                extra, order_id,
+            )
+            return extra
+        return 0
 
     async def _reconcile_kalshi_order(
         self, leg: LegOrder, client_order_id: str,
@@ -4688,7 +4941,9 @@ class UnwindManager:
 
             order_id = order.get("order_id", "")
             leg.exchange_order_id = order_id
-            remaining = int(order.get("remaining_count", leg.contracts))
+            remaining = _int_or(
+                order.get("remaining_count", leg.contracts), leg.contracts,
+            )
             filled = leg.contracts - remaining
 
             logging.info(
@@ -4872,7 +5127,7 @@ class UnwindManager:
             side=leg.side,
             count=leg.contracts,
             price_cents=price_cents,
-            time_in_force="ioc",
+            time_in_force="immediate_or_cancel",
         )
 
         if result.get("error"):
@@ -4882,11 +5137,21 @@ class UnwindManager:
 
         order_id = result.get("order_id", "")
         leg.exchange_order_id = order_id
-        remaining = int(result.get("remaining_count", leg.contracts))
+        status = str(result.get("status", "")).lower()
+        remaining = _int_or(
+            result.get("remaining_count", leg.contracts), leg.contracts,
+        )
         filled = leg.contracts - remaining
 
         if filled > 0:
-            leg.status = LegStatus.UNWOUND
+            # If the order is not terminal, cancel the remainder and
+            # absorb any fills the cancel reveals — a resting remainder
+            # that sells after we report failure would be sold a SECOND
+            # time by the orphan retry.
+            if status not in self._KALSHI_TERMINAL_ORDER_STATUSES:
+                filled += await self._cancel_kalshi_remainder(
+                    leg, order_id, already_filled=filled,
+                )
             leg.filled_contracts = filled
             leg.filled_at = _utc_iso()
 
@@ -4906,8 +5171,36 @@ class UnwindManager:
                 "[Unwind] Kalshi sell filled: %d/%d contracts @ %dc.",
                 filled, leg.contracts, actual_price_cents or price_cents,
             )
-            return True
+            if filled >= leg.contracts:
+                leg.status = LegStatus.UNWOUND
+                return True
+            # Partial sell: the position is NOT flat — report failure so
+            # callers orphan the remainder for retry (matching
+            # _sell_poly's contract).
+            leg.status = LegStatus.FAILED
+            logging.warning(
+                "[Unwind] Kalshi sell partial: %d contracts remain exposed.",
+                leg.contracts - filled,
+            )
+            return False
 
+        # No fill.  Defensively cancel in case the order is resting,
+        # absorbing any fills the cancel response reveals (a resting sell
+        # that fills after we report failure would be sold a second time
+        # by the orphan retry).
+        late_sold = 0
+        if status not in self._KALSHI_TERMINAL_ORDER_STATUSES:
+            late_sold = await self._cancel_kalshi_remainder(
+                leg, order_id, already_filled=0,
+            )
+        if late_sold > 0:
+            leg.filled_contracts = late_sold
+            leg.filled_at = _utc_iso()
+            if late_sold >= leg.contracts:
+                leg.status = LegStatus.UNWOUND
+                return True
+            leg.status = LegStatus.FAILED
+            return False
         leg.status = LegStatus.FAILED
         leg.filled_contracts = 0
         logging.warning("[Unwind] Kalshi sell: no fill — order %s.", order_id)
@@ -5898,8 +6191,12 @@ class ExecutionEngine:
         rate-limit consumed).  Only trades that pass all silent checks
         hit the rate limiter, create an Order, and write to CSV.
 
-        If UnwindManager fails/unwinds, the (event, direction) key is
-        removed from self._traded so the bot can retry on the next tick.
+        If UnwindManager fails/unwinds with NOTHING booked, the
+        (event, direction) key is removed from self._traded so the bot
+        can retry on the next tick.  If a paired portion survived (a
+        partial Leg 2 fill was booked as a position), the key stays held
+        exactly like a completed trade — retrying would stack new
+        exposure on top of the live paired position.
         """
         key = (opp.event_name, opp.direction)
 
@@ -6093,49 +6390,59 @@ class ExecutionEngine:
         # from concurrent WS ticks hitting submit() while we're awaiting.
         self._traded.add(key)
 
+        # Contracts booked into the portfolio so far — checked by the
+        # exception handler: once a position is booked, the key must NOT
+        # be released and the order must not be misreported as empty.
+        booked = 0
+
         try:
             if self._unwind_manager is not None:
                 uw_order = await self._unwind_manager.execute(opp, desired)
 
                 if uw_order.status != UnwindStatus.COMPLETE:
-                    # Unwind occurred or execution failed — unlock the key
-                    # so the bot can retry on the next tick.
-                    self._traded.discard(key)
+                    # A PAIRED portion can survive a failure/unwind (Leg 2
+                    # partially filled before the error) — real exposure
+                    # on both exchanges that must be booked, not dropped.
+                    paired = 0
+                    if uw_order.leg1 is not None and uw_order.leg2 is not None:
+                        paired = min(
+                            uw_order.leg1.filled_contracts,
+                            uw_order.leg2.filled_contracts,
+                        )
 
-                    if uw_order.status == UnwindStatus.UNWOUND:
-                        # Trade was unwound — record the real cost
-                        unwind_loss = getattr(uw_order, '_unwind_loss', ZERO)
-                        order.status = OrderStatus.UNWOUND
-                        order.reject_reason = RejectReason.NONE
-                        order.filled_contracts = 0
-                        order.total_outlay = unwind_loss
+                    if paired > 0:
+                        await self._book_position(opp, uw_order, paired)
+                        booked = paired
+                        order.filled_contracts = paired
+                        if self._risk_manager is not None:
+                            self._risk_manager.pnl_tracker.record(
+                                uw_order.net_profit_per_contract, paired,
+                            )
                     else:
-                        # Pure failure (Leg 1 never filled, etc.)
+                        # Nothing paired — unlock the key so the bot can
+                        # retry on the next tick.
+                        self._traded.discard(key)
+
+                    unwind_loss = getattr(uw_order, '_unwind_loss', ZERO)
+                    if uw_order.status == UnwindStatus.UNWOUND:
+                        order.status = OrderStatus.UNWOUND
+                    else:
+                        # Failure (Leg 1 never filled, unwind incomplete —
+                        # remainder is orphaned for retry, etc.)
                         order.status = OrderStatus.CANCELLED
-                        order.reject_reason = RejectReason.NONE
-                        order.filled_contracts = 0
-                        order.total_outlay = ZERO
+                    order.reject_reason = RejectReason.NONE
+                    order.total_outlay = unwind_loss
 
                     await self._finalize(order)
                     return order
 
                 # Both legs filled — use actual filled quantity
                 actual = uw_order.total_contracts
-                total_outlay = order_outlay(actual)
+                total_outlay = await self._book_position(opp, uw_order, actual)
+                booked = actual
                 order.filled_contracts = actual
                 order.total_outlay = total_outlay
                 order.status = OrderStatus.FILLED
-
-                pos = Position(
-                    event_name=opp.event_name,
-                    direction=opp.direction,
-                    contracts=actual,
-                    cost_per_contract=opp.total_cost,
-                    fees_per_contract=opp.kalshi_fee + opp.poly_fee,
-                    total_outlay=total_outlay,
-                    opened_at=opp.timestamp,
-                )
-                await self._portfolio.open_position(pos)
 
                 if self._risk_manager is not None:
                     # Use the (possibly re-verified) net from the unwind
@@ -6166,24 +6473,84 @@ class ExecutionEngine:
                     self._risk_manager.pnl_tracker.record(opp.net_profit, desired)
 
         except Exception as exc:
-            # On any unexpected error during execution, unlock the key
-            # so the bot can retry.  Do NOT re-raise — this method runs
-            # via asyncio.create_task, so an unhandled exception would
-            # be silently swallowed (or produce noisy GC warnings).
-            self._traded.discard(key)
-            logging.error(
-                "[Exec] Execution failed for [%s] %s: %s",
-                opp.event_name, opp.direction, exc, exc_info=True,
-            )
-            order.status = OrderStatus.CANCELLED
-            order.reject_reason = RejectReason.NONE
-            order.filled_contracts = 0
-            order.total_outlay = ZERO
+            # Do NOT re-raise — this method runs via asyncio.create_task,
+            # so an unhandled exception would be silently swallowed (or
+            # produce noisy GC warnings).
+            if booked > 0:
+                # The position IS in the portfolio (capital deducted) —
+                # the failure came from a later step.  Keep the dedup key
+                # and report the booked quantity: discarding the key here
+                # would let the next tick stack a duplicate trade on top
+                # of live exposure.
+                logging.critical(
+                    "[Exec] Post-booking failure for [%s] %s (%d contracts "
+                    "booked): %s — dedup key retained.",
+                    opp.event_name, opp.direction, booked, exc,
+                    exc_info=True,
+                )
+                order.filled_contracts = booked
+                if order.status == OrderStatus.PENDING:
+                    order.status = OrderStatus.FILLED
+                order.reject_reason = RejectReason.NONE
+            else:
+                # Nothing booked — unlock the key so the bot can retry.
+                self._traded.discard(key)
+                logging.error(
+                    "[Exec] Execution failed for [%s] %s: %s",
+                    opp.event_name, opp.direction, exc, exc_info=True,
+                )
+                order.status = OrderStatus.CANCELLED
+                order.reject_reason = RejectReason.NONE
+                order.filled_contracts = 0
+                order.total_outlay = ZERO
             await self._finalize(order)
             return order
 
         await self._finalize(order)
         return order
+
+    async def _book_position(
+        self,
+        opp: ArbOpportunity,
+        uw_order: "UnwindOrder",
+        contracts: int,
+    ) -> Decimal:
+        """Open a Position for *contracts* at the EXECUTED leg prices.
+
+        The legs carry the prices actually traded — Leg 2 may have been
+        repriced to a fresh Kalshi ask after the Leg 1 fill.  Booking at
+        the original snapshot prices (opp.*) understated the outlay and
+        drifted state.db capital from actual spend.  Returns the outlay.
+        """
+        k_price, p_price = opp.kalshi_price, opp.poly_price
+        for leg in (uw_order.leg1, uw_order.leg2):
+            if leg is None:
+                continue
+            if leg.platform == "kalshi":
+                k_price = leg.price
+            else:
+                p_price = leg.price
+
+        cost = (k_price + p_price).quantize(Q4)
+        total_outlay = (
+            cost * D(contracts)
+            + kalshi_taker_fee(k_price, contracts)
+            + poly_taker_fee(p_price, contracts)
+        ).quantize(Q4)
+
+        pos = Position(
+            event_name=opp.event_name,
+            direction=opp.direction,
+            contracts=contracts,
+            cost_per_contract=cost,
+            fees_per_contract=(
+                kalshi_taker_fee(k_price, 1) + poly_taker_fee(p_price, 1)
+            ),
+            total_outlay=total_outlay,
+            opened_at=opp.timestamp,
+        )
+        await self._portfolio.open_position(pos)
+        return total_outlay
 
     def _make_order(self, opp: ArbOpportunity, desired: int) -> Order:
         """Instantiate an Order dataclass from an opp."""
@@ -6447,14 +6814,40 @@ async def _resolution_checker(
     stop_event: asyncio.Event,
     kalshi_ws: Optional[KalshiWS] = None,
     poly_ws: Optional[PolymarketWS] = None,
+    execution: Optional["ExecutionEngine"] = None,
 ) -> None:
     """Periodically check if any active markets have resolved.
 
-    Runs every RESOLUTION_CHECK_INTERVAL seconds.  When a market
-    resolves, closes open positions, removes the event from the
-    active list, and drops it from both WS trackers so dead markets
-    stop generating ticks and queue entries.
+    Runs every RESOLUTION_CHECK_INTERVAL seconds.  Two distinct steps:
+
+    1. STOP TRADING: when either platform reports the market inactive,
+       remove the event from the active list and both WS trackers so
+       dead markets stop generating ticks and queue entries.
+    2. CREDIT PAYOUT: positions are only closed at the $1.00/contract
+       arb payout once Kalshi reports an actual outcome (settled /
+       result populated).  "closed" alone means trading halted — paying
+       out on it credited capital before settlement (and on voided
+       markets, capital that never arrives).
+
+    Positions are enrolled for settlement by re-scanning
+    portfolio.open_positions every cycle (not only at removal time), so
+    a position booked by an execution that was still in flight when its
+    event was removed is picked up on a later cycle.  The all-settled
+    auto-shutdown is deferred while executions are in flight or
+    stragglers exist.
     """
+    # Events no longer tracked whose positions await Kalshi settlement:
+    # event_name -> kalshi_ticker.
+    pending_settlement: dict[str, str] = {}
+    # Every event ever removed from tracking this session, kept so
+    # late-booked positions can still be enrolled: event_name -> ticker.
+    removed_tickers: dict[str, str] = {}
+    # Alerting for entries that never settle (voided/delisted markets
+    # have no escape hatch — an operator must intervene).
+    pending_since: dict[str, float] = {}
+    warned_stuck: set[str] = set()
+    stuck_warn_seconds = 4 * 3600.0
+
     while not stop_event.is_set():
         try:
             await asyncio.wait_for(
@@ -6464,7 +6857,7 @@ async def _resolution_checker(
         except asyncio.TimeoutError:
             pass  # time to check
 
-        if not active_events:
+        if not active_events and not pending_settlement and not removed_tickers:
             return
 
         to_remove: list[dict] = []
@@ -6474,21 +6867,71 @@ async def _resolution_checker(
                 fetcher.check_poly_active(ev["poly_condition_id"]),
             )
             if not k_active or not p_active:
-                logging.info("[%s] Market resolved — removing.", ev["name"])
-                await portfolio.close_positions_for_event(ev["name"])
+                logging.info(
+                    "[%s] Market no longer tradeable — removing from "
+                    "tracking.", ev["name"],
+                )
                 to_remove.append(ev)
 
         for ev in to_remove:
             active_events.remove(ev)
             name_to_event.pop(ev["name"], None)
+            removed_tickers[ev["name"]] = ev["kalshi_ticker"]
             if kalshi_ws is not None:
                 kalshi_ws.remove_market(ev["kalshi_ticker"])
             if poly_ws is not None:
                 poly_ws.remove_market(ev["poly_condition_id"])
             logging.info("Removed resolved event: %s", ev["name"])
 
-        if not active_events:
-            logging.info("All events resolved.")
+        # Enroll open positions of removed events (re-scanned every
+        # cycle to catch positions booked by in-flight executions).
+        for pos in portfolio.open_positions:
+            name = pos.event_name
+            if name in removed_tickers and name not in pending_settlement:
+                pending_settlement[name] = removed_tickers[name]
+                pending_since[name] = time.time()
+
+        # Credit positions only once Kalshi reports an actual outcome.
+        for name, ticker in list(pending_settlement.items()):
+            if await fetcher.check_kalshi_settled(ticker):
+                await portfolio.close_positions_for_event(name)
+                pending_settlement.pop(name, None)
+                pending_since.pop(name, None)
+                warned_stuck.discard(name)
+                logging.info(
+                    "[%s] Kalshi settled — positions credited.", name,
+                )
+            elif (
+                name not in warned_stuck
+                and time.time() - pending_since.get(name, time.time())
+                > stuck_warn_seconds
+            ):
+                warned_stuck.add(name)
+                logging.error(
+                    "[%s] Pending settlement for over %.0fh — Kalshi "
+                    "reports no outcome for %s. Positions remain "
+                    "uncredited; investigate (voided/delisted market?).",
+                    name, stuck_warn_seconds / 3600, ticker,
+                )
+
+        # Auto-shutdown only when nothing can still produce or hold a
+        # position: no tracked events, no pending settlements, no
+        # in-flight executions, and no straggler positions awaiting
+        # enrollment on the next cycle.
+        inflight = (
+            execution is not None
+            and any(not t.done() for t in execution._inflight)
+        )
+        stragglers = any(
+            p.event_name in removed_tickers for p in portfolio.open_positions
+        )
+        if (
+            not active_events
+            and not pending_settlement
+            and not inflight
+            and not stragglers
+        ):
+            logging.info("All events resolved and settled.")
             stop_event.set()
 
 
@@ -6910,7 +7353,7 @@ async def main() -> None:
     bg_tasks.append(asyncio.create_task(
         _resolution_checker(
             active_events, name_to_event, fetcher, portfolio, stop_event,
-            kalshi_ws=kalshi_ws, poly_ws=poly_ws,
+            kalshi_ws=kalshi_ws, poly_ws=poly_ws, execution=execution,
         ),
         name="resolution-check",
     ))
