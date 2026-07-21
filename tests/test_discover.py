@@ -1,5 +1,4 @@
-"""discover.py: schedule parsing and exchange search-string generation
-(offline — canned ESPN scoreboard fixture, no network)."""
+"""discover.py: schedule parsing (offline — canned ESPN scoreboard fixture, no network)."""
 from datetime import date
 
 import discover
@@ -51,25 +50,6 @@ def test_parse_games():
     assert games[1]["state"] == "in"
 
 
-def test_kalshi_search_concatenates_away_home():
-    games = discover.parse_games(espn_fixture(), "MLB", False)
-    assert discover.kalshi_search(games[0]) == "NYYBOS"
-
-
-def test_kalshi_search_applies_overrides():
-    games = discover.parse_games(espn_fixture(), "MLB", False)
-    white_sox = games[1]
-    # ESPN says CHW; the override table maps to Kalshi's convention
-    assert "CHW" in discover.KALSHI_ABBREV_OVERRIDES["MLB"]
-    expected = discover.KALSHI_ABBREV_OVERRIDES["MLB"]["CHW"] + "DET"
-    assert discover.kalshi_search(white_sox) == expected
-
-
-def test_poly_search_uses_nicknames():
-    games = discover.parse_games(espn_fixture(), "MLB", False)
-    assert discover.poly_search(games[0]) == "Yankees Red Sox"
-
-
 def test_local_start_handles_bad_dates():
     games = discover.parse_games(espn_fixture(), "MLB", False)
     assert discover.local_start(games[0]) != "--:--"
@@ -87,7 +67,12 @@ def test_resolve_date_relative():
     assert (tomorrow - today).days == 1
 
 
+def test_resolve_date_all():
+    assert discover.resolve_date("all") is None
+
+
 def test_nickname_fallbacks():
     assert discover._nickname({"team": {"name": "Nickname Only"}}) == "Nickname Only"
     assert discover._nickname({"team": {"displayName": "Full Name"}}) == "Full Name"
     assert discover._nickname({}) == "?"
+

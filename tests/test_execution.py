@@ -36,8 +36,19 @@ async def test_expected_pnl_recorded(stack):
 
 # ── Silent reject paths (no Order, no CSV row) ───────────────────────
 
-async def test_duplicate_rejected_after_fill(stack):
+async def test_duplicate_allowed_when_unlimited(stack):
     opp = make_opp("evt-dup")
+    assert (await stack.ex.submit(opp)).status == ab.OrderStatus.FILLED
+    # Default MAX_TRADES_PER_EVENT=0 (unlimited) — second trade goes through
+    order2 = await stack.ex.submit(opp)
+    assert order2 is not None
+    assert order2.status == ab.OrderStatus.FILLED
+
+
+async def test_duplicate_rejected_when_capped(tmp_path):
+    stack = build_stack(tmp_path)
+    stack.ex._max_trades_per_event = 1  # allow only 1 trade per event+direction
+    opp = make_opp("evt-dup-cap")
     assert (await stack.ex.submit(opp)).status == ab.OrderStatus.FILLED
     assert await stack.ex.submit(opp) is None
 
@@ -142,7 +153,8 @@ async def test_inflight_reservation_and_dedup(stack):
     r1, r2 = await asyncio.gather(t1, t2)
 
     statuses = {r.status if r else None for r in (r1, r2)}
-    assert statuses == {ab.OrderStatus.FILLED, None}
+    # With unlimited trades, both should fill (serialised by the per-event lock)
+    assert statuses == {ab.OrderStatus.FILLED}
     assert stack.ex._reserved == ab.ZERO
 
 

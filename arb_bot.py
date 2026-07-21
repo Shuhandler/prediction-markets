@@ -201,6 +201,7 @@ MAX_TOTAL_EXPOSURE: Decimal = D(os.environ.get("MAX_TOTAL_EXPOSURE", "500.00"))
 MAX_CONCURRENT_POSITIONS: int = int(os.environ.get("MAX_CONCURRENT_POSITIONS", "10"))
 MAX_SPREAD_THRESHOLD: Decimal = D(os.environ.get("MAX_SPREAD_THRESHOLD", "0.20"))
 MAX_ORDERS_PER_MINUTE: int = int(os.environ.get("MAX_ORDERS_PER_MINUTE", "10"))
+MAX_TRADES_PER_EVENT: int = int(os.environ.get("MAX_TRADES_PER_EVENT", "0"))  # 0 = unlimited
 KILL_FILE: str = os.environ.get("KILL_FILE", "KILL")
 
 # ---- Unwind module (Phase 2) ----
@@ -1795,14 +1796,16 @@ class _LocalOrderbook:
         """
         self.bids.clear()
         for lvl in bids_raw:
-            p = D(str(lvl[0])) / HUNDRED
+            p_val = D(str(lvl[0]))
+            p = p_val / HUNDRED if (isinstance(lvl[0], int) and lvl[0] > 1) or p_val >= 1 else p_val
             s = D(str(lvl[1]))
             if s > ZERO:
                 self.bids[p] = s
 
-    def apply_delta_kalshi(self, price_cents: int, delta: int) -> None:
+    def apply_delta_kalshi(self, price_val, delta) -> None:
         """Apply a Kalshi orderbook_delta."""
-        price = D(str(price_cents)) / HUNDRED
+        p_val = D(str(price_val))
+        price = p_val / HUNDRED if (isinstance(price_val, int) and price_val > 1) or p_val >= 1 else p_val
         current = self.bids.get(price, ZERO)
         new_size = current + D(str(delta))
         if new_size > ZERO:
@@ -2522,10 +2525,10 @@ class KalshiWS:
                     "no": _LocalOrderbook(),
                 }
             self._books[ticker]["yes"].apply_snapshot_kalshi(
-                inner.get("yes", []),
+                inner.get("yes_dollars_fp") or inner.get("yes", []),
             )
             self._books[ticker]["no"].apply_snapshot_kalshi(
-                inner.get("no", []),
+                inner.get("no_dollars_fp") or inner.get("no", []),
             )
             self._notify_update(ticker)
 
@@ -2535,7 +2538,8 @@ class KalshiWS:
             side = inner.get("side", "")
             if ticker in self._books and side in self._books[ticker]:
                 self._books[ticker][side].apply_delta_kalshi(
-                    inner.get("price", 0), inner.get("delta", 0),
+                    inner.get("price_dollars") or inner.get("price", 0),
+                    inner.get("delta_fp") or inner.get("delta", 0),
                 )
                 self._notify_update(ticker)
 
@@ -5867,6 +5871,11 @@ class HealthServer:
 
         async def handler(request):
             body, healthy = self.payload()
+            if not healthy:
+                logging.warning(
+                    "[Health] Health check degraded! Status: 503. Payload: %s",
+                    body,
+                )
             return web.json_response(
                 body,
                 status=200 if healthy else 503,
@@ -5876,7 +5885,7 @@ class HealthServer:
         app = web.Application()
         app.router.add_get("/health", handler)
         app.router.add_get("/", handler)
-        self._runner = web.AppRunner(app)
+        self._runner = web.AppRunner(app, access_log=None)
         await self._runner.setup()
         site = web.TCPSite(self._runner, self._host, self.port)
         await site.start()
@@ -6161,6 +6170,7 @@ class ExecutionEngine:
         risk_manager: Optional[RiskManager] = None,
         unwind_manager: Optional[UnwindManager] = None,
         notifier: Optional[DiscordNotifier] = None,
+        max_trades_per_event: int = MAX_TRADES_PER_EVENT,
     ):
         self._portfolio = portfolio
         self._trader = trader
@@ -6168,13 +6178,15 @@ class ExecutionEngine:
         self._risk_manager = risk_manager
         self._unwind_manager = unwind_manager
         self._notifier = notifier
+        self._max_trades_per_event = max_trades_per_event  # 0 = unlimited
         self._orders: list[Order] = []
-        # Track which event+direction combos we've already traded or
-        # are currently in-flight (prevents concurrency races).
-        self._traded: set[tuple[str, str]] = set()
+        # Track how many times each event+direction combo has been traded
+        # or is currently in-flight (prevents concurrency races).
+        # Counter replaces the old set to support configurable repeat trading.
+        self._traded: dict[tuple[str, str], int] = {}
         # Per-event locks to guarantee mutual exclusion for concurrent
         # WS ticks on the same event (prevents the TOCTOU race between
-        # the `if key in self._traded` check and `self._traded.add(key)`).
+        # the `if key in self._traded` check and the counter increment).
         self._event_locks: dict[tuple[str, str], asyncio.Lock] = {}
         # Capital reserved by in-flight submissions.  Capital is only
         # deducted from the portfolio once BOTH legs fill, so without
@@ -6253,11 +6265,13 @@ class ExecutionEngine:
         # These return None without creating an Order, writing CSV,
         # or consuming a rate-limit slot.
 
-        # 1. Duplicate / in-flight check
-        if key in self._traded:
+        # 1. Duplicate / in-flight check (respects MAX_TRADES_PER_EVENT)
+        trade_count = self._traded.get(key, 0)
+        if self._max_trades_per_event > 0 and trade_count >= self._max_trades_per_event:
             logging.debug(
-                "[Exec] Skipped [%s] %s — already traded or in-flight",
+                "[Exec] Skipped [%s] %s — already traded %d/%d times",
                 opp.event_name, opp.direction,
+                trade_count, self._max_trades_per_event,
             )
             return None
 
@@ -6392,7 +6406,7 @@ class ExecutionEngine:
 
         # Mark in-flight BEFORE awaiting to prevent duplicate submissions
         # from concurrent WS ticks hitting submit() while we're awaiting.
-        self._traded.add(key)
+        self._traded[key] = self._traded.get(key, 0) + 1
 
         # Contracts booked into the portfolio so far — checked by the
         # exception handler: once a position is booked, the key must NOT
@@ -6425,7 +6439,8 @@ class ExecutionEngine:
                     else:
                         # Nothing paired — unlock the key so the bot can
                         # retry on the next tick.
-                        self._traded.discard(key)
+                        # Decrement the counter so the bot can retry.
+                        self._traded[key] = max(self._traded.get(key, 1) - 1, 0)
 
                     unwind_loss = getattr(uw_order, '_unwind_loss', ZERO)
                     if uw_order.status == UnwindStatus.UNWOUND:
@@ -6498,7 +6513,7 @@ class ExecutionEngine:
                 order.reject_reason = RejectReason.NONE
             else:
                 # Nothing booked — unlock the key so the bot can retry.
-                self._traded.discard(key)
+                self._traded[key] = max(self._traded.get(key, 1) - 1, 0)
                 logging.error(
                     "[Exec] Execution failed for [%s] %s: %s",
                     opp.event_name, opp.direction, exc, exc_info=True,
@@ -6695,6 +6710,10 @@ def _print_banner(active_events: list[dict], mode: str = "event-driven") -> None
     logging.info("  Max positions   : %d", MAX_CONCURRENT_POSITIONS)
     logging.info("  Max spread      : %s%%", (MAX_SPREAD_THRESHOLD * HUNDRED).quantize(Q2))
     logging.info("  Order rate limit: %d/min", MAX_ORDERS_PER_MINUTE)
+    logging.info(
+        "  Trades/event    : %s",
+        str(MAX_TRADES_PER_EVENT) if MAX_TRADES_PER_EVENT > 0 else "unlimited",
+    )
     logging.info("  Kill file       : %s", KILL_FILE)
     logging.info("  Unwind timeout  : %ds", UNWIND_TIMEOUT_SECONDS)
     logging.info("  Stuck pos age   : %ds", STUCK_POSITION_MAX_AGE)

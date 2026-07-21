@@ -1,16 +1,9 @@
 [
     {
-        "name": "Golden State at New Orleans Winner?",
-        "kalshi_ticker": "KXNBAGAME-26FEB24GSWNOP-GSW",
-        "poly_condition_id": "0x7cdb2504f2b5c28598efa93e349169c122c51289ed64fcec816ebed49377076c",
-        "poly_yes_token": "FILL_ME",
-        "poly_no_token": "FILL_ME"
-    },
-    {
-        "name": "Tennessee at Missouri Winner?",
-        "kalshi_ticker": "KXNCAAMBGAME-26FEB24TENNMIZZ-TENN",
-        "poly_condition_id": "0xba7bd969e491109cd0d813dde352dec5abfe8fe05b1fedbafcfab432b6f28577",
-        "poly_yes_token": "FILL_ME",
-        "poly_no_token": "FILL_ME"
+        "name": "Will Stan Wawrinka win the Wawrinka vs Burruchaga: Round Of 32 match?",
+        "kalshi_ticker": "KXATPMATCH-26JUL19WAWBUR-BUR",
+        "poly_condition_id": "0x2b8f0876a2339e3ff7e8f39a6caf982ed5faf5c6e5359618acd47e8fee564047",
+        "poly_yes_token": "101182515524719951568485829484170882500599847920385143976424324641422174578461",
+        "poly_no_token": "32115979187210926149951699386601190847975881866928013883095379542505475138476"
     }
 ]
