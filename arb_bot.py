@@ -6199,6 +6199,14 @@ class ExecutionEngine:
         self._inflight: set[asyncio.Task] = set()
         self._last_order_ts: str = ""
 
+    def _decrement_traded(self, key: tuple[str, str]) -> None:
+        """Decrement trade counter for key; pop it when count reaches 0 so `key in self._traded` stays clean."""
+        new_count = self._traded.get(key, 1) - 1
+        if new_count <= 0:
+            self._traded.pop(key, None)
+        else:
+            self._traded[key] = new_count
+
     async def submit(self, opp: ArbOpportunity) -> Optional[Order]:
         """
         Submit a candidate arb trade for execution.
@@ -6437,10 +6445,8 @@ class ExecutionEngine:
                                 uw_order.net_profit_per_contract, paired,
                             )
                     else:
-                        # Nothing paired — unlock the key so the bot can
-                        # retry on the next tick.
-                        # Decrement the counter so the bot can retry.
-                        self._traded[key] = max(self._traded.get(key, 1) - 1, 0)
+                        # Nothing paired — unlock the key so the bot can retry.
+                        self._decrement_traded(key)
 
                     unwind_loss = getattr(uw_order, '_unwind_loss', ZERO)
                     if uw_order.status == UnwindStatus.UNWOUND:
@@ -6513,7 +6519,7 @@ class ExecutionEngine:
                 order.reject_reason = RejectReason.NONE
             else:
                 # Nothing booked — unlock the key so the bot can retry.
-                self._traded[key] = max(self._traded.get(key, 1) - 1, 0)
+                self._decrement_traded(key)
                 logging.error(
                     "[Exec] Execution failed for [%s] %s: %s",
                     opp.event_name, opp.direction, exc, exc_info=True,
