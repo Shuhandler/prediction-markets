@@ -7,20 +7,18 @@ from decimal import Decimal as D
 from pathlib import Path
 
 import arb_bot as ab
-from conftest import build_stack, make_opp, order_outlay, snap
-from mocks import MockFetcher, MockKalshiOrderClient, MockPolyOrderClient
+from conftest import build_stack, make_opp, order_outlay
+from mocks import MockKalshiOrderClient, MockPolyOrderClient
 
 # The complete, intentional set of places allowed to branch on live mode:
 #   UnwindManager.__init__      — stores the flag
 #   UnwindManager._submit_leg   — paper fill vs real order
 #   UnwindManager._submit_unwind— paper sell vs real sell
-#   UnwindManager._execute_locked — live-only spread re-verification
 #   main                        — wiring/validation of clients
 ALLOWED_LIVE_REFS = {
     "UnwindManager.__init__",
     "UnwindManager._submit_leg",
     "UnwindManager._submit_unwind",
-    "UnwindManager._execute_locked",
     "main",
 }
 
@@ -82,15 +80,17 @@ async def test_paper_and_perfect_live_produce_identical_orders(tmp_path):
     poly = MockPolyOrderClient()
     poly.place_responses = [{"orderID": "P1", "status": "matched"}]
     kalshi = MockKalshiOrderClient()
+    # A perfect exchange fills at the observed ask (the IOC is placed
+    # with a reservation ceiling above it, but the book didn't move).
     kalshi.place_responses = [
-        {"order_id": "K1", "status": "executed", "remaining_count": 0},
+        {
+            "order_id": "K1", "status": "executed", "remaining_count": 0,
+            "average_fill_price": "0.40",
+        },
     ]
-    fetcher = MockFetcher(
-        kalshi_snapshot=snap(yes={"ask": "0.40", "ask_size": "50"}),
-    )
     live = build_stack(
         tmp_path / "live", live_mode=True,
-        kalshi_client=kalshi, poly_client=poly, fetcher=fetcher,
+        kalshi_client=kalshi, poly_client=poly,
     )
     live_order = await live.ex.submit(opp)
 

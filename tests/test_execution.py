@@ -3,6 +3,7 @@ order-level outlay, capital reservation, precise exposure check, rate-limit
 audit row, dedup semantics, and error recovery."""
 import asyncio
 from decimal import Decimal as D
+import pytest
 
 import arb_bot as ab
 from conftest import build_stack, make_opp, order_outlay
@@ -23,8 +24,9 @@ async def test_paper_fill_sizes_down_to_depth(stack):
 async def test_capital_binds_when_depth_is_deep(stack):
     opp = make_opp("evt-deep", k_depth=500, p_depth=500)
     order = await stack.ex.submit(opp)
-    # position_size $50 / ~0.9357 per contract = 53
-    assert order.filled_contracts == 53
+    # Sizing uses the WORST-CASE Kalshi price (Leg 2 reservation ceiling
+    # 0.41, not the observed 0.40): $50 / ~0.9457 per contract = 52
+    assert order.filled_contracts == 52
     assert order.total_outlay <= D("50")
 
 
@@ -198,3 +200,36 @@ async def test_unwound_outcome_releases_key(stack):
     stack.um._submit_leg = orig
     retry = await stack.ex.submit(opp)
     assert retry.status == ab.OrderStatus.FILLED
+
+
+@pytest.mark.asyncio
+async def test_partial_leg1_and_partial_leg2_unwinds_only_difference(stack):
+    orig = stack.um._submit_leg
+
+    async def custom_submit_leg(leg):
+        if leg.platform == "polymarket" and leg.side == "yes":
+            # Poly fills 3 of requested 10
+            leg.status = ab.LegStatus.FILLED
+            leg.filled_contracts = 3
+            leg.filled_at = ab._utc_iso()
+            return True
+        if leg.platform == "kalshi" and leg.side == "no":
+            # Kalshi fills 2 of requested 3
+            leg.status = ab.LegStatus.FILLED
+            leg.filled_contracts = 2
+            leg.filled_at = ab._utc_iso()
+            return True
+        return await orig(leg)
+
+    stack.um._submit_leg = custom_submit_leg
+    opp = make_opp(
+        "evt-partial-3-2", k_depth=10, p_depth=10,
+        direction="Buy YES@Polymarket + Buy NO@Kalshi",
+    )
+    uw_order = await stack.um.execute(opp, 10)
+
+    # 2 contracts were paired on Kalshi, 1 excess contract was unwound on Poly
+    assert uw_order.total_contracts == 2
+    assert uw_order.unwind_leg is not None
+    assert uw_order.unwind_leg.contracts == 1
+    assert uw_order.status == ab.UnwindStatus.COMPLETE

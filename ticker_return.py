@@ -13,7 +13,9 @@ Dependencies:
     pip install requests
 """
 
+import os
 import sys
+import json
 import requests
 from urllib.parse import urlparse
 
@@ -221,18 +223,12 @@ def main():
         print(f"  Found: {title}")
         print(f"  Condition ID: {condition_id}")
     else:
-        print(f"  Found {len(p_markets)} market(s):\n")
-        for i, m in enumerate(p_markets, 1):
-            title = m.get("question", m.get("groupItemTitle", "?"))
-            cid = m.get("conditionId", m.get("condition_id", "?"))
-            print(f"    {i}. {title}")
-            print(f"       condition_id: {cid}")
-        print()
-        choice = prompt_choice(
-            f"  Which market? [1-{len(p_markets)}]: ", len(p_markets),
-        )
-        selected = p_markets[choice - 1]
+        selected = p_markets[0]
         condition_id = selected.get("conditionId", selected.get("condition_id", ""))
+        title = selected.get("question", selected.get("groupItemTitle", "?"))
+        print(f"  Found {len(p_markets)} market(s). Auto-selecting option 1:")
+        print(f"    1. {title}")
+        print(f"       condition_id: {condition_id}")
 
     if not condition_id:
         print("  ERROR: No condition_id obtained.")
@@ -329,19 +325,53 @@ def main():
     print()
     name = input(f"  Event name [{suggested}]: ").strip() or suggested
 
-    # ── Output ──────────────────────────────────────────────────────
+    new_entry = {
+        "name": name,
+        "kalshi_ticker": selected_ticker,
+        "poly_condition_id": condition_id,
+        "poly_yes_token": yes_token_id,
+        "poly_no_token": no_token_id,
+    }
+
+    # ── Auto-save to events.json ────────────────────────────────────
+    events_file = "events.json"
+    events_list = []
+
+    if os.path.exists(events_file):
+        try:
+            with open(events_file, "r", encoding="utf-8") as f:
+                events_list = json.load(f)
+                if not isinstance(events_list, list):
+                    events_list = []
+        except Exception:
+            events_list = []
+
+    replaced = False
+    for i, entry in enumerate(events_list):
+        if (
+            entry.get("kalshi_ticker") == selected_ticker
+            or entry.get("poly_condition_id") == condition_id
+        ):
+            events_list[i] = new_entry
+            replaced = True
+            break
+
+    if not replaced:
+        events_list.append(new_entry)
+
+    with open(events_file, "w", encoding="utf-8") as f:
+        json.dump(events_list, f, indent=4)
+        f.write("\n")
+
     print()
     print("  " + "=" * 58)
-    print("  Add this to events.json:")
+    if replaced:
+        print(f"  ✅ Updated existing event in events.json ({len(events_list)} total events)")
+    else:
+        print(f"  ✅ Saved new event straight to events.json ({len(events_list)} total events)")
     print("  " + "=" * 58)
     print()
-    print("    {")
-    print(f'        "name": "{name}",')
-    print(f'        "kalshi_ticker": "{selected_ticker}",')
-    print(f'        "poly_condition_id": "{condition_id}",')
-    print(f'        "poly_yes_token": "{yes_token_id}",')
-    print(f'        "poly_no_token": "{no_token_id}"')
-    print("    }")
+    print(json.dumps(new_entry, indent=4))
     print()
 
 

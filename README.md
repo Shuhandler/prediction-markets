@@ -288,17 +288,44 @@ On any non-`COMPLETE` outcome from `UnwindManager`, the `(event, direction)` key
 ```
 ┌──────────────────────────────────────────────────────────────┐
 │ 1. Build Leg 1 (Polymarket FOK) and Leg 2 (Kalshi IOC)      │
+│    Leg 2 carries a reservation-price ceiling: the highest    │
+│    Kalshi price that still nets MIN_PROFIT_MARGIN after fees │
 │ 2. Submit Leg 1 (Polymarket FOK)                             │
 │    ├─ FAILED  → mark FAILED, return                          │
 │    ├─ 0 fills → mark FAILED, return                          │
 │    └─ FILLED (possibly partial) → continue                   │
 │ 3. If Leg 1 partial fill → adjust Leg 2 size to match       │
-│ 4. Submit Leg 2 (Kalshi IOC)                                 │
+│ 4. Submit Leg 2 (Kalshi IOC) IMMEDIATELY at the ceiling —   │
+│    no book refetch (latency = legging risk); the exchange    │
+│    fills at book prices, so the common case executes at the  │
+│    observed ask and a moved book fills any still-profitable  │
+│    deeper level instead of missing                           │
 │    ├─ FAILED / 0 fills → UNWIND Leg 1 (sell back)            │
 │    ├─ Partial fill → UNWIND excess contracts from Leg 1      │
-│    └─ Full fill → COMPLETE                                   │
+│    └─ Full fill → COMPLETE (realized net recomputed from     │
+│       the executed VWAP, not the detection snapshot)         │
 └──────────────────────────────────────────────────────────────┘
 ```
+
+### Leg 2 reservation pricing
+
+The Leg 2 IOC limit is not the observed ask — it is the **reservation
+price**: the highest Kalshi price `P` satisfying
+
+```
+1 − poly_price − poly_fee(poly_price) − P − kalshi_fee(P) ≥ MIN_PROFIT_MARGIN
+```
+
+(`kalshi_reservation_price()`; unique because `P + fee(P)` is strictly
+increasing). On a CLOB the limit is a ceiling: price improvement is
+automatic on both venues, so this costs nothing in the best case and
+converts "book moved → miss → unwind Leg 1 at a loss" into "fill at a
+degraded but still-acceptable margin". Fills report a volume-weighted
+`average_fill_price` (Kalshi V2), which is booked as the executed leg
+price; when a fill path carries no VWAP (WS/poll/reconcile), the wire
+ceiling is booked instead as a conservative upper bound. Because a fill
+can legitimately land above the observed ask, `ExecutionEngine` sizes
+and reserves capital at the ceiling price, not the snapshot price.
 
 ### Paper mode fills
 
@@ -307,7 +334,7 @@ Both `_submit_leg()` and `_submit_unwind()` simulate instant, complete fills wit
 ### Live mode fills
 
 **Kalshi buy (`_submit_kalshi_buy`):**
-1. Convert Decimal price to integer cents.
+1. Wire price = the leg's reservation ceiling (`limit_price`) when set, else its expected price; converted to integer cents.
 2. POST an IOC limit order with a `client_order_id` (UUID) for reconciliation.
 3. If the HTTP POST **times out**, reconcile by querying recent orders on that ticker matching the `client_order_id`. The exchange may have accepted and filled the order despite no HTTP response.
 4. Check REST response: if `remaining_count == 0` or `status == "executed"/"filled"` → done.

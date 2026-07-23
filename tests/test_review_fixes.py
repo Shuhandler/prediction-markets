@@ -5,8 +5,8 @@ import asyncio
 from decimal import Decimal as D
 
 import arb_bot as ab
-from conftest import build_stack, make_opp, snap
-from mocks import MockFetcher, MockKalshiOrderClient, MockPolyOrderClient
+from conftest import build_stack, make_opp
+from mocks import MockKalshiOrderClient, MockPolyOrderClient
 
 
 # ── F1: Polymarket WS book snapshots — current schema uses bids/asks ─
@@ -131,21 +131,19 @@ async def test_unfilled_kalshi_sell_is_defensively_cancelled(tmp_path):
 
 # ── F3: positions booked at EXECUTED prices, not the stale snapshot ──
 
-async def test_position_booked_at_reverified_leg2_price(tmp_path):
+async def test_position_booked_at_actual_leg2_fill_price(tmp_path):
     poly = MockPolyOrderClient()
     poly.place_responses = [{"orderID": "P1", "status": "matched"}]
     kalshi = MockKalshiOrderClient()
+    # The Leg 2 IOC (ceiling 0.41) filled above the observed 0.40 ask:
+    # the position must be booked at the executed VWAP, not the snapshot.
     kalshi.place_responses = [
-        {"order_id": "K1", "status": "executed", "remaining_count": 0},
+        {"order_id": "K1", "status": "executed", "remaining_count": 0,
+         "average_fill_price": "0.41"},
     ]
-    # Spread re-verification finds a worse (higher) fresh Kalshi ask:
-    # 0.41 instead of the opp's 0.40.  Leg 2 executes at 0.41.
-    fetcher = MockFetcher(
-        kalshi_snapshot=snap(yes={"ask": "0.41", "ask_size": "50"}),
-    )
     stack = build_stack(
         tmp_path, live_mode=True,
-        kalshi_client=kalshi, poly_client=poly, fetcher=fetcher,
+        kalshi_client=kalshi, poly_client=poly,
     )
 
     order = await stack.ex.submit(make_opp("evt-repriced"))

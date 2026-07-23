@@ -53,9 +53,15 @@ class MockPolyOrderClient:
         self.place_responses: list[dict] = []
         self.get_responses: list[dict] = []
         self.cancel_calls: list[str] = []
+        self.token_balance = 0.0
 
     def resolve_token_id(self, condition_id, side):
         return self._token
+
+    async def get_token_balance(self, token_id):
+        # 0.0 mirrors the real client's "unknown" result: callers treat
+        # a non-positive balance as advisory and skip capping.
+        return self.token_balance
 
     async def place_order(self, **kwargs):
         self.place_calls.append(kwargs)
@@ -72,7 +78,9 @@ class MockPolyOrderClient:
 class MockFetcher:
     """Stand-in for MarketFetcher inside UnwindManager.
 
-    kalshi_snapshot: returned by fetch_kalshi (spread re-verification).
+    kalshi_snapshot: returned by fetch_kalshi (unused by the execute
+        path since Leg 2 reservation pricing removed the refetch;
+        kalshi_calls lets tests assert it stays that way).
     poly_bids: bid levels returned by _fetch_poly_book (unwind sizing).
     """
 

@@ -84,7 +84,7 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
-from decimal import Decimal, ROUND_CEILING, ROUND_HALF_UP
+from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR, ROUND_HALF_UP
 from pathlib import Path
 from typing import Optional
 
@@ -178,6 +178,8 @@ POLY_API_SECRET: str = os.environ.get("POLY_API_SECRET", "")
 POLY_PASSPHRASE: str = os.environ.get("POLY_PASSPHRASE", "")
 POLY_PRIVATE_KEY_PATH: str = os.environ.get("POLY_PRIVATE_KEY_PATH", "")
 POLY_CHAIN_ID: int = int(os.environ.get("POLY_CHAIN_ID", "137"))  # Polygon mainnet
+POLY_SIGNATURE_TYPE: int = int(os.environ.get("POLY_SIGNATURE_TYPE", "0"))  # 0=EOA, 1=POLY_PROXY, 2=GNOSIS_SAFE, 3=POLY_1271
+POLY_FUNDER_ADDRESS: str = os.environ.get("POLY_FUNDER_ADDRESS", "")
 
 # ---- Kalshi fill poll interval (live mode) ----
 KALSHI_FILL_POLL_MS: int = int(os.environ.get("KALSHI_FILL_POLL_MS", "250"))
@@ -332,7 +334,7 @@ def _load_events(path: str) -> list[dict]:
                 )
                 sys.exit(1)
 
-    logging.info("Loaded %d events from %s", len(events), path)
+    logging.debug("Loaded %d events from %s", len(events), path)
     return events
 
 
@@ -379,9 +381,11 @@ def _int_or(value, default: int) -> int:
     API count fields (e.g. Kalshi remaining_count) must never crash an
     execution path mid-trade — a None here previously raised TypeError
     after the order was already live on the exchange.
+
+    Handles Kalshi V2 fixed-point strings like "10.00" via float().
     """
     try:
-        return int(value)
+        return int(float(value))
     except (TypeError, ValueError):
         return default
 
@@ -427,6 +431,10 @@ def _setup_logging(level: str) -> None:
     root.setLevel(getattr(logging, level))
     root.handlers = handlers
 
+    # Suppress verbose third-party HTTP, WebSocket, and SDK error logs
+    for noisy in ("httpx", "httpcore", "urllib3", "websockets", "py_clob_client_v2", "py_clob_client"):
+        logging.getLogger(noisy).setLevel(logging.CRITICAL)
+
 
 # ====================================================================
 # FEE COMPUTATION (Decimal-precise)
@@ -460,6 +468,37 @@ def poly_taker_fee(price: Decimal, contracts: int = 1) -> Decimal:
     p_factor = price * (ONE - price)
     raw = POLY_FEE_RATE * D(contracts) * (p_factor ** POLY_FEE_EXPONENT)
     return raw.quantize(Q4, rounding=ROUND_CEILING)
+
+
+def kalshi_reservation_price(
+    poly_price: Decimal, min_margin: Decimal = MIN_PROFIT_MARGIN,
+) -> Optional[Decimal]:
+    """Highest Kalshi price (whole cents) that still nets *min_margin*.
+
+    Given a filled Polymarket leg at *poly_price*, returns the largest
+    price P (in Decimal dollars, integer cents, 1–99¢) satisfying
+
+        1 − poly_price − poly_fee(poly_price) − P − kalshi_fee(P) ≥ min_margin
+
+    Used as the Leg 2 IOC limit: on a CLOB the limit is a ceiling, so
+    the order still fills at the observed ask when the book is intact,
+    but can walk deeper levels (or absorb a moved book) down to the
+    worst price that clears the margin floor — instead of missing and
+    forcing an unwind of Leg 1.
+
+    Total Kalshi cost P + fee(P) is strictly increasing in P (the fee
+    derivative is bounded by ±0.07), so the answer is unique.  Returns
+    None when no price ≥ 1¢ clears the floor.
+    """
+    budget = ONE - poly_price - poly_taker_fee(poly_price, 1) - min_margin
+    # Start at the budget itself (fee ≥ 0 means P ≤ budget) and walk
+    # down — the per-order fee ceils to ≤ 2¢, so this loops ≤ 3 times.
+    start = min(99, int((budget * HUNDRED).to_integral_value(rounding=ROUND_FLOOR)))
+    for cents in range(start, 0, -1):
+        p = D(cents) / HUNDRED
+        if p + kalshi_taker_fee(p, 1) <= budget:
+            return p
+    return None
 
 
 # ====================================================================
@@ -601,8 +640,13 @@ class LegOrder:
     leg_id: str
     platform: str              # "kalshi" or "polymarket"
     side: str                  # "yes" or "no"
-    price: Decimal
+    price: Decimal             # expected price; updated to executed price on fill
     contracts: int
+    # Optional wire limit (reservation price): the worst acceptable
+    # price sent to the exchange.  The CLOB fills at book prices, so
+    # this is a ceiling, not the expected price.  None → use `price`.
+    # Ignored by paper fills, which simulate execution at `price`.
+    limit_price: Optional[Decimal] = None
     status: LegStatus = LegStatus.PENDING
     filled_contracts: int = 0
     submitted_at: str = ""
@@ -767,9 +811,9 @@ class MarketFetcher:
         self._session: aiohttp.ClientSession | None = None
         self._poly_token_cache: dict[str, tuple[str, str]] = {}
         self._kalshi_limiter = RateLimiter(KALSHI_MAX_RPS)
-        # Separate limiter for execution-critical fetches (e.g. the Leg 2
-        # spread re-verification) so a mid-trade snapshot never queues
-        # behind background resolution checks.  Combined worst case is
+        # Separate limiter for execution-critical fetches (priority=True,
+        # e.g. mid-trade snapshots) so they never queue behind background
+        # resolution checks.  Combined worst case is
         # 2 × KALSHI_MAX_RPS, still well under Kalshi's Basic read limit.
         self._kalshi_priority_limiter = RateLimiter(KALSHI_MAX_RPS)
         self._poly_limiter = RateLimiter(POLY_MAX_RPS)
@@ -830,7 +874,7 @@ class MarketFetcher:
             "settled", "closed", "finalized", "determined",
             "ceased_trading", "complete",
         ) or result:
-            logging.info(
+            logging.debug(
                 "[Kalshi] Market %s resolved (status=%s, result=%s)",
                 ticker, status, result,
             )
@@ -890,7 +934,7 @@ class MarketFetcher:
         )
 
         if data.get("closed") is True or data.get("active") is False:
-            logging.info(
+            logging.debug(
                 "[Polymarket] Market %s… resolved (closed=%s, active=%s)",
                 condition_id[:16], data.get("closed"), data.get("active"),
             )
@@ -1201,12 +1245,15 @@ class KalshiOrderClient:
       - KALSHI-ACCESS-TIMESTAMP: timestamp in milliseconds
 
     Endpoints:
-      - POST   /trade-api/v2/portfolio/orders           — place order
-      - GET    /trade-api/v2/portfolio/orders/{order_id} — check status
-      - DELETE /trade-api/v2/portfolio/orders/{order_id} — cancel order
+      - POST   /trade-api/v2/portfolio/events/orders           — place order (V2)
+      - GET    /trade-api/v2/portfolio/orders/{order_id}        — check status
+      - DELETE /trade-api/v2/portfolio/events/orders/{order_id} — cancel order (V2)
     """
 
-    ORDER_PATH = "/trade-api/v2/portfolio/orders"
+    ORDER_PATH = "/trade-api/v2/portfolio/events/orders"
+    # Legacy path kept for GET-only endpoints (get_order, get_orders)
+    # that haven't been deprecated yet.
+    ORDER_PATH_LEGACY = "/trade-api/v2/portfolio/orders"
 
     def __init__(self) -> None:
         self._session: Optional[aiohttp.ClientSession] = None
@@ -1268,6 +1315,32 @@ class KalshiOrderClient:
         if self._session is None or self._session.closed:
             self._session = aiohttp.ClientSession()
 
+    @staticmethod
+    def _to_v2_side(action: str, side: str) -> tuple[str, bool]:
+        """Convert V1 action+side to V2 book side.
+
+        V2 uses a single-book model quoting from the YES side:
+          bid = buy YES,  ask = sell YES.
+        Buying NO at price X  ≡  selling YES at (1-X).
+        Selling NO at price X ≡  buying YES at (1-X).
+
+        Returns:
+            (v2_side, invert_price): v2_side is 'bid' or 'ask',
+            invert_price is True when the caller's price_cents must be
+            subtracted from 100.
+        """
+        a, s = action.lower(), side.lower()
+        if a == "buy" and s == "yes":
+            return "bid", False
+        elif a == "sell" and s == "yes":
+            return "ask", False
+        elif a == "buy" and s == "no":
+            return "ask", True
+        elif a == "sell" and s == "no":
+            return "bid", True
+        else:
+            raise ValueError(f"Invalid action/side: {action}/{side}")
+
     async def place_order(
         self,
         ticker: str,
@@ -1278,7 +1351,12 @@ class KalshiOrderClient:
         time_in_force: str = "immediate_or_cancel",
         client_order_id: str = "",
     ) -> dict:
-        """Place an order on Kalshi.
+        """Place an order on Kalshi (V2 endpoint).
+
+        The external signature preserves V1 semantics (action+side+cents)
+        for backward compatibility.  Internally, the V1 parameters are
+        translated to the V2 wire format (single-book bid/ask, fixed-point
+        dollar prices).
 
         Args:
             ticker: Market ticker (e.g. KXNBAGAME-26FEB24GSWNOP-GSW)
@@ -1295,29 +1373,30 @@ class KalshiOrderClient:
 
         Returns:
             The order dict from the API response, including:
-              order_id, status, remaining_count, etc.
+              order_id, remaining_count, fill_count, etc.
         """
         await self._ensure_session()
         await self._limiter.acquire()
 
+        # ── Translate V1 args → V2 wire format ──
+        v2_side, invert = self._to_v2_side(action, side)
+        v2_price_cents = (100 - price_cents) if invert else price_cents
+        v2_price_str = f"{v2_price_cents / 100:.4f}"  # e.g. "0.5000"
+        v2_count_str = f"{count:.2f}"  # e.g. "1.00"
+
         path = self.ORDER_PATH
         headers = self._sign_request("POST", path)
 
-        body = {
+        body: dict = {
             "ticker": ticker,
-            "action": action,
-            "side": side,
-            "type": "limit",
-            "count": count,
+            "side": v2_side,
+            "count": v2_count_str,
+            "price": v2_price_str,
             "time_in_force": time_in_force,
+            "self_trade_prevention_type": "taker_at_cross",
         }
         if client_order_id:
             body["client_order_id"] = client_order_id
-        # Kalshi expects yes_price or no_price depending on side
-        if side == "yes":
-            body["yes_price"] = price_cents
-        else:
-            body["no_price"] = price_cents
 
         url = f"{self._base}{path}"
 
@@ -1334,17 +1413,34 @@ class KalshiOrderClient:
                         count, price_cents, resp.status, data,
                     )
                     return {"error": True, "status_code": resp.status, "detail": data}
-                order = data.get("order", data)
+                # V2 response is flat (no "order" wrapper)
+                order_id = data.get("order_id", "?")
+                fill_count = data.get("fill_count_fp", data.get("fill_count", "0"))
+                remaining = data.get("remaining_count_fp", data.get("remaining_count", "0"))
                 logging.info(
                     "[Kalshi-Order] %s %s %s x%d @ %dc → "
-                    "order_id=%s status=%s remaining=%s",
+                    "order_id=%s filled=%s remaining=%s",
                     action.upper(), side.upper(), ticker,
                     count, price_cents,
-                    order.get("order_id", "?"),
-                    order.get("status", "?"),
-                    order.get("remaining_count", "?"),
+                    order_id, fill_count, remaining,
                 )
-                return order
+                # Normalize to match what callers expect
+                data["order_id"] = order_id
+                data["fill_count"] = fill_count
+                data["remaining_count"] = remaining
+                # V2 reports the VWAP fill price in the single-book
+                # (YES) price space; translate back into the caller's
+                # (action, side) space so a NO buy sees its NO price.
+                avg_fill = data.get("average_fill_price")
+                if avg_fill is not None:
+                    try:
+                        avg_d = Decimal(str(avg_fill))
+                        if invert:
+                            avg_d = ONE - avg_d
+                        data["average_fill_price"] = str(avg_d)
+                    except ArithmeticError:
+                        data.pop("average_fill_price", None)
+                return data
         except (aiohttp.ClientError, asyncio.TimeoutError, ValueError) as exc:
             # ValueError covers json.JSONDecodeError: gateways can return
             # non-JSON error bodies (HTML 502 pages) that must surface as
@@ -1353,11 +1449,14 @@ class KalshiOrderClient:
             return {"error": True, "detail": str(exc)}
 
     async def get_order(self, order_id: str) -> dict:
-        """Check the status of an existing order."""
+        """Check the status of an existing order.
+
+        Uses the legacy GET path which is still supported.
+        """
         await self._ensure_session()
         await self._limiter.acquire()
 
-        path = f"{self.ORDER_PATH}/{order_id}"
+        path = f"{self.ORDER_PATH_LEGACY}/{order_id}"
         headers = self._sign_request("GET", path)
 
         url = f"{self._base}{path}"
@@ -1378,11 +1477,12 @@ class KalshiOrderClient:
 
         Useful for reconciliation: pass ticker=... to find orders
         placed during a timeout when we don't have the order_id.
+        Uses the legacy GET path which is still supported.
         """
         await self._ensure_session()
         await self._limiter.acquire()
 
-        path = self.ORDER_PATH
+        path = self.ORDER_PATH_LEGACY
         headers = self._sign_request("GET", path)
 
         url = f"{self._base}{path}"
@@ -1452,7 +1552,7 @@ class KalshiOrderClient:
             return None
 
     async def cancel_order(self, order_id: str) -> dict:
-        """Cancel an order."""
+        """Cancel an order (V2 endpoint)."""
         await self._ensure_session()
         await self._limiter.acquire()
 
@@ -1467,7 +1567,7 @@ class KalshiOrderClient:
                 url, headers=headers, timeout=timeout,
             ) as resp:
                 data = await resp.json(content_type=None)
-                return data.get("order", data) if resp.status < 400 else data
+                return data if resp.status < 400 else data
         except (aiohttp.ClientError, asyncio.TimeoutError, ValueError) as exc:
             logging.error("[Kalshi-Order] cancel_order failed: %s", exc)
             return {"error": True, "detail": str(exc)}
@@ -1527,12 +1627,12 @@ class PolymarketOrderClient:
         if self._client is not None:
             return
         try:
-            from py_clob_client.client import ClobClient
-            from py_clob_client.clob_types import ApiCreds
+            from py_clob_client_v2 import ClobClient
+            from py_clob_client_v2.clob_types import ApiCreds
         except ImportError:
             raise ImportError(
-                "py_clob_client is required for live Polymarket trading. "
-                "Install with: pip install py-clob-client"
+                "py_clob_client_v2 is required for live Polymarket trading. "
+                "Install with: pip install py-clob-client-v2"
             )
 
         key = self._load_private_key()
@@ -1553,8 +1653,10 @@ class PolymarketOrderClient:
             key=key,
             chain_id=POLY_CHAIN_ID,
             creds=creds,
+            signature_type=POLY_SIGNATURE_TYPE,
+            funder=POLY_FUNDER_ADDRESS or None,
         )
-        logging.info(
+        logging.debug(
             "[Poly-Order] ClobClient initialized (chain_id=%d)", POLY_CHAIN_ID,
         )
 
@@ -1589,20 +1691,22 @@ class PolymarketOrderClient:
             side: "buy" or "sell"
             price: Limit price (0.0-1.0)
             size: Number of contracts (as float for py_clob_client)
-            order_type: "fok" (default) or "gtc"
+            order_type: "fak" (default), "fok", or "gtc"
 
         Returns:
             Response dict with orderID, status ("matched"/"unmatched"), etc.
         """
         self._ensure_client()
 
-        from py_clob_client.clob_types import OrderArgs, OrderType
-        from py_clob_client.order_builder.constants import BUY, SELL
+        from py_clob_client_v2.clob_types import OrderArgsV2, OrderType
 
-        clob_side = BUY if side.lower() == "buy" else SELL
-        ot = OrderType.FOK if order_type.lower() == "fok" else OrderType.GTC
+        clob_side = "BUY" if side.lower() == "buy" else "SELL"
+        ot = (
+            OrderType.FAK if order_type.lower() == "fak"
+            else (OrderType.FOK if order_type.lower() == "fok" else OrderType.GTC)
+        )
 
-        order_args = OrderArgs(
+        order_args = OrderArgsV2(
             token_id=token_id,
             price=price,
             size=size,
@@ -1618,7 +1722,8 @@ class PolymarketOrderClient:
                 response = await asyncio.to_thread(_sync_create_and_post)
             order_id = response.get("orderID", "?") if isinstance(response, dict) else "?"
             status = response.get("status", "?") if isinstance(response, dict) else str(response)
-            logging.info(
+            log_fn = logging.debug if str(status).lower() == "delayed" else logging.info
+            log_fn(
                 "[Poly-Order] %s %s token=%s… size=%.1f @ %.4f → "
                 "orderID=%s status=%s",
                 side.upper(), order_type.upper(),
@@ -1626,7 +1731,7 @@ class PolymarketOrderClient:
             )
             return response if isinstance(response, dict) else {"raw": response}
         except Exception as exc:
-            logging.error("[Poly-Order] place_order failed: %s", exc, exc_info=True)
+            logging.debug("[Poly-Order] place_order failed: %s", exc)
             return {"error": True, "detail": str(exc)}
 
     async def get_order(self, order_id: str) -> dict:
@@ -1653,11 +1758,25 @@ class PolymarketOrderClient:
         self._ensure_client()
         try:
             async with self._order_lock:
-                result = await asyncio.to_thread(self._client.cancel, order_id)
+                result = await asyncio.to_thread(self._client.cancel_orders, [order_id])
             return result if isinstance(result, dict) else {"raw": result}
         except Exception as exc:
             logging.error("[Poly-Order] cancel_order failed: %s", exc)
             return {"error": True, "detail": str(exc)}
+
+    async def get_token_balance(self, token_id: str) -> float:
+        """Fetch CTF conditional token balance for a specific outcome token."""
+        self._ensure_client()
+        try:
+            from py_clob_client_v2.clob_types import BalanceAllowanceParams, AssetType
+            params = BalanceAllowanceParams(asset_type=AssetType.CONDITIONAL, token_id=token_id)
+            async with self._order_lock:
+                res = await asyncio.to_thread(self._client.get_balance_allowance, params)
+            if isinstance(res, dict) and "balance" in res:
+                return float(res["balance"]) / 1e6
+        except Exception as exc:
+            logging.debug("[Poly-Order] get_token_balance failed: %s", exc)
+        return 0.0
 
     async def _get_collateral_info(self) -> Optional[dict]:
         """Fetch USDC balance/allowance via py_clob_client (best effort).
@@ -1667,11 +1786,14 @@ class PolymarketOrderClient:
         """
         self._ensure_client()
         try:
-            from py_clob_client.clob_types import (
+            from py_clob_client_v2.clob_types import (
                 AssetType,
                 BalanceAllowanceParams,
             )
-            params = BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
+            params = BalanceAllowanceParams(
+                asset_type=AssetType.COLLATERAL,
+                signature_type=POLY_SIGNATURE_TYPE,
+            )
             async with self._order_lock:
                 result = await asyncio.to_thread(
                     self._client.get_balance_allowance, params,
@@ -1686,8 +1808,12 @@ class PolymarketOrderClient:
     async def get_collateral_balance(self) -> Optional[Decimal]:
         """USDC balance in dollars, or None if the check is unavailable.
 
-        The CLOB reports collateral in micro-USDC (6 decimals).
+        Only POLY_PROXY (signature_type 1) wallets hold collateral in the
+        CLOB's internal ledger.  EOA (0) and Gnosis Safe (2) wallets hold
+        USDC on-chain — the API always reports 0, which is not actionable.
         """
+        if POLY_SIGNATURE_TYPE != 1:
+            return None
         info = await self._get_collateral_info()
         if info is None or info.get("balance") is None:
             return None
@@ -1723,7 +1849,7 @@ class PolymarketOrderClient:
                 allowance,
             )
         else:
-            logging.info(
+            logging.debug(
                 "[Poly-Order] Collateral allowance present: %r", allowance,
             )
 
@@ -1929,7 +2055,7 @@ class PolymarketWS:
             )
             self._connected = True
             self._reconnect_attempts = 0
-            logging.info("[Poly-WS] Connected to %s", POLY_WS_URL)
+            logging.debug("[Poly-WS] Connected to %s", POLY_WS_URL)
 
             # Re-subscribe if reconnecting
             if self._subscribed_assets:
@@ -1938,8 +2064,8 @@ class PolymarketWS:
                     "type": "market",
                 }
                 await self._ws.send_json(msg)
-                logging.info(
-                    "[Poly-WS] Re-subscribed to %d assets",
+                logging.debug(
+                    "[Poly-WS] Re-subscribed to %d markets.",
                     len(self._subscribed_assets),
                 )
 
@@ -2178,9 +2304,9 @@ class PolymarketWS:
         if new_assets and self._connected and self._ws and not self._ws.closed:
             msg = {"assets_ids": new_assets, "type": "market"}
             await self._ws.send_json(msg)
-            logging.info(
-                "[Poly-WS] Subscribed to %d new assets for %s…",
-                len(new_assets), condition_id[:16],
+            logging.debug(
+                "[Poly-WS] Subscribed to %d new markets.",
+                len(new_assets),
             )
 
     def remove_market(self, condition_id: str) -> None:
@@ -2199,7 +2325,7 @@ class PolymarketWS:
                 self._books.pop(tok, None)
                 if tok in self._subscribed_assets:
                     self._subscribed_assets.remove(tok)
-        logging.info(
+        logging.debug(
             "[Poly-WS] Removed resolved market %s…", condition_id[:16],
         )
 
@@ -2378,7 +2504,7 @@ class KalshiWS:
             )
             self._connected = True
             self._reconnect_attempts = 0
-            logging.info("[Kalshi-WS] Connected to %s", KALSHI_WS_URL)
+            logging.debug("[Kalshi-WS] Connected to %s", KALSHI_WS_URL)
 
             # Re-subscribe if reconnecting
             if self._subscribed_tickers:
@@ -2392,8 +2518,8 @@ class KalshiWS:
                     },
                 }
                 await self._ws.send_json(msg)
-                logging.info(
-                    "[Kalshi-WS] Re-subscribed to %d tickers",
+                logging.debug(
+                    "[Kalshi-WS] Re-subscribed to %d markets.",
                     len(self._subscribed_tickers),
                 )
 
@@ -2409,7 +2535,7 @@ class KalshiWS:
                     },
                 }
                 await self._ws.send_json(fill_msg)
-                logging.info("[Kalshi-WS] Re-subscribed to fill channel.")
+                logging.debug("[Kalshi-WS] Re-subscribed to fill channel.")
 
             self._cancel_conn_tasks()
             self._listen_task = asyncio.create_task(self._listen_loop())
@@ -2643,7 +2769,7 @@ class KalshiWS:
                 },
             }
             await self._ws.send_json(msg)
-            logging.info("[Kalshi-WS] Subscribed to %s", ticker)
+            logging.debug("[Kalshi-WS] Subscribed to %s", ticker)
 
     async def subscribe_fills(self) -> None:
         """Subscribe to the fill channel for live order tracking (Phase 3).
@@ -2672,7 +2798,7 @@ class KalshiWS:
         }
         await self._ws.send_json(msg)
         self._fills_subscribed = True
-        logging.info(
+        logging.debug(
             "[Kalshi-WS] Subscribed to fill channel for %d tickers.",
             len(self._subscribed_tickers),
         )
@@ -2690,7 +2816,7 @@ class KalshiWS:
         self._books.pop(ticker, None)
         if ticker in self._subscribed_tickers:
             self._subscribed_tickers.remove(ticker)
-        logging.info("[Kalshi-WS] Removed resolved market %s", ticker)
+        logging.debug("[Kalshi-WS] Removed resolved market %s", ticker)
 
     def register_fill_waiter(self, order_id: str) -> asyncio.Future:
         """Register a Future that resolves when fill(s) arrive for order_id.
@@ -3141,7 +3267,7 @@ class WSRecorder:
                 )
                 self._files[platform] = (day, open(path, "ab"))
                 self._last_flush[platform] = now
-                logging.info("[Recorder] Capturing %s WS → %s", platform, path)
+                logging.debug("[Recorder] Capturing %s WS → %s", platform, path)
 
             line = json.dumps({"ts": now, "raw": raw}) + "\n"
             self._buffers.setdefault(platform, []).append(
@@ -3514,7 +3640,7 @@ class PaperPortfolio:
         self.total_unwind_losses = restored["unwind_losses"]
         self.closed_count = restored["closed_count"]
         self.open_positions = self._store.load_positions()
-        logging.info(
+        logging.debug(
             "[State] Restored portfolio: capital $%s, %d open position(s), "
             "realized P&L $%s",
             self.capital.quantize(Q2), len(self.open_positions),
@@ -4089,10 +4215,16 @@ class UnwindManager:
         poly_ws: Optional["PolymarketWS"] = None,
         fetcher: Optional["MarketFetcher"] = None,
         state_store: Optional[StateStore] = None,
+        min_fill_margin: Decimal = MIN_PROFIT_MARGIN,
     ) -> None:
         self._portfolio = portfolio
         self._pnl_tracker = pnl_tracker
         self._timeout = timeout
+        # Floor for the Leg 2 reservation price: the Kalshi IOC goes out
+        # at the highest price that still nets this margin after fees,
+        # so a moved book fills at a degraded-but-acceptable price
+        # instead of missing and forcing an unwind of Leg 1.
+        self._min_fill_margin = min_fill_margin
         self._logger = logger or UnwindLogger()
         # Active unwind orders (in-flight — not yet COMPLETE/UNWOUND/FAILED)
         self._active: dict[str, UnwindOrder] = {}
@@ -4124,9 +4256,8 @@ class UnwindManager:
 
     # ── Leg construction ──────────────────────────────────────────
 
-    @staticmethod
     def _build_legs(
-        opp: ArbOpportunity, contracts: int,
+        self, opp: ArbOpportunity, contracts: int,
     ) -> tuple[LegOrder, LegOrder]:
         """Create Leg 1 (Polymarket) and Leg 2 (Kalshi) from an opp.
 
@@ -4135,6 +4266,14 @@ class UnwindManager:
         FOK fails, we avoid placing the Kalshi IOC at all — no legging
         risk.  Kalshi IOC (Leg 2) is more reliable and supports partial
         fills, making it the safer second leg.
+
+        Leg 2 carries a reservation-price ceiling (`limit_price`): the
+        highest Kalshi price that still nets `min_fill_margin` after
+        fees given the Leg 1 price.  The exchange fills at book prices
+        (the limit is a ceiling), so the common case executes at the
+        observed ask while a book that moved between detection and
+        execution fills at any still-acceptable deeper level instead
+        of missing entirely.
         """
         if "YES@Kalshi" in opp.direction:
             # Direction A: Buy NO @ Polymarket + Buy YES @ Kalshi
@@ -4164,6 +4303,17 @@ class UnwindManager:
                 price=opp.kalshi_price, contracts=contracts,
                 market_id=opp.kalshi_ticker,
             )
+
+        # Reservation ceiling for Leg 2.  Never below the observed ask:
+        # the detected opp already cleared the engine's margin gate, so
+        # the observed price must always remain fillable.
+        reservation = kalshi_reservation_price(
+            opp.poly_price, self._min_fill_margin,
+        )
+        leg2.limit_price = (
+            opp.kalshi_price if reservation is None
+            else max(reservation, opp.kalshi_price)
+        )
         return leg1, leg2
 
     # ── Core execution ────────────────────────────────────────────
@@ -4244,56 +4394,19 @@ class UnwindManager:
                 leg2.contracts = actual_contracts
                 uw.total_contracts = actual_contracts
 
-            # ── Spread re-verification after Leg 1 fill ──
-            # Sports markets have a 3-second matching delay.  During
-            # that window the Kalshi price may have moved, making the
-            # arb unprofitable.  Re-fetch the Kalshi book and verify
-            # the spread still holds before committing Leg 2.
-            if self._live_mode and self._fetcher is not None:
-                kalshi_snap = await self._fetcher.fetch_kalshi(
-                    leg2.market_id, priority=True,
-                )
-                if kalshi_snap is not None:
-                    # Pick the correct side's best ask
-                    side_book = (
-                        kalshi_snap.yes if leg2.side == "yes"
-                        else kalshi_snap.no
-                    )
-                    fresh_ask = side_book.best_ask
-                    if fresh_ask is not None and fresh_ask > ZERO:
-                        new_cost = (leg1.price + fresh_ask).quantize(Q4)
-                        k_fee = kalshi_taker_fee(fresh_ask, 1)
-                        p_fee = poly_taker_fee(leg1.price, 1)
-                        new_net = (ONE - new_cost - k_fee - p_fee).quantize(Q4)
-                        if new_net <= ZERO:
-                            logging.warning(
-                                "  [Unwind %s] Spread evaporated after Leg 1 "
-                                "fill (new_net=$%s). Unwinding.",
-                                uw.unwind_id, new_net.quantize(Q4),
-                            )
-                            uw.error_message = (
-                                f"Spread gone after Leg 1 fill "
-                                f"(net={new_net}). Unwinding."
-                            )
-                            await self._unwind(uw)
-                            return uw
-                        # Update Leg 2 price to the fresh ask
-                        leg2.price = fresh_ask
-                        uw.net_profit_per_contract = new_net
-                        logging.info(
-                            "  [Unwind %s] Spread re-verified: "
-                            "fresh Kalshi ask=$%s, new net=$%s",
-                            uw.unwind_id,
-                            fresh_ask.quantize(Q4),
-                            new_net.quantize(Q4),
-                        )
-
             # ── Step 2: Submit Leg 2 (Kalshi IOC — more reliable) ──
+            # No book refetch here: every millisecond after Leg 1 fills
+            # is legging risk.  Leg 2 goes out immediately with its
+            # reservation-price ceiling (set in _build_legs), so the
+            # margin floor is enforced by the exchange's matching
+            # engine atomically instead of by a stale REST snapshot.
             uw.status = UnwindStatus.LEG2_SUBMITTED
             logging.info(
-                "  [Unwind %s] Leg 2 SUBMITTED: %s %s @ $%s × %d on %s",
+                "  [Unwind %s] Leg 2 SUBMITTED: %s %s @ $%s × %d on %s "
+                "(ceiling $%s)",
                 uw.unwind_id, "BUY", leg2.side.upper(),
                 leg2.price.quantize(Q4), leg2.contracts, leg2.platform,
+                (leg2.limit_price or leg2.price).quantize(Q4),
             )
 
             leg2_ok = await self._submit_leg(leg2)
@@ -4309,6 +4422,16 @@ class UnwindManager:
                 )
                 await self._unwind(uw)
                 return uw
+
+            # Realized economics from EXECUTED prices: Leg 2 may have
+            # filled below the observed ask (price improvement) or
+            # above it, up to its reservation ceiling.  In paper mode
+            # the leg prices are unchanged, so this equals opp.net_profit.
+            uw.net_profit_per_contract = (
+                ONE - leg1.price - leg2.price
+                - kalshi_taker_fee(leg2.price, 1)
+                - poly_taker_fee(leg1.price, 1)
+            ).quantize(Q4)
 
             if leg2.filled_contracts < leg2.contracts:
                 # Leg 2 partial fill — unwind the excess from Leg 1
@@ -4699,8 +4822,12 @@ class UnwindManager:
             leg.status = LegStatus.FAILED
             return False
 
-        # Convert Decimal price to cents (Kalshi uses integer cents)
-        price_cents = int((leg.price * HUNDRED).quantize(D("1")))
+        # Wire price: the reservation ceiling when present (Leg 2),
+        # else the leg's expected price.  Kalshi uses integer cents.
+        wire_price = (
+            leg.limit_price if leg.limit_price is not None else leg.price
+        )
+        price_cents = int((wire_price * HUNDRED).quantize(D("1")))
 
         # Step 1: Submit the IOC order
         # Use a client_order_id so we can reconcile on timeout.
@@ -4726,7 +4853,7 @@ class UnwindManager:
                 isinstance(status_code, int) and 400 <= status_code < 500
             )
             if not clean_reject:
-                logging.warning(
+                logging.debug(
                     "[Unwind] Kalshi order POST outcome ambiguous "
                     "(client_order_id=%s, detail=%s). Reconciling via "
                     "REST poll…",
@@ -4751,21 +4878,34 @@ class UnwindManager:
         leg.exchange_order_id = order_id
         status = str(result.get("status", "")).lower()
         remaining = _int_or(
-            result.get("remaining_count", leg.contracts), leg.contracts,
+            result.get("remaining_count_fp", result.get("remaining_count")), 0,
         )
-        filled = leg.contracts - remaining
+        filled = _int_or(
+            result.get("fill_count_fp", result.get("fill_count")), -1,
+        )
+        if filled < 0:
+            # V1-style responses carry only remaining_count — derive.
+            filled = max(0, leg.contracts - remaining)
 
         logging.info(
             "[Unwind] Kalshi order %s: status=%s filled=%d/%d remaining=%d",
             order_id, status, filled, leg.contracts, remaining,
         )
 
-        # Step 2/3: Check if IOC already completed (typical case)
-        if remaining == 0 or status in ("executed", "filled"):
+        # Step 2/3: Check if IOC filled or was killed
+        if filled >= leg.contracts or status in ("executed", "filled"):
             leg.status = LegStatus.FILLED
             leg.filled_contracts = leg.contracts
             leg.filled_at = _utc_iso()
+            self._record_kalshi_buy_price(leg, result, wire_price)
             return True
+
+        if status == "canceled" and filled == 0:
+            logging.error(
+                "[Unwind] Kalshi order %s killed with 0 fills.", order_id,
+            )
+            leg.status = LegStatus.FAILED
+            return False
 
         if filled > 0:
             # Partial fill — a genuine IOC cancelled the rest.  If the
@@ -4783,6 +4923,7 @@ class UnwindManager:
             )
             leg.filled_contracts = filled
             leg.filled_at = _utc_iso()
+            self._record_kalshi_buy_price(leg, result, wire_price)
             logging.info(
                 "[Unwind] Kalshi IOC partial fill: %d/%d contracts.",
                 filled, leg.contracts,
@@ -4843,6 +4984,9 @@ class UnwindManager:
                     )
                     leg.filled_contracts = filled_final
                     leg.filled_at = _utc_iso()
+                    self._record_kalshi_buy_price(
+                        leg, poll_result, wire_price,
+                    )
                     return True
 
                 # No fill reported.  A genuine IOC is already cancelled by
@@ -4862,6 +5006,7 @@ class UnwindManager:
                     )
                     leg.filled_contracts = late_fills
                     leg.filled_at = _utc_iso()
+                    self._record_kalshi_buy_price(leg, {}, wire_price)
                     return True
         finally:
             if waiter_registered:
@@ -4874,6 +5019,32 @@ class UnwindManager:
             order_id,
         )
         return False
+
+    @staticmethod
+    def _record_kalshi_buy_price(
+        leg: LegOrder, result: dict, wire_price: Optional[Decimal] = None,
+    ) -> None:
+        """Record the executed price for a filled Kalshi buy leg.
+
+        Uses the V2 response's side-normalized VWAP (`average_fill_price`)
+        when present — fills can price-improve below the observed ask or
+        walk deeper levels up to the reservation ceiling.  When the
+        response carries no fill price (WS/poll/reconcile paths), falls
+        back to the wire limit price: a conservative upper bound, so
+        booked capital never overstates what is actually left.
+        """
+        if wire_price is None:
+            wire_price = (
+                leg.limit_price if leg.limit_price is not None else leg.price
+            )
+        avg = result.get("average_fill_price")
+        if avg is not None:
+            try:
+                leg.price = Decimal(str(avg))
+                return
+            except ArithmeticError:
+                pass
+        leg.price = wire_price
 
     async def _cancel_kalshi_remainder(
         self, leg: LegOrder, order_id: str, already_filled: int,
@@ -4950,9 +5121,15 @@ class UnwindManager:
             order_id = order.get("order_id", "")
             leg.exchange_order_id = order_id
             remaining = _int_or(
-                order.get("remaining_count", leg.contracts), leg.contracts,
+                order.get("remaining_count_fp", order.get("remaining_count")),
+                leg.contracts,
             )
-            filled = leg.contracts - remaining
+            filled = _int_or(
+                order.get("fill_count_fp", order.get("fill_count")), -1,
+            )
+            if filled < 0:
+                # V1-style order objects carry only remaining_count — derive.
+                filled = max(0, leg.contracts - remaining)
 
             logging.info(
                 "[Unwind] Reconciled Kalshi order %s "
@@ -4961,9 +5138,12 @@ class UnwindManager:
             )
 
             if filled > 0:
-                leg.status = LegStatus.FILLED if remaining == 0 else LegStatus.PARTIAL
+                leg.status = LegStatus.FILLED if filled >= leg.contracts else LegStatus.PARTIAL
                 leg.filled_contracts = filled
                 leg.filled_at = _utc_iso()
+                # No side-normalized VWAP available on this path —
+                # record the wire ceiling (conservative upper bound).
+                self._record_kalshi_buy_price(leg, {}, None)
                 return True
 
             # Order was found but 0 fills
@@ -5008,17 +5188,17 @@ class UnwindManager:
             leg.status = LegStatus.FAILED
             return False
 
-        # Submit FOK buy order
+        # Submit FAK buy order (Immediate-or-Cancel / Fill-And-Kill)
         result = await self._poly_client.place_order(
             token_id=token_id,
             side="buy",
             price=float(leg.price),
             size=float(leg.contracts),
-            order_type="fok",
+            order_type="fak",
         )
 
         if result.get("error"):
-            logging.error("[Unwind] Poly order failed: %s", result.get("detail"))
+            logging.debug("[Unwind] Poly order failed: %s", result.get("detail"))
             leg.status = LegStatus.FAILED
             return False
 
@@ -5026,26 +5206,43 @@ class UnwindManager:
         leg.exchange_order_id = order_id
         status = str(result.get("status", "")).lower()
 
+        def _extract_poly_filled(data: dict, requested: int) -> int:
+            raw = (
+                data.get("taking_amount")
+                or data.get("takingAmount")
+                or data.get("size_matched")
+                or data.get("sizeMatched")
+            )
+            if raw is not None:
+                try:
+                    cnt = int(float(raw))
+                    return min(max(1, cnt), requested)
+                except (ValueError, TypeError):
+                    pass
+            return requested
+
         if status == "matched":
+            filled_cnt = _extract_poly_filled(result, leg.contracts)
             leg.status = LegStatus.FILLED
-            leg.filled_contracts = leg.contracts
+            leg.filled_contracts = filled_cnt
             leg.filled_at = _utc_iso()
             logging.info(
-                "[Unwind] Poly FOK matched: orderID=%s, %d contracts.",
-                order_id, leg.contracts,
+                "[Unwind] Poly FAK matched: orderID=%s, %d/%d contracts.",
+                order_id, filled_cnt, leg.contracts,
             )
             return True
 
         if status == "delayed":
             # Rare: order is still being processed.  Poll for result.
-            logging.info("[Unwind] Poly FOK delayed — polling for result…")
+            logging.debug("[Unwind] Poly FAK delayed — polling for result…")
             for _ in range(int(self._timeout * 1000 / KALSHI_FILL_POLL_MS)):
                 await asyncio.sleep(KALSHI_FILL_POLL_MS / 1000)
                 poll = await self._poly_client.get_order(order_id)
                 poll_status = str(poll.get("status", "")).lower()
                 if poll_status == "matched":
+                    filled_cnt = _extract_poly_filled(poll, leg.contracts)
                     leg.status = LegStatus.FILLED
-                    leg.filled_contracts = leg.contracts
+                    leg.filled_contracts = filled_cnt
                     leg.filled_at = _utc_iso()
                     return True
                 if poll_status in ("unmatched", "canceled", "cancelled"):
@@ -5057,23 +5254,24 @@ class UnwindManager:
                 # then check one last time in case it matched while the
                 # cancel was in flight.
                 logging.warning(
-                    "[Unwind] Poly FOK still delayed after %ds — "
+                    "[Unwind] Poly FAK still delayed after %ds — "
                     "cancelling order %s.",
                     self._timeout, order_id,
                 )
                 await self._poly_client.cancel_order(order_id)
                 final = await self._poly_client.get_order(order_id)
                 if str(final.get("status", "")).lower() == "matched":
+                    filled_cnt = _extract_poly_filled(final, leg.contracts)
                     leg.status = LegStatus.FILLED
-                    leg.filled_contracts = leg.contracts
+                    leg.filled_contracts = filled_cnt
                     leg.filled_at = _utc_iso()
                     return True
 
-        # FOK was killed (unmatched) or timed out
+        # FAK was killed (unmatched) or timed out
         leg.status = LegStatus.FAILED
         leg.filled_contracts = 0
         logging.warning(
-            "[Unwind] Poly FOK unmatched/killed: orderID=%s status=%s",
+            "[Unwind] Poly FAK unmatched/killed: orderID=%s status=%s",
             order_id, status,
         )
         return False
@@ -5305,15 +5503,25 @@ class UnwindManager:
             return False
 
         # Cap FOK size to fillable depth at/above the floor
-        unwind_size = min(leg.contracts, total_bids)
+        unwind_size = float(min(leg.contracts, total_bids))
+
+        # Check actual token balance held in wallet to avoid selling more than we own
+        actual_bal = await self._poly_client.get_token_balance(token_id)
+        if actual_bal > 0 and actual_bal < unwind_size:
+            logging.info(
+                "[Unwind] Poly sell: wallet holds %.2f contracts (capping unwind from %.1f).",
+                actual_bal, unwind_size,
+            )
+            unwind_size = actual_bal
+
         if unwind_size < leg.contracts:
             logging.warning(
-                "[Unwind] Poly sell: capping FOK to %d/%d contracts "
+                "[Unwind] Poly sell: capping FAK to %.2f/%d contracts "
                 "(fillable depth = %d).",
                 unwind_size, leg.contracts, total_bids,
             )
 
-        # ── Step 4: Send FOK at slippage-protected price ──
+        # ── Step 4: Send FAK at slippage-protected price ──
         sell_price = float(floor_price)
         logging.info(
             "[Unwind] Poly sell: buy_price=$%s → floor=$%.4f",
@@ -5324,12 +5532,12 @@ class UnwindManager:
             side="sell",
             price=sell_price,
             size=float(unwind_size),
-            order_type="fok",
+            order_type="fak",
         )
 
         if result.get("error"):
             logging.error(
-                "[Unwind] Poly sell API error: %s", result.get("error"),
+                "[Unwind] Poly sell API error: %s", result.get("detail", result.get("error")),
             )
             leg.status = LegStatus.FAILED
             leg.filled_contracts = 0
@@ -5512,6 +5720,7 @@ class DiscordNotifier:
     COLOR_GREEN = 0x2ECC71   # fills, success
     COLOR_RED = 0xE74C3C     # errors, rejects, circuit breaker
     COLOR_YELLOW = 0xF1C40F  # warnings, unwinds, reconnects
+    COLOR_BLUE = 0x3498DB    # opportunity detected
 
     def __init__(
         self,
@@ -5525,6 +5734,9 @@ class DiscordNotifier:
         self._min_interval = 1.0 / max_posts_per_sec if max_posts_per_sec > 0 else 0.2
         self._last_post: float = 0.0
         self._lock = asyncio.Lock()
+        # Cooldown tracker to prevent duplicate Arb Opp spam per (event_name, direction)
+        self._opp_cooldowns: dict[tuple[str, str], float] = {}
+        self._opp_cooldown_seconds: float = 60.0
 
     async def _ensure_session(self) -> None:
         if self._session is None or self._session.closed:
@@ -5633,6 +5845,8 @@ class DiscordNotifier:
 
     async def notify_reject(self, order: "Order") -> None:
         """Notify: order rejected (red embed)."""
+        if order.reject_reason == RejectReason.ORDER_RATE_LIMIT:
+            return
         await self.send(
             title="❌ Order Rejected",
             color=self.COLOR_RED,
@@ -5642,6 +5856,32 @@ class DiscordNotifier:
                 {"name": "Reason", "value": order.reject_reason.value, "inline": True},
                 {"name": "Desired Qty", "value": str(order.desired_contracts), "inline": True},
                 {"name": "Depth K/P", "value": f"{order.kalshi_depth}/{order.poly_depth}", "inline": True},
+            ],
+        )
+
+    async def notify_opp(self, opp: "ArbOpportunity") -> None:
+        """Notify: arbitrage opportunity detected (blue embed), deduplicated per event/direction."""
+        key = (opp.event_name, opp.direction)
+        now = time.time()
+        if now - self._opp_cooldowns.get(key, 0.0) < self._opp_cooldown_seconds:
+            return  # Skip duplicate notifications for the same event & direction within 60s
+        self._opp_cooldowns[key] = now
+
+        net_str = (
+            f"${opp.net_profit.quantize(Q4)}"
+            if opp.net_profit > ZERO
+            else f"-${abs(opp.net_profit).quantize(Q4)}"
+        )
+        await self.send(
+            title="🎯 Arbitrage Opportunity Detected",
+            color=self.COLOR_BLUE,
+            fields=[
+                {"name": "Event", "value": opp.event_name, "inline": True},
+                {"name": "Direction", "value": opp.direction, "inline": True},
+                {"name": "Gross Profit", "value": f"{(opp.gross_profit * HUNDRED).quantize(Q2)}%", "inline": True},
+                {"name": "Net Profit/c", "value": net_str, "inline": True},
+                {"name": "Fees/c", "value": f"${(opp.kalshi_fee + opp.poly_fee).quantize(Q4)}", "inline": True},
+                {"name": "Depth K/P", "value": f"{opp.kalshi_depth}/{opp.poly_depth}", "inline": True},
             ],
         )
 
@@ -5891,7 +6131,7 @@ class HealthServer:
         await site.start()
         # Resolve the actual port (supports port=0 in tests)
         self.port = site._server.sockets[0].getsockname()[1]
-        logging.info(
+        logging.debug(
             "[Health] Endpoint listening on http://%s:%d/health",
             self._host, self.port,
         )
@@ -5920,7 +6160,7 @@ async def _acquire_run_lock(store: StateStore, instance: str) -> bool:
             store.try_acquire_run_lock, instance, RUN_LOCK_STALE_SECONDS,
         )
         if acquired:
-            logging.info("[Lock] Run lock acquired (%s).", instance)
+            logging.debug("[Lock] Run lock acquired (%s).", instance)
             return True
         logging.warning(
             "[Lock] Another instance holds the run lock — retrying in 5s…",
@@ -5994,7 +6234,7 @@ async def _reconcile_startup_positions(
     ]
 
     if not mismatches:
-        logging.info(
+        logging.debug(
             "[Reconcile] Kalshi positions match persisted state "
             "(%d ticker(s)).", len(persisted),
         )
@@ -6090,7 +6330,7 @@ class StuckPositionMonitor:
 
     async def run(self, stop_event: asyncio.Event) -> None:
         """Main loop — runs until stop_event is set."""
-        logging.info(
+        logging.debug(
             "[StuckMonitor] Started (check every %ds, max age %ds)",
             self._check_interval, self._max_age,
         )
@@ -6171,6 +6411,8 @@ class ExecutionEngine:
         unwind_manager: Optional[UnwindManager] = None,
         notifier: Optional[DiscordNotifier] = None,
         max_trades_per_event: int = MAX_TRADES_PER_EVENT,
+        failed_cooldown_seconds: float = 0.0,
+        min_fill_margin: Decimal = MIN_PROFIT_MARGIN,
     ):
         self._portfolio = portfolio
         self._trader = trader
@@ -6178,6 +6420,10 @@ class ExecutionEngine:
         self._risk_manager = risk_manager
         self._unwind_manager = unwind_manager
         self._notifier = notifier
+        # Must match UnwindManager's floor: Leg 2 goes out with a
+        # reservation-price ceiling, so sizing and capital reservation
+        # cover a fill at that ceiling, not just the observed ask.
+        self._min_fill_margin = min_fill_margin
         self._max_trades_per_event = max_trades_per_event  # 0 = unlimited
         self._orders: list[Order] = []
         # Track how many times each event+direction combo has been traded
@@ -6193,6 +6439,9 @@ class ExecutionEngine:
         # this, concurrent submits on different events could each pass
         # the capital/exposure checks and collectively over-commit.
         self._reserved: Decimal = ZERO
+        # Cooldown tracker after failed trade attempts (e.g., FOK killed)
+        self._failed_cooldowns: dict[tuple[str, str], float] = {}
+        self._failed_cooldown_seconds: float = failed_cooldown_seconds
         # In-flight submit tasks (Phase 6): tracked so shutdown can drain
         # them before order clients close — killing the process between
         # legs strands a one-legged position.
@@ -6273,7 +6522,11 @@ class ExecutionEngine:
         # These return None without creating an Order, writing CSV,
         # or consuming a rate-limit slot.
 
-        # 1. Duplicate / in-flight check (respects MAX_TRADES_PER_EVENT)
+        # 1. Duplicate / in-flight & failure cooldown check
+        loop = asyncio.get_running_loop()
+        if loop.time() - self._failed_cooldowns.get(key, 0.0) < self._failed_cooldown_seconds:
+            return None
+
         trade_count = self._traded.get(key, 0)
         if self._max_trades_per_event > 0 and trade_count >= self._max_trades_per_event:
             logging.debug(
@@ -6304,7 +6557,22 @@ class ExecutionEngine:
         # 4. Size the trade from capital, position size, and book depth.
         #    Capital already reserved by other in-flight submissions is
         #    excluded — the portfolio only deducts once both legs fill.
-        cost_plus_fees = opp.total_cost + opp.kalshi_fee + opp.poly_fee
+        #    Sizing uses the WORST-CASE Kalshi execution price: Leg 2 is
+        #    placed with a reservation-price ceiling (UnwindManager.
+        #    _build_legs), so a fill can legitimately land above the
+        #    observed ask — reserving at the snapshot price would let
+        #    concurrent in-flight trades over-commit capital.
+        k_ceiling = kalshi_reservation_price(
+            opp.poly_price, self._min_fill_margin,
+        )
+        k_worst = (
+            opp.kalshi_price if k_ceiling is None
+            else max(k_ceiling, opp.kalshi_price)
+        )
+        worst_cost = (k_worst + opp.poly_price).quantize(Q4)
+        cost_plus_fees = (
+            worst_cost + kalshi_taker_fee(k_worst, 1) + opp.poly_fee
+        )
         if cost_plus_fees <= ZERO:
             return None
 
@@ -6342,13 +6610,29 @@ class ExecutionEngine:
         # Exact order-level cost: exchanges round fees once per ORDER,
         # not per contract, so ceil(per-contract fee) × N systematically
         # overstates fees (worst at extreme prices).  The fee functions
-        # already take a contract count — use them.
+        # already take a contract count — use them.  Priced at the
+        # worst-case Kalshi ceiling (see step 4) so the reservation
+        # covers the maximum possible booking.
         def _order_outlay(contracts: int) -> Decimal:
             return (
-                opp.total_cost * D(contracts)
-                + kalshi_taker_fee(opp.kalshi_price, contracts)
+                worst_cost * D(contracts)
+                + kalshi_taker_fee(k_worst, contracts)
                 + poly_taker_fee(opp.poly_price, contracts)
             ).quantize(Q4)
+
+        # Polymarket requires a minimum total order value of $1.00 for marketable orders
+        poly_order_val = opp.poly_price * D(desired)
+        if poly_order_val < D("1.00"):
+            import math
+            min_poly_contracts = int(math.ceil(D("1.00") / opp.poly_price))
+            if min_poly_contracts <= opp.max_contracts and _order_outlay(min_poly_contracts) <= available:
+                desired = min_poly_contracts
+            else:
+                logging.debug(
+                    "[Exec] Skipped [%s] %s — Polymarket order value $%.2f < $1.00 min",
+                    opp.event_name, opp.direction, float(poly_order_val),
+                )
+                return None
 
         # Safety net: the per-contract estimate above is always >= the
         # exact order cost, so this loop should never fire — but never
@@ -6405,9 +6689,11 @@ class ExecutionEngine:
                 await self._finalize(order)
                 return order
 
-        # ── Log the opportunity (console + CSV) ──
+        # ── Log the opportunity (console + CSV + Discord) ──
         _log_opportunity(opp)
         await self._trader.log(opp)
+        if self._notifier is not None:
+            asyncio.ensure_future(self._notifier.notify_opp(opp))
 
         # ── CREATE ORDER + EXECUTE ──
         order = self._make_order(opp, desired)
@@ -6445,8 +6731,10 @@ class ExecutionEngine:
                                 uw_order.net_profit_per_contract, paired,
                             )
                     else:
-                        # Nothing paired — unlock the key so the bot can retry.
+                        # Nothing paired — unlock key and apply 1.0s failure cooldown.
                         self._decrement_traded(key)
+                        loop = asyncio.get_running_loop()
+                        self._failed_cooldowns[key] = loop.time()
 
                     unwind_loss = getattr(uw_order, '_unwind_loss', ZERO)
                     if uw_order.status == UnwindStatus.UNWOUND:
@@ -6470,15 +6758,22 @@ class ExecutionEngine:
                 order.status = OrderStatus.FILLED
 
                 if self._risk_manager is not None:
-                    # Use the (possibly re-verified) net from the unwind
-                    # manager — after a Leg 2 price refresh, opp.net_profit
+                    # Use the realized net from the unwind manager —
+                    # Leg 2 may have filled away from the observed ask
+                    # (up to its reservation ceiling), so opp.net_profit
                     # is stale.
                     self._risk_manager.pnl_tracker.record(
                         uw_order.net_profit_per_contract, actual,
                     )
             else:
                 # Legacy path (no unwind manager) — instant paper fill
-                total_outlay = order_outlay(desired)
+                # at the OBSERVED prices (no reservation ceiling here,
+                # so the worst-case order_outlay would overstate cost).
+                total_outlay = (
+                    opp.total_cost * D(desired)
+                    + kalshi_taker_fee(opp.kalshi_price, desired)
+                    + poly_taker_fee(opp.poly_price, desired)
+                ).quantize(Q4)
                 order.filled_contracts = desired
                 order.total_outlay = total_outlay
                 order.status = OrderStatus.FILLED
@@ -6632,18 +6927,29 @@ class ExecutionEngine:
                 order.desired_contracts,
             )
         elif order.status == OrderStatus.REJECTED:
-            logging.info(
-                "  ORDER %s REJECTED: [%s] %s — %s "
-                "(wanted %d, depth K=%d P=%d)",
-                order.order_id,
-                order.event_name, order.direction,
-                order.reject_reason.value,
-                order.desired_contracts,
-                order.kalshi_depth, order.poly_depth,
-            )
-            # Phase 4: Discord notification
-            if self._notifier is not None:
-                asyncio.ensure_future(self._notifier.notify_reject(order))
+            if order.reject_reason == RejectReason.ORDER_RATE_LIMIT:
+                logging.debug(
+                    "  ORDER %s REJECTED: [%s] %s — %s "
+                    "(wanted %d, depth K=%d P=%d)",
+                    order.order_id,
+                    order.event_name, order.direction,
+                    order.reject_reason.value,
+                    order.desired_contracts,
+                    order.kalshi_depth, order.poly_depth,
+                )
+            else:
+                logging.info(
+                    "  ORDER %s REJECTED: [%s] %s — %s "
+                    "(wanted %d, depth K=%d P=%d)",
+                    order.order_id,
+                    order.event_name, order.direction,
+                    order.reject_reason.value,
+                    order.desired_contracts,
+                    order.kalshi_depth, order.poly_depth,
+                )
+                # Phase 4: Discord notification
+                if self._notifier is not None:
+                    asyncio.ensure_future(self._notifier.notify_reject(order))
 
     @property
     def orders(self) -> list[Order]:
@@ -6680,64 +6986,28 @@ _events_file_path: str = DEFAULT_EVENTS_FILE
 def _print_banner(active_events: list[dict], mode: str = "event-driven") -> None:
     """Print a startup banner with current configuration."""
     is_live = "LIVE" in mode.upper()
-    logging.info("=" * 62)
+    logging.info("=" * 60)
     if is_live:
-        logging.info("  ARBITRAGE BOT  v%s — LIVE TRADING", BOT_VERSION)
-        logging.info("  *** REAL ORDERS WILL BE PLACED ***")
+        logging.info("  ARBITRAGE BOT  v%s — LIVE TRADING (REAL ORDERS)", BOT_VERSION)
     else:
-        logging.info("  ARBITRAGE BOT  v%s — PAPER TRADING", BOT_VERSION)
-        logging.info("  No real trades will be executed.")
-    logging.info("=" * 62)
-    logging.info("  Trading mode    : %s", mode)
-    logging.info("  Execution model : event-driven (WS only, stale watchdog)")
-    if is_live:
-        logging.info("  Kalshi orders   : IOC (Immediate-or-Cancel)")
-        logging.info("  Poly orders     : FOK (Fill-or-Kill)")
-    else:
-        logging.info("  Order type      : Fill or Kill (FOK) — simulated")
-    logging.info("  Precision       : decimal.Decimal (12 sig digits)")
+        logging.info("  ARBITRAGE BOT  v%s — PAPER TRADING (SIMULATED)", BOT_VERSION)
+    logging.info("=" * 60)
     logging.info(
-        "  Min gross margin: %s%%",
+        "  Capital: $%s | Pos Size: $%s | Min Margin: %s%%",
+        STARTING_CAPITAL.quantize(Q2),
+        POSITION_SIZE.quantize(Q2),
         (MIN_PROFIT_MARGIN * HUNDRED).quantize(Q2),
     )
     logging.info(
-        "  Kalshi fee rate : %s%%",
-        (KALSHI_FEE_RATE * HUNDRED).quantize(Q2),
+        "  Risk Caps: Exposure $%s | Daily Loss Limit $%s | Max Pos: %d",
+        MAX_TOTAL_EXPOSURE.quantize(Q2),
+        DAILY_LOSS_LIMIT.quantize(Q2),
+        MAX_CONCURRENT_POSITIONS,
     )
-    logging.info(
-        "  Poly fee rate   : %s%%",
-        (POLY_FEE_RATE * HUNDRED).quantize(Q2),
-    )
-    logging.info("  Starting capital: $%s", STARTING_CAPITAL.quantize(Q2))
-    logging.info("  Position size   : $%s", POSITION_SIZE.quantize(Q2))
-    logging.info("  Stale timeout   : %ds", STALE_TIMEOUT_SECONDS)
-    logging.info("  Daily loss limit: $%s", DAILY_LOSS_LIMIT.quantize(Q2))
-    logging.info("  Max exposure    : $%s", MAX_TOTAL_EXPOSURE.quantize(Q2))
-    logging.info("  Max positions   : %d", MAX_CONCURRENT_POSITIONS)
-    logging.info("  Max spread      : %s%%", (MAX_SPREAD_THRESHOLD * HUNDRED).quantize(Q2))
-    logging.info("  Order rate limit: %d/min", MAX_ORDERS_PER_MINUTE)
-    logging.info(
-        "  Trades/event    : %s",
-        str(MAX_TRADES_PER_EVENT) if MAX_TRADES_PER_EVENT > 0 else "unlimited",
-    )
-    logging.info("  Kill file       : %s", KILL_FILE)
-    logging.info("  Unwind timeout  : %ds", UNWIND_TIMEOUT_SECONDS)
-    logging.info("  Stuck pos age   : %ds", STUCK_POSITION_MAX_AGE)
-    logging.info("  Stuck check int : %ds", STUCK_POSITION_CHECK_INTERVAL)
-    logging.info("  Ledger file     : %s", LEDGER_FILE)
-    logging.info("  Order file      : %s", ORDER_FILE)
-    logging.info("  Portfolio file  : %s", PORTFOLIO_FILE)
-    logging.info(
-        "  Observations    : %s", OBSERVATIONS_FILE or "(disabled)",
-    )
-    logging.info(
-        "  WS capture      : %s", WS_CAPTURE_DIR or "(disabled)",
-    )
-    logging.info("  Events file     : %s", _events_file_path)
-    logging.info("  Events tracked  : %d", len(active_events))
+    logging.info("  Tracking %d Active Event(s):", len(active_events))
     for ev in active_events:
-        logging.info("    - %s", ev["name"])
-    logging.info("=" * 62)
+        logging.info("    • %s", ev["name"])
+    logging.info("=" * 60)
 
 
 def _log_opportunity(opp: ArbOpportunity) -> None:
@@ -6793,7 +7063,7 @@ async def _setup_websockets(
             await kalshi_ws.connect()
             for ev in active_events:
                 await kalshi_ws.subscribe(ev["kalshi_ticker"], ev["name"])
-            logging.info("[Kalshi-WS] Subscribed to %d markets.", len(active_events))
+            logging.debug("[Kalshi-WS] Subscribed to %d markets.", len(active_events))
         except Exception as exc:
             logging.warning(
                 "[Kalshi-WS] Failed to connect (%s). Will retry via reconnect logic.",
@@ -6824,7 +7094,7 @@ async def _setup_websockets(
             fetcher._poly_token_cache[cond_id] = (yes_tok, no_tok)
             await poly_ws.subscribe(cond_id, yes_tok, no_tok, ev["name"])
 
-        logging.info("[Poly-WS] Subscribed to %d markets.", len(active_events))
+        logging.debug("[Poly-WS] Subscribed to %d markets.", len(active_events))
     except Exception as exc:
         logging.warning(
             "[Poly-WS] Failed to connect (%s). Will retry via reconnect logic.",
@@ -6896,7 +7166,7 @@ async def _resolution_checker(
                 fetcher.check_poly_active(ev["poly_condition_id"]),
             )
             if not k_active or not p_active:
-                logging.info(
+                logging.debug(
                     "[%s] Market no longer tradeable — removing from "
                     "tracking.", ev["name"],
                 )
@@ -7170,10 +7440,10 @@ async def main() -> None:
                 ", ".join(missing),
             )
             sys.exit(1)
-        logging.warning("=" * 62)
-        logging.warning("  *** LIVE TRADING MODE ***")
-        logging.warning("  Real orders WILL be placed on Kalshi and Polymarket.")
-        logging.warning("=" * 62)
+        logging.debug("=" * 62)
+        logging.debug("  *** LIVE TRADING MODE ***")
+        logging.debug("  Real orders WILL be placed on Kalshi and Polymarket.")
+        logging.debug("=" * 62)
 
     # ── Load events from JSON ──
     global _events_file_path
@@ -7227,9 +7497,9 @@ async def main() -> None:
     # ── Discord notifications (Phase 4) ──
     notifier = DiscordNotifier(webhook_url=DISCORD_WEBHOOK_URL)
     if notifier._enabled:
-        logging.info("[Phase 4] Discord notifications ENABLED.")
+        logging.debug("[Phase 4] Discord notifications ENABLED.")
     else:
-        logging.info("[Phase 4] Discord notifications disabled (no DISCORD_WEBHOOK_URL).")
+        logging.debug("[Phase 4] Discord notifications disabled (no DISCORD_WEBHOOK_URL).")
     # Wire notifier into circuit-breaker tracker
     pnl_tracker.set_notifier(notifier)
 
@@ -7271,7 +7541,7 @@ async def main() -> None:
         # Subscribe to Kalshi fill channel for live order tracking
         if kalshi_ws:
             await kalshi_ws.subscribe_fills()
-            logging.info("[Phase 3] Kalshi WS fill channel active.")
+            logging.debug("[Phase 3] Kalshi WS fill channel active.")
 
         # Phase 6: reconcile persisted positions against the exchange
         # (catches legs orphaned by a crash) and sanity-check allowances.
@@ -7280,7 +7550,7 @@ async def main() -> None:
         )
         await poly_client.verify_allowances()
 
-        logging.info("[Phase 3] Order clients initialized for live trading.")
+        logging.debug("[Phase 3] Order clients initialized for live trading.")
 
     # ── Unwind module (Phase 2 + Phase 3 live integration) ──
     unwind_logger = UnwindLogger(path=UNWIND_LOG_FILE)
@@ -7296,6 +7566,7 @@ async def main() -> None:
         poly_ws=poly_ws,
         fetcher=fetcher,
         state_store=state_store,
+        min_fill_margin=MIN_PROFIT_MARGIN,
     )
     # Phase 6: resume retrying any orphaned exposure from a prior run
     unwind_manager.restore_orphans()
@@ -7308,6 +7579,8 @@ async def main() -> None:
         risk_manager=risk_manager,
         unwind_manager=unwind_manager,
         notifier=notifier,
+        failed_cooldown_seconds=1.0,
+        min_fill_margin=MIN_PROFIT_MARGIN,
     )
 
     mode_parts = []
@@ -7445,7 +7718,7 @@ async def main() -> None:
 
     # Give websockets a moment to receive initial snapshots
     if kalshi_ws or poly_ws:
-        logging.info("Waiting 3s for initial WS snapshots…")
+        logging.debug("Waiting 3s for initial WS snapshots…")
         await asyncio.sleep(3)
 
     # ── Run the main event-driven processor ──

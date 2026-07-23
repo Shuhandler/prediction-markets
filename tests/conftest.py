@@ -27,6 +27,8 @@ CANONICAL = {
     "UNWIND_ABSOLUTE_MIN_PRICE": D("0.05"),
     "MAX_ORDERS_IN_MEMORY": 1000,
     "KALSHI_FILL_POLL_MS": 250,
+    "MAX_TRADES_PER_EVENT": 0,
+    "POLY_SIGNATURE_TYPE": 0,
 }
 
 
@@ -52,6 +54,8 @@ def build_stack(
     max_positions=10,
     max_per_minute=1000,
     unwind_timeout=1,
+    max_trades_per_event=0,
+    min_fill_margin=D("0.05"),
 ):
     """Assemble the full pipeline with CSV output under tmp_path."""
     portfolio = ab.PaperPortfolio(
@@ -81,6 +85,7 @@ def build_stack(
         poly_client=poly_client,
         kalshi_ws=kalshi_ws,
         fetcher=fetcher,
+        min_fill_margin=min_fill_margin,
     )
     ex = ab.ExecutionEngine(
         portfolio=portfolio,
@@ -88,6 +93,8 @@ def build_stack(
         order_logger=ab.OrderLogger(path=str(tmp_path / "orders.csv")),
         risk_manager=risk,
         unwind_manager=um,
+        max_trades_per_event=max_trades_per_event,
+        min_fill_margin=min_fill_margin,
     )
     return SimpleNamespace(
         portfolio=portfolio, trader=trader, pnl=pnl, rate=rate,

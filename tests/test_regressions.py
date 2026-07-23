@@ -88,49 +88,95 @@ async def test_reconnect_delay_caps_at_max(monkeypatch):
     assert delays == [ab.WS_RECONNECT_MAX]
 
 
-# ── Spread re-verification after Leg 1 (live mode) ───────────────────
+# ── Leg 2 reservation-price ceiling (no refetch after Leg 1) ─────────
 
-def _live_stack(tmp_path, fresh_yes_ask):
+def _live_stack(tmp_path, kalshi_response):
     poly = MockPolyOrderClient()
     poly.place_responses = [{"orderID": "P1", "status": "matched"}]
     kalshi = MockKalshiOrderClient()
-    kalshi.place_responses = [
-        {"order_id": "K1", "status": "executed", "remaining_count": 0},
-    ]
+    kalshi.place_responses = [kalshi_response]
     fetcher = MockFetcher(
-        kalshi_snapshot=snap(yes={"ask": fresh_yes_ask, "ask_size": "50"}),
+        kalshi_snapshot=snap(yes={"ask": "0.40", "ask_size": "50"}),
         poly_bids=[{"price": "0.50", "size": "100"}],
     )
     stack = build_stack(
         tmp_path, live_mode=True,
         kalshi_client=kalshi, poly_client=poly, fetcher=fetcher,
     )
-    return stack, kalshi, poly
+    return stack, kalshi, poly, fetcher
 
 
-async def test_spread_evaporated_unwinds_without_leg2(tmp_path):
-    # Fresh Kalshi ask 0.70: cost 0.50 + 0.70 = 1.20 -> net < 0 -> unwind
-    stack, kalshi, poly = _live_stack(tmp_path, "0.70")
-    poly.place_responses.append({"orderID": "P2", "status": "matched"})  # sell
-    uw = await stack.um.execute(make_opp("evt-gone", k_depth=5, p_depth=5), 5)
-    assert uw.status == ab.UnwindStatus.UNWOUND
-    assert kalshi.place_calls == []  # Leg 2 never submitted
-    sell = poly.place_calls[-1]
-    assert sell["side"] == "sell"
+async def test_reservation_price_helper():
+    # poly 0.50, floor 0.05: budget = 1 - 0.50 - 0.0157 - 0.05 = 0.4343
+    # 0.41 + fee(0.41)=0.02 = 0.43 fits; 0.42 + 0.02 = 0.44 doesn't.
+    assert ab.kalshi_reservation_price(D("0.50"), D("0.05")) == D("0.41")
+    # Zero floor accepts anything net-positive: 0.46 + 0.02 <= 0.4843
+    assert ab.kalshi_reservation_price(D("0.50"), D("0")) == D("0.46")
+    # No price >= 1c can clear the floor
+    assert ab.kalshi_reservation_price(D("0.99"), D("0.05")) is None
 
 
-async def test_spread_still_good_updates_leg2_price(tmp_path):
-    # Fresh ask 0.41 (was 0.40): still profitable, Leg 2 repriced
-    stack, kalshi, poly = _live_stack(tmp_path, "0.41")
-    uw = await stack.um.execute(make_opp("evt-ok", k_depth=5, p_depth=5), 5)
+async def test_leg2_goes_out_at_reservation_ceiling_without_refetch(tmp_path):
+    # Observed ask 0.40, poly 0.50, floor 0.05 -> ceiling 0.41.  The IOC
+    # is submitted at the ceiling immediately; no Kalshi book refetch.
+    stack, kalshi, poly, fetcher = _live_stack(
+        tmp_path,
+        {"order_id": "K1", "status": "executed", "remaining_count": 0,
+         "average_fill_price": "0.40"},
+    )
+    uw = await stack.um.execute(make_opp("evt-fast", k_depth=5, p_depth=5), 5)
     assert uw.status == ab.UnwindStatus.COMPLETE
+    assert fetcher.kalshi_calls == []          # latency win: no refetch
     assert kalshi.place_calls[0]["price_cents"] == 41
-    fresh_net = (
+    # Perfect book: filled at the observed ask, economics unchanged
+    assert uw.leg2.price == D("0.40")
+    assert uw.net_profit_per_contract == make_opp("evt-fast").net_profit
+
+
+async def test_leg2_fill_at_ceiling_books_actual_vwap(tmp_path):
+    # The top of book was taken; the IOC walked up to the ceiling and
+    # filled at 0.41.  Realized net must be recomputed from the VWAP.
+    stack, kalshi, poly, fetcher = _live_stack(
+        tmp_path,
+        {"order_id": "K1", "status": "executed", "remaining_count": 0,
+         "average_fill_price": "0.41"},
+    )
+    uw = await stack.um.execute(make_opp("evt-moved", k_depth=5, p_depth=5), 5)
+    assert uw.status == ab.UnwindStatus.COMPLETE
+    assert uw.leg2.price == D("0.41")
+    degraded_net = (
         ab.ONE - D("0.91")
         - ab.kalshi_taker_fee(D("0.41"), 1)
         - ab.poly_taker_fee(D("0.50"), 1)
     ).quantize(ab.Q4)
-    assert uw.net_profit_per_contract == fresh_net
+    assert uw.net_profit_per_contract == degraded_net
+
+
+async def test_leg2_fill_without_vwap_books_ceiling(tmp_path):
+    # No average_fill_price in the response -> book the wire ceiling
+    # (conservative upper bound), never the stale observed ask.
+    stack, kalshi, poly, fetcher = _live_stack(
+        tmp_path,
+        {"order_id": "K1", "status": "executed", "remaining_count": 0},
+    )
+    uw = await stack.um.execute(make_opp("evt-noavg", k_depth=5, p_depth=5), 5)
+    assert uw.status == ab.UnwindStatus.COMPLETE
+    assert uw.leg2.price == D("0.41")
+
+
+async def test_leg2_no_fill_within_ceiling_unwinds(tmp_path):
+    # Book moved beyond the ceiling: IOC killed with 0 fills -> unwind
+    # Leg 1 (the ceiling itself enforced the margin floor).
+    stack, kalshi, poly, fetcher = _live_stack(
+        tmp_path,
+        {"order_id": "K1", "status": "canceled", "remaining_count": 5,
+         "fill_count": 0},
+    )
+    poly.place_responses.append({"orderID": "P2", "status": "matched"})  # sell
+    uw = await stack.um.execute(make_opp("evt-gone", k_depth=5, p_depth=5), 5)
+    assert uw.status == ab.UnwindStatus.UNWOUND
+    sell = poly.place_calls[-1]
+    assert sell["side"] == "sell"
 
 
 # ── /book downgrade: transient errors must not be permanent ──────────
